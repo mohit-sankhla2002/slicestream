@@ -112,6 +112,7 @@ The storage SCP listens on `0.0.0.0:11112` with AE title `SLICESTREAM`
 (`[dimse]` in the config). It handles C-ECHO and C-STORE.
 `allowed_peers` limits which calling AE titles may connect.
 Set `enabled = false` to turn it off.
+See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the conformance statement.
 
 ## Project layout
 
