@@ -16,11 +16,11 @@ use dicom_core::dictionary::{UidDictionary, UidType};
 use dicom_dictionary_std::sop_class;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, broadcast};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::{
-    BlobHash, FsBlobStore, HeaderError, Index, InstanceHeader, InstanceRecord, SpoolError,
-    SpooledBlob, StorageConfig, TempBlob, UpsertOutcome, read_header,
+    BlobHash, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceHeader, InstanceRecord,
+    SpoolError, SpooledBlob, StorageConfig, TempBlob, UpsertOutcome, read_header,
 };
 
 /// Capacity of the [`StoredEvent`] broadcast channel.
@@ -222,17 +222,28 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| IngestError::Storage(io::Error::other(e)))
+    tokio::task::spawn_blocking(f).await.map_err(join_error)
+}
+
+fn join_error(e: tokio::task::JoinError) -> IngestError {
+    error!(error = %e, "ingest task failed");
+    IngestError::Storage(io::Error::other(e))
 }
 
 /// The ingest pipeline. Share it as `Arc<Ingestor>`.
 #[derive(Debug)]
 pub struct Ingestor {
     cfg: StorageConfig,
+    shared: Arc<Shared>,
+}
+
+/// State used by the commit → index → cleanup critical section, which runs
+/// in its own task and therefore needs owned (`Arc`) access.
+#[derive(Debug)]
+struct Shared {
     blobs: FsBlobStore,
     index: Index,
+    on_duplicate: DuplicatePolicy,
     events: broadcast::Sender<StoredEvent>,
     /// Serializes commit → upsert → cleanup per SOP Instance UID (striped).
     /// Identical bytes imply the same SOP Instance UID, so every operation
@@ -240,98 +251,68 @@ pub struct Ingestor {
     /// without it, a cleanup could delete a blob that a concurrent ingest of
     /// the same instance has just committed and is about to index.
     locks: Box<[Mutex<()>]>,
+    #[cfg(test)]
+    hooks: TestHooks,
 }
 
-impl Ingestor {
-    /// Open the blob store at `cfg.root` and the index at
-    /// `cfg.root/index.sqlite`, creating both if missing.
-    pub async fn open(cfg: StorageConfig) -> Result<Arc<Ingestor>, IngestError> {
-        let root = cfg.root.clone();
-        let blobs = blocking(move || FsBlobStore::open(&root)).await??;
-        let index = Index::open(&cfg.root.join("index.sqlite")).await?;
-        let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let locks = (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect();
-        Ok(Arc::new(Ingestor {
-            cfg,
-            blobs,
-            index,
-            events,
-            locks,
-        }))
+/// Fault-injection and pause points for deterministic unit tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestHooks {
+    /// Make the next `upsert_instance` call fail.
+    fail_next_upsert: std::sync::atomic::AtomicBool,
+    /// One-shot pause inside the blob-delete closure: signal `.0`, then block
+    /// until `.1` receives.
+    pause_before_delete:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    fn upsert_should_fail(&self) -> bool {
+        self.fail_next_upsert
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Start a new spool file limited to `max_instance_bytes`.
-    ///
-    /// If a `write_chunk` fails, drop the `TempBlob` (which removes its file);
-    /// do not keep writing to it.
-    pub fn create_temp(&self) -> Result<TempBlob, IngestError> {
-        Ok(self.blobs.create_temp(self.cfg.max_instance_bytes)?)
+    fn before_delete(&self) {
+        let pause = self.pause_before_delete.lock().unwrap().take();
+        if let Some((reached, proceed)) = pause {
+            let _ = reached.send(());
+            let _ = proceed.recv();
+        }
     }
+}
 
-    pub fn subscribe(&self) -> broadcast::Receiver<StoredEvent> {
-        self.events.subscribe()
-    }
-
-    pub fn index(&self) -> &Index {
-        &self.index
-    }
-
-    pub fn blobs(&self) -> &FsBlobStore {
-        &self.blobs
-    }
-
-    pub fn config(&self) -> &StorageConfig {
-        &self.cfg
-    }
-
+impl Shared {
     fn lock_for(&self, sop_instance_uid: &str) -> &Mutex<()> {
         let mut h = std::hash::DefaultHasher::new();
         sop_instance_uid.hash(&mut h);
         &self.locks[(h.finish() % self.locks.len() as u64) as usize]
     }
 
-    /// Validate, commit and index a spooled instance.
-    ///
-    /// Returns only after the blob is renamed into place, its directory is
-    /// fsynced and the index transaction has committed, so `Ok` may be
-    /// acknowledged to the sender. On error the spool file is removed and no
-    /// index row is written.
-    pub async fn ingest(
-        &self,
+    /// The critical section of [`Ingestor::ingest`]. Runs in its own task so
+    /// that dropping the caller cannot interrupt it between steps.
+    async fn store(
+        self: Arc<Self>,
         spooled: SpooledBlob,
-        source: IngestSource,
-        expect: Expectations,
+        mut rec: InstanceRecord,
     ) -> Result<Stored, IngestError> {
-        let (spooled, header) = blocking(move || {
-            let header = read_header(spooled.path());
-            (spooled, header)
-        })
-        .await?;
-        let header = header?;
-        validate(&header, &expect)?;
-
-        let size_bytes = spooled.len;
-        let _guard = self.lock_for(&header.sop_instance_uid).lock().await;
+        let _guard = self.lock_for(&rec.header.sop_instance_uid).lock().await;
 
         let blobs = self.blobs.clone();
         let new_blob = blocking(move || blobs.commit(spooled)).await??;
+        rec.blob = new_blob;
 
-        let calling_ae = match &source {
-            IngestSource::Dimse { calling_ae, .. } => Some(calling_ae.clone()),
-            _ => None,
+        #[cfg(test)]
+        let forced_failure = self.hooks.upsert_should_fail();
+        #[cfg(not(test))]
+        let forced_failure = false;
+        let upserted = if forced_failure {
+            Err(sqlx::Error::PoolTimedOut)
+        } else {
+            self.index.upsert_instance(&rec, self.on_duplicate).await
         };
-        let rec = InstanceRecord {
-            header,
-            blob: new_blob,
-            size_bytes,
-            source: source.as_str().to_owned(),
-            calling_ae,
-        };
-        let outcome = match self
-            .index
-            .upsert_instance(&rec, self.cfg.on_duplicate)
-            .await
-        {
+        let outcome = match upserted {
             Ok(o) => o,
             Err(e) => {
                 self.discard_unreferenced(new_blob).await;
@@ -375,11 +356,17 @@ impl Ingestor {
     /// Delete `hash` unless an index row references it. Failures are logged,
     /// not returned: the instance outcome is already decided, and any blob
     /// left behind is an orphan that [`Ingestor::recover`] removes.
-    async fn discard_unreferenced(&self, hash: BlobHash) {
+    async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash) {
         match self.index.blob_in_use(&hash).await {
             Ok(false) => {
-                let blobs = self.blobs.clone();
-                match blocking(move || blobs.delete(&hash)).await {
+                let shared = Arc::clone(self);
+                match blocking(move || {
+                    #[cfg(test)]
+                    shared.hooks.before_delete();
+                    shared.blobs.delete(&hash)
+                })
+                .await
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => warn!(blob = %hash.to_hex(), error = %e, "failed to delete blob"),
                     Err(e) => warn!(blob = %hash.to_hex(), error = %e, "failed to delete blob"),
@@ -391,6 +378,93 @@ impl Ingestor {
             }
         }
     }
+}
+
+impl Ingestor {
+    /// Open the blob store at `cfg.root` and the index at
+    /// `cfg.root/index.sqlite`, creating both if missing.
+    pub async fn open(cfg: StorageConfig) -> Result<Arc<Ingestor>, IngestError> {
+        let root = cfg.root.clone();
+        let blobs = blocking(move || FsBlobStore::open(&root)).await??;
+        let index = Index::open(&cfg.root.join("index.sqlite")).await?;
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let locks = (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect();
+        let shared = Arc::new(Shared {
+            blobs,
+            index,
+            on_duplicate: cfg.on_duplicate,
+            events,
+            locks,
+            #[cfg(test)]
+            hooks: TestHooks::default(),
+        });
+        Ok(Arc::new(Ingestor { cfg, shared }))
+    }
+
+    /// Start a new spool file limited to `max_instance_bytes`.
+    ///
+    /// If a `write_chunk` fails, drop the `TempBlob` (which removes its file);
+    /// do not keep writing to it.
+    pub fn create_temp(&self) -> Result<TempBlob, IngestError> {
+        Ok(self.shared.blobs.create_temp(self.cfg.max_instance_bytes)?)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<StoredEvent> {
+        self.shared.events.subscribe()
+    }
+
+    pub fn index(&self) -> &Index {
+        &self.shared.index
+    }
+
+    pub fn blobs(&self) -> &FsBlobStore {
+        &self.shared.blobs
+    }
+
+    pub fn config(&self) -> &StorageConfig {
+        &self.cfg
+    }
+
+    /// Validate, commit and index a spooled instance.
+    ///
+    /// Returns only after the blob is renamed into place, its directory is
+    /// fsynced and the index transaction has committed, so `Ok` may be
+    /// acknowledged to the sender. On error the spool file is removed and no
+    /// index row is written.
+    ///
+    /// Cancellation-safe: once validation passes, commit → index → cleanup →
+    /// broadcast runs in a spawned task that completes (holding the per-UID
+    /// lock throughout) even if this future is dropped.
+    pub async fn ingest(
+        &self,
+        spooled: SpooledBlob,
+        source: IngestSource,
+        expect: Expectations,
+    ) -> Result<Stored, IngestError> {
+        let (spooled, header) = blocking(move || {
+            let header = read_header(spooled.path());
+            (spooled, header)
+        })
+        .await?;
+        let header = header?;
+        validate(&header, &expect)?;
+
+        let calling_ae = match &source {
+            IngestSource::Dimse { calling_ae, .. } => Some(calling_ae.clone()),
+            _ => None,
+        };
+        let rec = InstanceRecord {
+            header,
+            blob: spooled.hash,
+            size_bytes: spooled.len,
+            source: source.as_str().to_owned(),
+            calling_ae,
+        };
+        let shared = Arc::clone(&self.shared);
+        tokio::spawn(shared.store(spooled, rec))
+            .await
+            .map_err(join_error)?
+    }
 
     /// Startup-only crash recovery: remove every file in `tmp/`, then delete
     /// committed blobs that no index row references.
@@ -399,10 +473,10 @@ impl Ingestor {
     /// [`Ingestor::ingest`] could remove an in-flight spool file or a blob
     /// that has been committed but not yet indexed.
     pub async fn recover(&self) -> Result<RecoveryReport, IngestError> {
-        let blobs = self.blobs.clone();
+        let blobs = self.shared.blobs.clone();
         let tmp_removed = blocking(move || blobs.sweep_tmp()).await??;
-        let referenced: HashSet<BlobHash> = self.index.blob_hashes().await?;
-        let blobs = self.blobs.clone();
+        let referenced: HashSet<BlobHash> = self.shared.index.blob_hashes().await?;
+        let blobs = self.shared.blobs.clone();
         let orphans_removed = blocking(move || -> io::Result<usize> {
             let mut n = 0;
             for hash in blobs.list()? {
@@ -443,5 +517,99 @@ impl Ingestor {
             Expectations::default(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn spool(ing: &Ingestor, bytes: &[u8]) -> SpooledBlob {
+        let mut t = ing.create_temp().unwrap();
+        t.write_chunk(bytes).await.unwrap();
+        t.finish().await.unwrap()
+    }
+
+    /// Dropping an `ingest` future mid-cleanup must not let a concurrent
+    /// ingest of the same bytes index a blob that the cleanup then deletes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_ingest_cannot_delete_blob_indexed_by_another() {
+        let d = tempfile::tempdir().unwrap();
+        crate::phantom::write_phantom(&d.path().join("src"), 1, 16).unwrap();
+        let bytes = std::fs::read(d.path().join("src/IM00001.dcm")).unwrap();
+        let ing = Ingestor::open(StorageConfig {
+            root: d.path().join("store"),
+            max_instance_bytes: 1 << 30,
+            on_duplicate: DuplicatePolicy::Keep,
+        })
+        .await
+        .unwrap();
+
+        // A: upsert fails, cleanup decides the new blob is unused and pauses
+        // just before deleting it.
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        *ing.shared.hooks.pause_before_delete.lock().unwrap() = Some((reached_tx, proceed_rx));
+        ing.shared
+            .hooks
+            .fail_next_upsert
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let a = {
+            let ing = Arc::clone(&ing);
+            let spooled = spool(&ing, &bytes).await;
+            tokio::spawn(async move {
+                ing.ingest(
+                    spooled,
+                    IngestSource::Http { remote: None },
+                    Expectations::default(),
+                )
+                .await
+            })
+        };
+        tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        // The caller goes away (client disconnect / association abort).
+        a.abort();
+        assert!(a.await.unwrap_err().is_cancelled());
+
+        // B: same bytes.
+        let mut b = {
+            let ing = Arc::clone(&ing);
+            let spooled = spool(&ing, &bytes).await;
+            tokio::spawn(async move {
+                ing.ingest(
+                    spooled,
+                    IngestSource::Http { remote: None },
+                    Expectations::default(),
+                )
+                .await
+            })
+        };
+        // Correct code keeps B waiting behind A's critical section, so this
+        // times out; broken code lets B finish first. The assertions below
+        // hold for correct code regardless of how long this wait is.
+        let early = tokio::time::timeout(Duration::from_millis(200), &mut b).await;
+        proceed_tx.send(()).unwrap();
+        let stored = match early {
+            Ok(r) => r.unwrap().unwrap(),
+            Err(_) => b.await.unwrap().unwrap(),
+        };
+
+        let indexed = ing
+            .index()
+            .instance(&stored.sop_instance_uid)
+            .await
+            .unwrap()
+            .expect("B indexed the instance");
+        // Give a detached delete (broken code) time to land; correct code has
+        // already finished A's delete before B could take the lock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            ing.blobs().path_of(&indexed.blob).is_file(),
+            "index references a blob that no longer exists"
+        );
     }
 }
