@@ -7,25 +7,18 @@
 //! `<dicom-root>` and each of its immediate sub-directories are scanned for
 //! DICOM series. Open http://127.0.0.1:8080 for the demo viewer.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use axum::Router;
-use axum::routing::get;
 use slicestream_core::{SchedulerConfig, Series};
-use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
-
-mod routes;
-mod stream;
-
-pub struct AppState {
-    pub series: HashMap<String, Arc<Series>>,
-    pub scheduler: SchedulerConfig,
-}
+use slicestream_server::config::HttpConfig;
+use slicestream_server::{AppState, app};
+use slicestream_store::{Ingestor, StorageConfig};
 
 struct Args {
     root: PathBuf,
@@ -87,22 +80,35 @@ async fn main() -> anyhow::Result<()> {
 
     let root = args.root.clone();
     let series = tokio::task::spawn_blocking(move || load_series(&root)).await??;
+
+    let ingestor = Ingestor::open(StorageConfig::default())
+        .await
+        .context("opening storage")?;
+    let report = ingestor.recover().await.context("storage recovery")?;
+    tracing::info!(
+        tmp_removed = report.tmp_removed,
+        orphans_removed = report.orphans_removed,
+        "storage ready"
+    );
+
+    let http = HttpConfig {
+        addr: args.addr,
+        web_dir: args.web,
+        ..HttpConfig::default()
+    };
     let state = Arc::new(AppState {
         series,
         scheduler: SchedulerConfig::default(),
+        ingestor,
+        http,
     });
-
-    let app = Router::new()
-        .route("/api/series", get(routes::list_series))
-        .route("/api/series/{uid}", get(routes::get_series))
-        .route("/api/series/{uid}/frames/{index}", get(routes::get_frame))
-        .route("/api/series/{uid}/stream", get(stream::stream_series))
-        .fallback_service(ServeDir::new(&args.web))
-        .layer(CorsLayer::permissive()) // dev default; lock down in production
-        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.addr).await?;
     tracing::info!("listening on http://{}", args.addr);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

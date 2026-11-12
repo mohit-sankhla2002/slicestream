@@ -4,3 +4,4 @@
 !tests/fixtures/**/*.dcm
 /.playwright-mcp
 /.superpowers
+/storage
