@@ -177,21 +177,18 @@ impl FsBlobStore {
     pub fn commit(&self, mut spooled: SpooledBlob) -> io::Result<BlobHash> {
         let hash = spooled.hash;
         let target = self.path_of(&hash);
-        if target.is_file() {
-            return Ok(hash); // dropping `spooled` removes the temp file
-        }
         let parent = target.parent().expect("target has parent");
+        if target.is_file() {
+            // Another committer may have renamed but not yet fsynced; make the
+            // entry durable before we report success. Dropping `spooled`
+            // removes our temp file.
+            sync_ancestors(parent)?;
+            return Ok(hash);
+        }
         fs::create_dir_all(parent)?;
         fs::rename(&spooled.path, &target)?;
         spooled.committed = true;
-        sync_dir(parent)?;
-        // Make newly created intermediate directories durable too.
-        if let Some(p) = parent.parent() {
-            sync_dir(p)?;
-            if let Some(pp) = p.parent() {
-                sync_dir(pp)?;
-            }
-        }
+        sync_ancestors(parent)?;
         Ok(hash)
     }
 
@@ -257,6 +254,18 @@ fn read_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
         }
     }
     Ok(v)
+}
+
+/// fsync `dir` and its two ancestors (`aa/bb`, `aa`, `objects`).
+fn sync_ancestors(dir: &Path) -> io::Result<()> {
+    sync_dir(dir)?;
+    if let Some(p) = dir.parent() {
+        sync_dir(p)?;
+        if let Some(pp) = p.parent() {
+            sync_dir(pp)?;
+        }
+    }
+    Ok(())
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -331,6 +340,19 @@ mod tests {
         store.delete(&h1).unwrap();
         store.delete(&h1).unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_existing_target_returns_hash_and_cleans_temp() {
+        let d = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::open(d.path()).unwrap();
+        let h1 = store.commit(spool(&store, b"dup").await).unwrap();
+        let b = spool(&store, b"dup").await;
+        let tmp = b.path().to_path_buf();
+        assert!(tmp.exists());
+        assert_eq!(store.commit(b).unwrap(), h1);
+        assert!(!tmp.exists());
+        assert!(store.path_of(&h1).is_file());
     }
 
     #[tokio::test]
