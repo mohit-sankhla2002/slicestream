@@ -1,0 +1,18 @@
+[package]
+name = "slicestream-dimse"
+description = "DIMSE PDV assembly and command codec for the slicestream storage SCP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+dicom-core = "0.10.1"
+dicom-dictionary-std = "0.10.1"
+dicom-object = "0.10.1"
+dicom-transfer-syntax-registry = "0.10.1"
+dicom-ul = { version = "0.10.1", features = ["async"] }
+thiserror = "2.0.21"

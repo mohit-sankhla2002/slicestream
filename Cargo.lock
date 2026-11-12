@@ -398,6 +398,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dicom-ul"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "480cdc430dc66cdfc1d9c30f6302bbf462476cf3e863b580235ad7baa904c214"
+dependencies = [
+ "byteordered",
+ "bytes",
+ "cfg-if",
+ "dicom-encoding",
+ "dicom-transfer-syntax-registry",
+ "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1794,6 +1810,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "slicestream-dimse"
+version = "0.1.0"
+dependencies = [
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "dicom-transfer-syntax-registry",
+ "dicom-ul",
  "thiserror",
 ]
 
