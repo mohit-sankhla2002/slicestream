@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>slicestream demo</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; background: #0b0d10; color: #d6dae0; font: 14px/1.4 system-ui, sans-serif; }
+    header { display: flex; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid #222; }
+    main { display: grid; place-items: center; height: calc(100vh - 90px); }
+    canvas { max-width: 100%; max-height: 100%; image-rendering: pixelated; background: #000; }
+    #bar { height: 6px; display: flex; margin: 0 16px; }
+    #bar span { flex: 1; background: #222; }
+    #bar span.got { background: #2f7d4f; }
+    #bar span.cur { background: #e0b341; }
+    select, output { font: inherit; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>slicestream</strong>
+    <select id="series"></select>
+    <output id="status">connecting…</output>
+  </header>
+  <div id="bar"></div>
+  <main><canvas id="view" width="512" height="512"></canvas></main>
+  <script src="client.js"></script>
+</body>
+</html>

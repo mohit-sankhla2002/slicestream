@@ -1,0 +1,6 @@
+/target
+/data
+*.dcm
+!tests/fixtures/**/*.dcm
+/.playwright-mcp
+/.superpowers
