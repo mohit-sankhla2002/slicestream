@@ -76,7 +76,13 @@ a Part-10 file.
 
 STOW-RS requests use `Content-Type: multipart/related; type="application/dicom"`.
 Responses are `application/dicom+json` and hold (0008,1190) RetrieveURL,
-(0008,1198) FailedSOPSequence and (0008,1199) ReferencedSOPSequence.
+(0008,1198) FailedSOPSequence and (0008,1199) ReferencedSOPSequence. A
+FailedSOPSequence item carries (0008,1150) / (0008,1155) whenever the part's
+header could be parsed.
+
+The RetrieveURLs follow the WADO-RS layout
+(`/dicom-web/studies/{study}/series/{series}/instances/{instance}`), but WADO-RS
+is not served yet, so they return 404 for now.
 
 | HTTP status | Meaning |
 |---|---|
@@ -112,6 +118,20 @@ the `Host` header against `[http] allowed_hosts` (default: `localhost`,
 
 Duplicates (same SOP Instance UID) return success. With `keep`, the first copy
 stays. With `overwrite`, the index points to the new copy.
+
+Byte-identical copies are always duplicates. The same instance received over
+DIMSE and over STOW-RS is not byte-identical: the SCP wraps the DIMSE data set
+in a Part-10 header whose Source Application Entity Title (0002,0016) is the
+calling AE title (and whose transfer syntax is the negotiated one). With
+`overwrite`, such a resend therefore replaces the stored copy.
+
+## Hierarchy conflicts
+
+The index links each study to one patient and each series to one study, using
+the first instance received. If a later instance places a known study under a
+different PatientID, or a known series under a different study, the instance
+is still stored and indexed (as part of the known series), the existing links
+are kept, and a warning is logged.
 
 ## Storage ownership
 
