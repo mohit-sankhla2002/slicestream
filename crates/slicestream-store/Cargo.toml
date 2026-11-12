@@ -1,0 +1,21 @@
+[package]
+name = "slicestream-store"
+description = "Durable spooling and content-addressed blob storage for slicestream."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+rand = "0.9"
+sha2 = "0.10"
+thiserror = "2.0.21"
+tokio = { version = "1", features = ["fs", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt"] }
