@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Edition 2024, `rust-version = "1.85"`, dual license `MIT OR Apache-2.0` via `[workspace.package]`.
+- Edition 2024, `rust-version = "1.88"`, dual license `MIT OR Apache-2.0` via `[workspace.package]`.
 - `#![forbid(unsafe_code)]` in every new crate.
 - `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all` pass after every task.
 - Never buffer a whole instance in memory; only headers (read with `read_until(tags::PIXEL_DATA)`) and DIMSE command sets.

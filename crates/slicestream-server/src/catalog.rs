@@ -67,10 +67,10 @@ impl SeriesCatalog {
     /// different instance count (a backstop in case an invalidation was
     /// missed).
     async fn get_row(&self, row: &SeriesRow) -> anyhow::Result<Option<Arc<Series>>> {
-        if let Some(e) = self.cache.read().await.get(&row.series_instance_uid) {
-            if e.instance_count == row.instance_count {
-                return Ok(e.series.clone());
-            }
+        if let Some(e) = self.cache.read().await.get(&row.series_instance_uid)
+            && e.instance_count == row.instance_count
+        {
+            return Ok(e.series.clone());
         }
         let generation = self.generation.load(Ordering::Acquire);
         let series = self.build(row).await?;
