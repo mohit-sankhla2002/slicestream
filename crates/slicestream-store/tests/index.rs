@@ -1,0 +1,161 @@
+#[allow(dead_code)]
+#[path = "../../slicestream-core/examples/make_phantom.rs"]
+mod phantom;
+
+use std::sync::Arc;
+
+use slicestream_store::{
+    BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, UpsertOutcome, read_header,
+};
+
+fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
+    phantom::write_phantom(dir, n, 32).unwrap();
+    (1..=n)
+        .map(|i| read_header(&dir.join(format!("IM{i:05}.dcm"))).unwrap())
+        .collect()
+}
+
+fn record(header: InstanceHeader, fill: u8) -> InstanceRecord {
+    InstanceRecord {
+        header,
+        blob: BlobHash([fill; 32]),
+        size_bytes: 1234,
+        source: "dimse".into(),
+        calling_ae: Some("MODALITY1".into()),
+    }
+}
+
+#[tokio::test]
+async fn upsert_insert_then_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = Index::open(&dir.path().join("index.db")).await.unwrap();
+    let h = phantom_headers(&dir.path().join("p"), 1).remove(0);
+    let uid = h.sop_instance_uid.clone();
+
+    let a = record(h.clone(), 0xaa);
+    assert_eq!(
+        idx.upsert_instance(&a, DuplicatePolicy::Keep)
+            .await
+            .unwrap(),
+        UpsertOutcome::Inserted
+    );
+    assert_eq!(
+        idx.upsert_instance(&a, DuplicatePolicy::Keep)
+            .await
+            .unwrap(),
+        UpsertOutcome::Duplicate { existing: a.blob }
+    );
+
+    let b = record(h.clone(), 0xbb);
+    assert_eq!(
+        idx.upsert_instance(&b, DuplicatePolicy::Keep)
+            .await
+            .unwrap(),
+        UpsertOutcome::Duplicate { existing: a.blob }
+    );
+    let s = idx.instance(&uid).await.unwrap().unwrap();
+    assert_eq!(s.blob, a.blob);
+    assert_eq!(s.source, "dimse");
+    assert_eq!(s.calling_ae.as_deref(), Some("MODALITY1"));
+    assert_eq!(s.series_instance_uid, h.series_instance_uid);
+
+    assert_eq!(
+        idx.upsert_instance(&b, DuplicatePolicy::Overwrite)
+            .await
+            .unwrap(),
+        UpsertOutcome::Replaced { previous: a.blob }
+    );
+    assert_eq!(idx.instance(&uid).await.unwrap().unwrap().blob, b.blob);
+    assert!(idx.blob_in_use(&b.blob).await.unwrap());
+    assert!(!idx.blob_in_use(&a.blob).await.unwrap());
+    assert_eq!(
+        idx.blob_hashes().await.unwrap(),
+        std::collections::HashSet::from([b.blob])
+    );
+    assert!(idx.instance("2.25.999").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn series_slices_returns_frame_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = Index::open(&dir.path().join("index.db")).await.unwrap();
+    for (i, h) in phantom_headers(&dir.path().join("p"), 3)
+        .into_iter()
+        .enumerate()
+    {
+        let r = record(h, i as u8);
+        assert_eq!(
+            idx.upsert_instance(&r, DuplicatePolicy::Keep)
+                .await
+                .unwrap(),
+            UpsertOutcome::Inserted
+        );
+    }
+    let slices = idx
+        .series_slices("2.25.1000000000000000000000000000001")
+        .await
+        .unwrap();
+    assert_eq!(slices.len(), 3);
+    for s in &slices {
+        assert_eq!(s.frame_info.rows, 32);
+        assert_eq!(s.number_of_frames, 1);
+        assert!(s.slice_position.is_some());
+    }
+    let series = idx.list_series().await.unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].instance_count, 3);
+    assert_eq!(series[0].modality.as_deref(), Some("CT"));
+    assert_eq!(
+        series[0].study_instance_uid,
+        "2.25.1000000000000000000000000000002"
+    );
+    assert!(idx.series_slices("2.25.404").await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_upserts_same_uid() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = Arc::new(Index::open(&dir.path().join("index.db")).await.unwrap());
+    let h = phantom_headers(&dir.path().join("p"), 1).remove(0);
+    let mut tasks = Vec::new();
+    for i in 0..8u8 {
+        let idx = idx.clone();
+        let r = record(h.clone(), i);
+        tasks.push(tokio::spawn(async move {
+            idx.upsert_instance(&r, DuplicatePolicy::Keep).await
+        }));
+    }
+    let mut inserted = 0;
+    let mut dup = 0;
+    for t in tasks {
+        match t.await.unwrap().unwrap() {
+            UpsertOutcome::Inserted => inserted += 1,
+            UpsertOutcome::Duplicate { .. } => dup += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!((inserted, dup), (1, 7));
+}
+
+#[tokio::test]
+async fn reopen_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let h = phantom_headers(&dir.path().join("p"), 1).remove(0);
+    let r = record(h.clone(), 7);
+    {
+        let idx = Index::open(&db).await.unwrap();
+        idx.upsert_instance(&r, DuplicatePolicy::Keep)
+            .await
+            .unwrap();
+    }
+    let idx = Index::open(&db).await.unwrap();
+    assert_eq!(
+        idx.instance(&h.sop_instance_uid)
+            .await
+            .unwrap()
+            .unwrap()
+            .blob,
+        r.blob
+    );
+}
