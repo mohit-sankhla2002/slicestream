@@ -66,6 +66,10 @@ in scroll direction, then the slices behind.
 
 ## Quick start
 
+Unix (Linux, macOS) is the supported platform: durable storage relies on
+fsyncing directories, which Windows does not offer. Building needs Rust 1.88
+or newer.
+
 ```sh
 # 1. Generate a synthetic CT series (no patient data needed)
 cargo run -p slicestream-core --example make_phantom -- data/phantom 120

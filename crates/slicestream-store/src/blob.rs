@@ -277,8 +277,17 @@ fn sync_ancestors(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// fsync a directory so a rename into it is durable. Unix only: Windows
+/// cannot open a directory as a `File` this way (and Unix is the supported
+/// platform), so elsewhere this is a no-op.
+#[cfg(unix)]
 fn sync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
