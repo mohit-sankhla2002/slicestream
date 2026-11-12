@@ -142,7 +142,7 @@ impl SeriesCatalog {
                 match event {
                     Ok(e) => catalog.invalidate(Some(&e.series_instance_uid)).await,
                     Err(RecvError::Lagged(n)) => {
-                        tracing::debug!(missed = n, "catalog invalidator lagged; clearing cache");
+                        tracing::warn!(missed = n, "catalog invalidator lagged; clearing cache");
                         catalog.invalidate(None).await;
                     }
                     Err(RecvError::Closed) => break,
