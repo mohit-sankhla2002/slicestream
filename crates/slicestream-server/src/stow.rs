@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use mime::Mime;
 use multer::{Constraints, Field, Multipart, SizeLimit};
 use serde_json::{Map, Value, json};
-use slicestream_store::{Expectations, IngestError, IngestSource, Stored, TempBlob};
+use slicestream_store::{Expectations, IngestError, IngestFailure, IngestSource, Stored, TempBlob};
 use subtle::ConstantTimeEq;
 
 use crate::AppState;
@@ -53,21 +53,35 @@ impl PartResult {
 
     /// Map an ingest error, keeping whichever UIDs the error itself carries.
     fn from_error(e: &IngestError) -> Self {
-        let (mut sop_class_uid, mut sop_instance_uid) = (None, None);
-        match e {
-            IngestError::UidMismatch { field, actual, .. } => match *field {
-                "SOPClassUID" => sop_class_uid = Some(actual.clone()),
-                "SOPInstanceUID" => sop_instance_uid = Some(actual.clone()),
-                _ => {}
-            },
-            IngestError::UnsupportedSopClass(uid) => sop_class_uid = Some(uid.clone()),
-            _ => {}
-        }
+        let (sop_class_uid, sop_instance_uid) = uids_in_error(e);
         PartResult::Failed {
             sop_class_uid,
             sop_instance_uid,
             reason: e.status(),
         }
+    }
+
+    /// Map an ingest failure, preferring the UIDs of the parsed header.
+    fn from_failure(f: &IngestFailure) -> Self {
+        let (class, instance) = uids_in_error(&f.error);
+        PartResult::Failed {
+            sop_class_uid: f.sop_class_uid.clone().or(class),
+            sop_instance_uid: f.sop_instance_uid.clone().or(instance),
+            reason: f.status(),
+        }
+    }
+}
+
+/// SOP Class / Instance UIDs named by the error itself, if any.
+fn uids_in_error(e: &IngestError) -> (Option<String>, Option<String>) {
+    match e {
+        IngestError::UidMismatch { field, actual, .. } => match *field {
+            "SOPClassUID" => (Some(actual.clone()), None),
+            "SOPInstanceUID" => (None, Some(actual.clone())),
+            _ => (None, None),
+        },
+        IngestError::UnsupportedSopClass(uid) => (Some(uid.clone()), None),
+        _ => (None, None),
     }
 }
 
@@ -204,8 +218,8 @@ async fn ingest_part(
     {
         Ok(stored) => Ok(PartResult::Stored(stored)),
         Err(e) => {
-            log_ingest_error(&e);
-            Ok(PartResult::from_error(&e))
+            log_ingest_error(&e.error);
+            Ok(PartResult::from_failure(&e))
         }
     }
 }
@@ -442,7 +456,7 @@ pub async fn post_instance(
             }))
             .into_response()
         }
-        Err(e) => ingest_error_response(&e),
+        Err(e) => ingest_error_response(&e.error),
     }
 }
 

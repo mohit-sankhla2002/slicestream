@@ -199,6 +199,25 @@ async fn study_mismatch_in_url() {
     let failed = items(&json, "00081198");
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0]["00081197"]["Value"], json!([50185]));
+    // The part was parsed, so its SOP Class / Instance UIDs are reported.
+    let dataset = dicom_object::open_file(&h.files[0]).unwrap();
+    let uid = |t| {
+        dataset
+            .element(t)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_end_matches('\0')
+            .to_string()
+    };
+    assert_eq!(
+        failed[0]["00081150"]["Value"],
+        json!([uid(dicom_dictionary_std::tags::SOP_CLASS_UID)])
+    );
+    assert_eq!(
+        failed[0]["00081155"]["Value"],
+        json!([uid(dicom_dictionary_std::tags::SOP_INSTANCE_UID)])
+    );
     assert_eq!(
         json["00081190"]["Value"][0],
         "http://pacs.example/dicom-web/studies/9.9.9"

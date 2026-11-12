@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
+use dicom_dictionary_std::uids::CT_IMAGE_STORAGE;
 use slicestream_store::{
     DuplicatePolicy, Expectations, IngestError, IngestSource, Ingestor, RecoveryReport,
     SpooledBlob, StorageConfig, is_storage_sop_class,
@@ -134,7 +135,10 @@ async fn uid_mismatch_rejected() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, IngestError::UidMismatch { .. }), "{err:?}");
+    assert!(
+        matches!(err.error, IngestError::UidMismatch { .. }),
+        "{err:?}"
+    );
     assert_eq!(err.status(), 0xA900);
     assert!(files_under(&d.path().join("store/objects")).is_empty());
     assert!(files_under(&d.path().join("store/tmp")).is_empty());
@@ -159,8 +163,19 @@ async fn study_mismatch_rejected() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, IngestError::StudyMismatch { .. }), "{err:?}");
+    assert!(
+        matches!(err.error, IngestError::StudyMismatch { .. }),
+        "{err:?}"
+    );
     assert_eq!(err.status(), 0xC409);
+    // The header was parsed, so the failure carries the instance's UIDs.
+    assert_eq!(err.sop_class_uid.as_deref(), Some(CT_IMAGE_STORAGE));
+    assert!(
+        err.sop_instance_uid
+            .as_deref()
+            .unwrap()
+            .starts_with("2.25.")
+    );
     assert!(files_under(&d.path().join("store/objects")).is_empty());
     assert!(files_under(&d.path().join("store/tmp")).is_empty());
 }
@@ -182,7 +197,7 @@ async fn non_storage_sop_class_rejected() {
         .unwrap();
     let err = ing.import_file(&file).await.unwrap_err();
     assert!(
-        matches!(err, IngestError::UnsupportedSopClass(_)),
+        matches!(err.error, IngestError::UnsupportedSopClass(_)),
         "{err:?}"
     );
     assert_eq!(err.status(), 0x0122);
@@ -319,7 +334,7 @@ async fn too_large_maps_to_a700() {
     let ing = Ingestor::open(cfg).await.unwrap();
     let err = ing.import_file(&file).await.unwrap_err();
     assert!(
-        matches!(err, IngestError::TooLarge { limit: 100 }),
+        matches!(err.error, IngestError::TooLarge { limit: 100 }),
         "{err:?}"
     );
     assert_eq!(err.status(), 0xA700);
@@ -347,7 +362,10 @@ async fn storage_failure_maps_to_a700() {
     let result = ing.import_file(&file).await;
     std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
     let err = result.unwrap_err();
-    assert!(matches!(err, IngestError::Storage(_)), "{err:?}");
+    assert!(matches!(err.error, IngestError::Storage(_)), "{err:?}");
+    // A post-parse failure still reports the instance.
+    assert_eq!(err.sop_class_uid.as_deref(), Some(CT_IMAGE_STORAGE));
+    assert!(err.sop_instance_uid.is_some());
     assert_eq!(err.status(), 0xA700);
     assert!(ing.index().list_series().await.unwrap().is_empty());
     assert!(files_under(&root.join("tmp")).is_empty());

@@ -143,6 +143,42 @@ impl IngestError {
     }
 }
 
+/// An [`IngestError`] plus the instance's SOP Class / Instance UIDs when the
+/// header had been parsed before the failure (for STOW-RS
+/// FailedSOPSequence items and logs).
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct IngestFailure {
+    pub error: IngestError,
+    pub sop_class_uid: Option<String>,
+    pub sop_instance_uid: Option<String>,
+}
+
+impl IngestFailure {
+    /// See [`IngestError::status`].
+    pub fn status(&self) -> u16 {
+        self.error.status()
+    }
+
+    fn for_instance(error: IngestError, h: &InstanceHeader) -> Self {
+        IngestFailure {
+            error,
+            sop_class_uid: Some(h.sop_class_uid.clone()),
+            sop_instance_uid: Some(h.sop_instance_uid.clone()),
+        }
+    }
+}
+
+impl From<IngestError> for IngestFailure {
+    fn from(error: IngestError) -> Self {
+        IngestFailure {
+            error,
+            sop_class_uid: None,
+            sop_instance_uid: None,
+        }
+    }
+}
+
 impl From<SpoolError> for IngestError {
     fn from(e: SpoolError) -> Self {
         match e {
@@ -475,7 +511,8 @@ impl Ingestor {
     /// Returns only after the blob is renamed into place, its directory is
     /// fsynced and the index transaction has committed, so `Ok` may be
     /// acknowledged to the sender. On error the spool file is removed and no
-    /// index row is written.
+    /// index row is written. Errors after the header was parsed carry the
+    /// instance's UIDs.
     ///
     /// Cancellation-safe: once validation passes, commit → index → cleanup →
     /// broadcast runs in a spawned task that completes (holding the per-UID
@@ -485,14 +522,18 @@ impl Ingestor {
         spooled: SpooledBlob,
         source: IngestSource,
         expect: Expectations,
-    ) -> Result<Stored, IngestError> {
+    ) -> Result<Stored, IngestFailure> {
         let (spooled, header) = blocking(move || {
             let header = read_header(spooled.path());
             (spooled, header)
         })
         .await?;
-        let header = header?;
-        validate(&header, &expect)?;
+        let header = header.map_err(IngestError::from)?;
+        validate(&header, &expect).map_err(|e| IngestFailure::for_instance(e, &header))?;
+        let (sop_class_uid, sop_instance_uid) = (
+            header.sop_class_uid.clone(),
+            header.sop_instance_uid.clone(),
+        );
 
         let calling_ae = match &source {
             IngestSource::Dimse { calling_ae, .. } => Some(calling_ae.clone()),
@@ -508,7 +549,13 @@ impl Ingestor {
         let shared = Arc::clone(&self.shared);
         tokio::spawn(shared.store(spooled, rec))
             .await
-            .map_err(join_error)?
+            .map_err(join_error)
+            .and_then(|r| r)
+            .map_err(|error| IngestFailure {
+                error,
+                sop_class_uid: Some(sop_class_uid),
+                sop_instance_uid: Some(sop_instance_uid),
+            })
     }
 
     /// Startup-only crash recovery: remove every file in `tmp/`, then delete
@@ -542,19 +589,23 @@ impl Ingestor {
 
     /// Ingest an existing Part-10 file by streaming a copy through a
     /// [`TempBlob`]. The source file is never modified.
-    pub async fn import_file(&self, path: &Path) -> Result<Stored, IngestError> {
-        let mut file = tokio::fs::File::open(path).await?;
+    pub async fn import_file(&self, path: &Path) -> Result<Stored, IngestFailure> {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(IngestError::from)?;
         let mut temp = self.create_temp()?;
         let mut buf = vec![0u8; IMPORT_CHUNK];
         loop {
-            let n = file.read(&mut buf).await?;
+            let n = file.read(&mut buf).await.map_err(IngestError::from)?;
             if n == 0 {
                 break;
             }
             // On error `temp` is dropped here, removing its file.
-            temp.write_chunk(&buf[..n]).await?;
+            temp.write_chunk(&buf[..n])
+                .await
+                .map_err(IngestError::from)?;
         }
-        let spooled = temp.finish().await?;
+        let spooled = temp.finish().await.map_err(IngestError::from)?;
         self.ingest(
             spooled,
             IngestSource::Import {

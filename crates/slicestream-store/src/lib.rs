@@ -20,7 +20,7 @@ pub use index::{
     DuplicatePolicy, Index, InstanceRecord, InstanceSummary, SeriesRow, SliceRow, UpsertOutcome,
 };
 pub use ingest::{
-    Expectations, IngestError, IngestSource, Ingestor, RecoveryReport, Stored, StoredEvent,
-    is_storage_sop_class,
+    Expectations, IngestError, IngestFailure, IngestSource, Ingestor, RecoveryReport, Stored,
+    StoredEvent, is_storage_sop_class,
 };
 pub use part10::{IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, write_part10_prefix};
