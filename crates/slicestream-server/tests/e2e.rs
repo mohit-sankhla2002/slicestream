@@ -410,3 +410,33 @@ async fn catalog_get_sees_new_slices_after_stored_event() {
     }
     assert_eq!(len, 2);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn import_counts_unreadable_dir_as_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("in");
+    phantom::write_phantom(&data, 2, 16).unwrap();
+    let locked = data.join("locked");
+    phantom::write_phantom(&locked, 1, 16).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root (or CAP_DAC_OVERRIDE) can read it anyway; nothing to test then.
+    let privileged = std::fs::read_dir(&locked).is_ok();
+
+    let ingestor = Ingestor::open(StorageConfig {
+        root: dir.path().join("store"),
+        ..StorageConfig::default()
+    })
+    .await
+    .unwrap();
+    let report = import_dir(&ingestor, &data, true).await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if privileged {
+        eprintln!("skipping: running with privileges that bypass mode 000");
+        return;
+    }
+    assert_eq!(report.stored, 2, "{report:?}");
+    assert_eq!(report.failed, 1, "{report:?}");
+}

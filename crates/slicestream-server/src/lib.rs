@@ -206,13 +206,7 @@ pub async fn import_dir(ingestor: &Ingestor, dir: &Path, recursive: bool) -> Imp
     let mut report = ImportReport::default();
     let mut dirs = vec![dir.to_path_buf()];
     while let Some(d) = dirs.pop() {
-        let (subdirs, mut files) = match list_dir(&d).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::warn!(dir = %d.display(), "cannot read directory: {e}");
-                continue;
-            }
-        };
+        let (subdirs, mut files) = list_dir(&d, &mut report).await;
         if recursive {
             dirs.extend(subdirs);
         }
@@ -246,12 +240,38 @@ pub async fn import_dir(ingestor: &Ingestor, dir: &Path, recursive: bool) -> Imp
 
 /// Sub-directories and regular files of `dir`. Symlinks to files are
 /// followed; symlinks to directories are not, so recursion cannot loop.
-async fn list_dir(dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let mut rd = tokio::fs::read_dir(dir).await?;
+/// An unreadable directory or entry is logged and counted as failed; the
+/// rest of the directory is still listed.
+async fn list_dir(dir: &Path, report: &mut ImportReport) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let (mut dirs, mut files) = (Vec::new(), Vec::new());
-    while let Some(e) = rd.next_entry().await? {
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), "cannot read directory: {e}");
+            report.failed += 1;
+            return (dirs, files);
+        }
+    };
+    loop {
+        let e = match rd.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                // A failed readdir step does not advance; stop rather than spin.
+                tracing::warn!(dir = %dir.display(), "cannot list directory: {e}");
+                report.failed += 1;
+                break;
+            }
+        };
         let path = e.path();
-        let ft = e.file_type().await?;
+        let ft = match e.file_type().await {
+            Ok(ft) => ft,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "cannot stat entry: {err}");
+                report.failed += 1;
+                continue;
+            }
+        };
         if ft.is_dir() {
             dirs.push(path);
         } else if ft.is_file()
@@ -260,7 +280,7 @@ async fn list_dir(dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
             files.push(path);
         }
     }
-    Ok((dirs, files))
+    (dirs, files)
 }
 
 /// Whether the file has a Part-10 preamble: at least 132 bytes with `DICM`
