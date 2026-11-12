@@ -105,8 +105,17 @@ Every setting has a default. To change them, copy
 | GET (WS) | `/api/series/{uid}/stream` | Scroll-aware frame stream. See [docs/PROTOCOL.md](docs/PROTOCOL.md). |
 
 If `[http] stow_token` is set, the three POST endpoints need
-`Authorization: Bearer <token>`. They have no CORS headers, so web pages on
-other origins cannot upload. The read endpoints allow any origin.
+`Authorization: Bearer <token>`. They never have CORS headers, so web pages on
+other origins cannot upload. The read endpoints send CORS headers only for the
+origins in `[http] cors_allowed_origins` (empty by default: no CORS), and the
+WebSocket stream refuses other cross-origin pages with 403. The demo viewer is
+same-origin and needs neither.
+
+Every request must carry an allowed `Host` header, or it gets 421 Misdirected
+Request. This blocks DNS rebinding. By default the allowed hosts are
+`localhost`, `127.0.0.1`, `[::1]` and the host of `[http] addr`. To reach the
+server by another name (for example when binding `0.0.0.0`), list it in
+`[http] allowed_hosts`.
 
 ## DIMSE
 

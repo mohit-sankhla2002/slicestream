@@ -21,6 +21,8 @@ use tower::ServiceExt;
 
 const BOUNDARY: &str = "XXslicestreamXX";
 const STUDY: &str = "2.25.1000000000000000000000000000002";
+/// Host header sent by these tests (allowed by the harness).
+const HOST: &str = "pacs.example";
 
 struct Harness {
     router: Router,
@@ -52,7 +54,10 @@ async fn harness_with(
     };
     storage(&mut scfg, &files);
     let ingestor = Ingestor::open(scfg).await.unwrap();
-    let mut cfg = HttpConfig::default();
+    let mut cfg = HttpConfig {
+        allowed_hosts: vec![HOST.into()],
+        ..HttpConfig::default()
+    };
     http(&mut cfg);
     let state = Arc::new(AppState {
         catalog: SeriesCatalog::new(Arc::clone(&ingestor)),
@@ -86,7 +91,7 @@ fn related_ct() -> String {
 
 fn stow_request(uri: &str, content_type: &str, body: Vec<u8>) -> Request<Body> {
     Request::post(uri)
-        .header(header::HOST, "pacs.example")
+        .header(header::HOST, HOST)
         .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(body))
         .unwrap()
@@ -396,7 +401,10 @@ async fn post_instance_too_large_413() {
         catalog: SeriesCatalog::new(Arc::clone(&ingestor)),
         scheduler: SchedulerConfig::default(),
         ingestor,
-        http: HttpConfig::default(),
+        http: HttpConfig {
+            allowed_hosts: vec![HOST.into()],
+            ..HttpConfig::default()
+        },
     }));
     let (status, json) = send(
         &router,
@@ -409,6 +417,7 @@ async fn post_instance_too_large_413() {
 
 fn preflight(uri: &str) -> Request<Body> {
     Request::options(uri)
+        .header(header::HOST, HOST)
         .header(header::ORIGIN, "https://evil.example")
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
         .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
@@ -449,20 +458,130 @@ async fn ingest_routes_reject_cors_preflight() {
     );
 }
 
-#[tokio::test]
-async fn read_routes_keep_permissive_cors() {
-    let h = harness(1, |_| {}).await;
-    let req = Request::get("/api/series")
-        .header(header::ORIGIN, "https://viewer.example")
+fn get_with_origin(uri: &str, origin: &str) -> Request<Body> {
+    Request::get(uri)
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, origin)
         .body(Body::empty())
+        .unwrap()
+}
+
+fn acao(res: &axum::response::Response) -> Option<&str> {
+    res.headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .map(|v| v.to_str().unwrap())
+}
+
+#[tokio::test]
+async fn read_routes_have_no_cors_by_default() {
+    let h = harness(1, |_| {}).await;
+    for uri in ["/api/series", "/index.html"] {
+        let res = h
+            .router
+            .clone()
+            .oneshot(get_with_origin(uri, "https://viewer.example"))
+            .await
+            .unwrap();
+        assert_eq!(acao(&res), None, "{uri} granted CORS by default");
+    }
+}
+
+#[tokio::test]
+async fn read_routes_allow_only_configured_origins() {
+    let h = harness(1, |c| {
+        c.cors_allowed_origins = vec!["https://viewer.example".into()];
+    })
+    .await;
+    let res = h
+        .router
+        .clone()
+        .oneshot(get_with_origin("/api/series", "https://viewer.example"))
+        .await
         .unwrap();
-    let res = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert!(
-        res.headers()
-            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-            .is_some()
-    );
+    assert_eq!(acao(&res), Some("https://viewer.example"));
+
+    let res = h
+        .router
+        .clone()
+        .oneshot(get_with_origin("/api/series", "https://evil.example"))
+        .await
+        .unwrap();
+    assert_eq!(acao(&res), None);
+
+    // Ingest routes never get CORS, even for a configured origin.
+    let mut req = preflight("/api/instances");
+    req.headers_mut()
+        .insert(header::ORIGIN, "https://viewer.example".parse().unwrap());
+    let res = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(acao(&res), None);
+}
+
+#[tokio::test]
+async fn unknown_host_is_rejected_on_every_route() {
+    let h = harness(1, |_| {}).await;
+    let get = |uri: &str, host: Option<&str>| {
+        let mut b = Request::get(uri);
+        if let Some(host) = host {
+            b = b.header(header::HOST, host);
+        }
+        b.body(Body::empty()).unwrap()
+    };
+    let mut post = stow_request("/api/instances", "application/dicom", Vec::new());
+    post.headers_mut()
+        .insert(header::HOST, "rebound.example".parse().unwrap());
+    let cases = [
+        get("/api/series", Some("evil.example")),
+        get("/api/series", Some("evil.example:8080")),
+        get("/index.html", Some("evil.example")),
+        get("/api/series", None),
+        post,
+    ];
+    for (i, req) in cases.into_iter().enumerate() {
+        let res = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::MISDIRECTED_REQUEST, "case {i}");
+    }
+    let res = h
+        .router
+        .clone()
+        .oneshot(get("/api/series", Some(HOST)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn default_allowed_hosts_are_loopback_and_addr() {
+    let h = harness(1, |c| {
+        c.allowed_hosts = Vec::new();
+        c.addr = "192.0.2.7:9000".parse().unwrap();
+    })
+    .await;
+    for (host, ok) in [
+        ("localhost", true),
+        ("localhost:9000", true),
+        ("LOCALHOST:9000", true),
+        ("127.0.0.1", true),
+        ("127.0.0.1:9000", true),
+        ("[::1]:9000", true),
+        ("192.0.2.7:9000", true),
+        ("192.0.2.7", true),
+        ("localhost:9001", false),
+        ("pacs.example", false),
+        ("localhost.evil.example", false),
+    ] {
+        let req = Request::get("/api/series")
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap();
+        let res = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status() == StatusCode::OK,
+            ok,
+            "{host}: {}",
+            res.status()
+        );
+    }
 }
 
 #[test]

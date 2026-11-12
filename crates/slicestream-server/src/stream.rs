@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use slicestream_core::protocol::{self, ClientMessage};
@@ -19,7 +19,11 @@ pub async fn stream_series(
     ws: WebSocketUpgrade,
     Path(uid): Path<String>,
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
 ) -> Response {
+    if !crate::hosts::websocket_origin_allowed(&state.http, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let series = match state.catalog.get(&uid).await {
         Ok(Some(s)) => s,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),

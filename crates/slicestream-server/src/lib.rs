@@ -10,18 +10,19 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderName, HeaderValue, Method};
 use axum::routing::{get, post};
 use slicestream_core::SchedulerConfig;
 use slicestream_dimse::StoreScp;
 use slicestream_store::Ingestor;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
-use tower::Layer;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
 pub mod catalog;
 pub mod config;
+pub mod hosts;
 pub mod routes;
 pub mod stow;
 pub mod stream;
@@ -46,21 +47,51 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/api/instances", post(stow::post_instance))
         .layer(DefaultBodyLimit::disable());
 
-    // Permissive CORS is a dev default for the read-only API and static
-    // files only. Ingest routes get no CORS layer, so cross-origin browser
-    // preflights fail and web pages cannot upload to a local server.
-    let read = Router::new()
+    // CORS only for the read API and only for configured origins. Ingest
+    // routes and static files never get CORS, so cross-origin pages cannot
+    // upload or read through them. (The demo viewer is same-origin.)
+    let mut read = Router::new()
         .route("/api/series", get(routes::list_series))
         .route("/api/series/{uid}", get(routes::get_series))
         .route("/api/series/{uid}/frames/{index}", get(routes::get_frame))
-        .route("/api/series/{uid}/stream", get(stream::stream_series))
-        .layer(CorsLayer::permissive());
+        .route("/api/series/{uid}/stream", get(stream::stream_series));
+    if let Some(cors) = cors_layer(&state.http.cors_allowed_origins) {
+        read = read.layer(cors);
+    }
 
+    // Every route, including static files, checks Host against DNS rebinding.
+    let allowed = Arc::new(hosts::HostAllowList::from_config(&state.http));
     Router::new()
         .merge(read)
         .merge(ingest)
-        .fallback_service(CorsLayer::permissive().layer(ServeDir::new(&state.http.web_dir)))
+        .fallback_service(ServeDir::new(&state.http.web_dir))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            hosts::host_guard(Arc::clone(&allowed), req, next)
+        }))
         .with_state(state)
+}
+
+/// CORS for exactly `origins`; `None` when the list is empty.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let origins: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| match HeaderValue::from_str(o) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(origin = %o, "ignoring invalid cors_allowed_origins entry");
+                None
+            }
+        })
+        .collect();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([Method::GET, Method::HEAD])
+            .expose_headers([HeaderName::from_static("x-slicestream-frame-info")]),
+    )
 }
 
 /// How long open HTTP connections (including WebSocket streams) may run
@@ -115,11 +146,14 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
     let catalog = SeriesCatalog::new(Arc::clone(&ingestor));
     catalog.spawn_invalidator();
 
+    // With `addr` port 0, derive the default allowed hosts from the bound port.
+    let mut http = config.http;
+    http.addr = http_addr;
     let state = Arc::new(AppState {
         catalog,
         ingestor,
         scheduler: SchedulerConfig::default(),
-        http: config.http,
+        http,
     });
     let router = app(state);
 

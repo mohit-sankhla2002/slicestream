@@ -87,6 +87,12 @@ Responses are `application/dicom+json` and hold (0008,1190) RetrieveURL,
 | 413 | Request exceeds `max_request_bytes` |
 | 400 | Malformed multipart body |
 | 401 | A `stow_token` is configured and the bearer token is missing or wrong |
+| 421 | The `Host` header is not in `allowed_hosts` (any route) |
+
+Ingest routes never send CORS headers. Read routes send them only for the
+origins in `[http] cors_allowed_origins` (default: none). Every route checks
+the `Host` header against `[http] allowed_hosts` (default: `localhost`,
+`127.0.0.1`, `[::1]` and the host of `[http] addr`).
 
 ## Limits and defaults
 
@@ -95,6 +101,8 @@ Responses are `application/dicom+json` and hold (0008,1190) RetrieveURL,
 | `[storage] max_instance_bytes` | 2147483648 (2 GiB) |
 | `[storage] on_duplicate` | `keep` (or `overwrite`) |
 | `[http] max_request_bytes` | 17179869184 (16 GiB) |
+| `[http] cors_allowed_origins` | empty (no CORS) |
+| `[http] allowed_hosts` | empty (loopback names and the host of `addr`) |
 | `[dimse] max_associations` | 64 |
 | `[dimse] max_pdu_length` | 116794 |
 | `[dimse] read_timeout_secs` / `write_timeout_secs` | 60 / 60 |

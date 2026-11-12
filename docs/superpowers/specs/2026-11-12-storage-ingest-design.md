@@ -142,6 +142,8 @@ on_duplicate = "keep"            # keep | overwrite
 addr = "127.0.0.1:8080"
 max_request_bytes = 17179869184  # 16 GiB
 # stow_token = "..."
+cors_allowed_origins = []        # e.g. ["https://viewer.example.org"]; empty: no CORS
+allowed_hosts = []               # empty: localhost, 127.0.0.1, [::1], addr's host
 
 [dimse]
 enabled = true

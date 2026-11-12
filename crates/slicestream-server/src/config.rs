@@ -42,6 +42,14 @@ pub struct HttpConfig {
     pub stow_token: Option<String>,
     /// Static files for the demo viewer.
     pub web_dir: PathBuf,
+    /// Origins (e.g. `https://viewer.example.org`) allowed to read the API
+    /// cross-origin. Empty: no CORS headers anywhere. Ingest routes never
+    /// get CORS.
+    pub cors_allowed_origins: Vec<String>,
+    /// Accepted `Host` header values (`host` or `host:port`); others get
+    /// 421. Empty: `localhost`, `127.0.0.1`, `[::1]` and the host of `addr`,
+    /// each with or without the port of `addr`.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for HttpConfig {
@@ -51,6 +59,8 @@ impl Default for HttpConfig {
             max_request_bytes: 17_179_869_184,
             stow_token: None,
             web_dir: PathBuf::from("web"),
+            cors_allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -65,6 +75,8 @@ impl std::fmt::Debug for HttpConfig {
                 &self.stow_token.as_ref().map(|_| "<redacted>"),
             )
             .field("web_dir", &self.web_dir)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("allowed_hosts", &self.allowed_hosts)
             .finish()
     }
 }

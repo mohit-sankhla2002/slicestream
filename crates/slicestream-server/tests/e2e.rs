@@ -109,11 +109,8 @@ async fn list_series(addr: SocketAddr) -> Vec<Value> {
     json.as_array().unwrap().clone()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stow_then_stream() {
-    let srv = Server::start(5).await;
-    let addr = srv.running.http_addr;
-
+/// STOW every phantom file of `srv` in one request; expects 200.
+async fn stow_phantom(srv: &Server) {
     let mut body = Vec::new();
     for f in &srv.phantom {
         body.extend_from_slice(
@@ -124,8 +121,22 @@ async fn stow_then_stream() {
     }
     body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
     let ct = format!("multipart/related; type=\"application/dicom\"; boundary={BOUNDARY}");
-    let (status, json) = http(addr, "POST", "/dicom-web/studies", &ct, &body).await;
+    let (status, json) = http(
+        srv.running.http_addr,
+        "POST",
+        "/dicom-web/studies",
+        &ct,
+        &body,
+    )
+    .await;
     assert_eq!(status, 200, "{json}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stow_then_stream() {
+    let srv = Server::start(5).await;
+    let addr = srv.running.http_addr;
+    stow_phantom(&srv).await;
 
     let list = list_series(addr).await;
     assert_eq!(list.len(), 1, "{list:?}");
@@ -469,4 +480,31 @@ async fn running_server_owns_its_storage_root() {
     })
     .await
     .expect("lock released after shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_rejects_cross_origin_websocket() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let srv = Server::start(2).await;
+    let addr = srv.running.http_addr;
+    stow_phantom(&srv).await;
+    let url = format!("ws://{addr}/api/series/{SERIES}/stream");
+
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+    let err = tokio_tungstenite::connect_async(req).await.unwrap_err();
+    assert!(
+        matches!(&err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403),
+        "{err:?}"
+    );
+
+    // Same origin (the demo viewer) is accepted.
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    drop(ws);
+    srv.stop().await;
 }
