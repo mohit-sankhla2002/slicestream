@@ -14,7 +14,10 @@ categories.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dicom-core = "0.10.1"
 dicom-dictionary-std = { version = "0.10.1", features = ["sop-class"] }
+dicom-encoding = "0.10.1"
 dicom-object = "0.10.1"
+dicom-parser = "0.10.1"
+dicom-transfer-syntax-registry = "0.10.1"
 fs4 = "1.1.0"
 rand = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,6 +30,5 @@ tokio = { version = "1", features = ["fs", "io-util", "rt", "sync"] }
 tracing = "0.1.44"
 
 [dev-dependencies]
-dicom-transfer-syntax-registry = "0.10.1"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread"] }
