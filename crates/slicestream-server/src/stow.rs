@@ -54,12 +54,14 @@ impl PartResult {
     /// Map an ingest error, keeping whichever UIDs the error itself carries.
     fn from_error(e: &IngestError) -> Self {
         let (mut sop_class_uid, mut sop_instance_uid) = (None, None);
-        if let IngestError::UidMismatch { field, actual, .. } = e {
-            match *field {
+        match e {
+            IngestError::UidMismatch { field, actual, .. } => match *field {
                 "SOPClassUID" => sop_class_uid = Some(actual.clone()),
                 "SOPInstanceUID" => sop_instance_uid = Some(actual.clone()),
                 _ => {}
-            }
+            },
+            IngestError::UnsupportedSopClass(uid) => sop_class_uid = Some(uid.clone()),
+            _ => {}
         }
         PartResult::Failed {
             sop_class_uid,
@@ -458,4 +460,24 @@ fn ingest_error_response(e: &IngestError) -> Response {
         Json(json!({ "error": message, "status": e.status() })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_sop_class_reports_class_uid() {
+        let r = PartResult::from_error(&IngestError::UnsupportedSopClass(
+            "1.2.840.10008.1.1".into(),
+        ));
+        assert_eq!(
+            r,
+            PartResult::Failed {
+                sop_class_uid: Some("1.2.840.10008.1.1".into()),
+                sop_instance_uid: None,
+                reason: 0x0122,
+            }
+        );
+    }
 }

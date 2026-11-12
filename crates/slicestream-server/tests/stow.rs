@@ -408,6 +408,64 @@ async fn post_instance_too_large_413() {
     assert_eq!(json["status"], 0xA700);
 }
 
+fn preflight(uri: &str) -> Request<Body> {
+    Request::options(uri)
+        .header(header::ORIGIN, "https://evil.example")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ingest_routes_reject_cors_preflight() {
+    let h = harness(1, |_| {}).await;
+    for uri in [
+        "/api/instances",
+        "/dicom-web/studies",
+        "/dicom-web/studies/1.2.3",
+    ] {
+        let res = h.router.clone().oneshot(preflight(uri)).await.unwrap();
+        assert!(
+            res.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none(),
+            "{uri} granted a cross-origin preflight"
+        );
+    }
+
+    // A simple cross-origin POST gets no CORS grant either.
+    let mut req = stow_request(
+        "/api/instances",
+        "application/dicom",
+        std::fs::read(&h.files[0]).unwrap(),
+    );
+    req.headers_mut()
+        .insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+    let res = h.router.clone().oneshot(req).await.unwrap();
+    assert!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn read_routes_keep_permissive_cors() {
+    let h = harness(1, |_| {}).await;
+    let req = Request::get("/api/series")
+        .header(header::ORIGIN, "https://viewer.example")
+        .body(Body::empty())
+        .unwrap();
+    let res = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_some()
+    );
+}
+
 #[test]
 fn stow_response_shape() {
     let stored = Stored {

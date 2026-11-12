@@ -10,6 +10,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use slicestream_core::{SchedulerConfig, Series};
 use slicestream_store::Ingestor;
+use tower::Layer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -37,13 +38,19 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/api/instances", post(stow::post_instance))
         .layer(DefaultBodyLimit::disable());
 
-    Router::new()
+    // Permissive CORS is a dev default for the read-only API and static
+    // files only. Ingest routes get no CORS layer, so cross-origin browser
+    // preflights fail and web pages cannot upload to a local server.
+    let read = Router::new()
         .route("/api/series", get(routes::list_series))
         .route("/api/series/{uid}", get(routes::get_series))
         .route("/api/series/{uid}/frames/{index}", get(routes::get_frame))
         .route("/api/series/{uid}/stream", get(stream::stream_series))
+        .layer(CorsLayer::permissive());
+
+    Router::new()
+        .merge(read)
         .merge(ingest)
-        .fallback_service(ServeDir::new(&state.http.web_dir))
-        .layer(CorsLayer::permissive()) // dev default; lock down in production
+        .fallback_service(CorsLayer::permissive().layer(ServeDir::new(&state.http.web_dir)))
         .with_state(state)
 }
