@@ -1822,7 +1822,13 @@ dependencies = [
  "dicom-object",
  "dicom-transfer-syntax-registry",
  "dicom-ul",
+ "serde",
+ "slicestream-store",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

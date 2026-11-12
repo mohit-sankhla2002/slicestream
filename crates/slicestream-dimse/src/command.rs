@@ -21,6 +21,8 @@ pub enum DimseRequest {
         command_field: u16,
         message_id: u16,
         sop_class_uid: Option<String>,
+        /// A data set follows (Command Data Set Type present and != 0x0101).
+        has_dataset: bool,
     },
 }
 
@@ -73,6 +75,8 @@ pub fn parse_command(bytes: &[u8]) -> Result<DimseRequest, CommandError> {
             command_field,
             message_id,
             sop_class_uid,
+            has_dataset: u16_of(&obj, tags::COMMAND_DATA_SET_TYPE, "CommandDataSetType")
+                .is_ok_and(|ds| ds != 0x0101),
         }),
     }
 }
