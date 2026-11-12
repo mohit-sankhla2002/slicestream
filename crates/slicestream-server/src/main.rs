@@ -18,7 +18,7 @@ use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use slicestream_server::config::Config;
 use slicestream_server::{import_dir, start};
-use slicestream_store::Ingestor;
+use slicestream_store::{IngestError, Ingestor};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -79,12 +79,27 @@ async fn import(config: Config, dir: PathBuf, recursive: bool) -> anyhow::Result
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
-    // No `recover()` here: a server may be running on the same storage root,
-    // and recovery would remove its in-flight spool files.
+    // `import` owns the storage root like `serve` does, so it cannot run
+    // beside a server on the same root.
     let root = config.storage.root.clone();
-    let ingestor = Ingestor::open(config.storage)
-        .await
-        .with_context(|| format!("opening storage at {}", root.display()))?;
+    let ingestor = match Ingestor::open(config.storage).await {
+        Ok(i) => i,
+        Err(IngestError::Locked { .. }) => bail!(
+            "a server is running on the storage root {}; stop it, or upload via \
+             STOW-RS / POST /api/instances instead",
+            root.display()
+        ),
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("opening storage at {}", root.display()));
+        }
+    };
+    let report = ingestor.recover().await.context("storage recovery")?;
+    tracing::info!(
+        tmp_removed = report.tmp_removed,
+        orphans_removed = report.orphans_removed,
+        "storage ready"
+    );
     let r = import_dir(&ingestor, &dir, recursive).await;
     println!(
         "stored {} / duplicate {} / failed {} (skipped {} non-DICOM)",

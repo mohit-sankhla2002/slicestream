@@ -113,3 +113,7 @@ benchmarks against Orthanc and dcm4chee.
 - The demo viewer renders only native (uncompressed) grayscale.
 - Storage is the local filesystem only, and the series list is rebuilt from
   the index on demand. There is no QIDO-RS/WADO-RS yet.
+- One process owns a storage root. `serve` and `import` take an exclusive
+  lock on `<root>/LOCK`; a second process on the same root fails at startup.
+  Use `import` only while the server is stopped; while it runs, upload through
+  STOW-RS, `POST /api/instances` or C-STORE.

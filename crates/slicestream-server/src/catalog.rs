@@ -64,7 +64,8 @@ impl SeriesCatalog {
     }
 
     /// Cached series for `row`, rebuilt if missing or if the index has a
-    /// different instance count (e.g. written by another process).
+    /// different instance count (a backstop in case an invalidation was
+    /// missed).
     async fn get_row(&self, row: &SeriesRow) -> anyhow::Result<Option<Arc<Series>>> {
         if let Some(e) = self.cache.read().await.get(&row.series_instance_uid) {
             if e.instance_count == row.instance_count {

@@ -208,14 +208,23 @@ impl FsBlobStore {
         }
     }
 
-    /// Remove every file in `tmp/`; returns how many were removed.
+    /// Remove every file in `tmp/`; returns how many were removed. Files
+    /// that vanish during the sweep are skipped, not treated as errors.
     pub fn sweep_tmp(&self) -> io::Result<usize> {
         let mut n = 0;
         for entry in fs::read_dir(self.root.join("tmp"))? {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
-                fs::remove_file(entry.path())?;
-                n += 1;
+            let is_file = match entry.file_type() {
+                Ok(ft) => ft.is_file(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if is_file {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => n += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(n)

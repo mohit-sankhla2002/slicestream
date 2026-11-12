@@ -66,12 +66,18 @@ impl Server {
     }
 
     async fn stop(self) {
+        self.stop_keep_dir().await;
+    }
+
+    /// Stop the server and hand back its temp dir (storage still on disk).
+    async fn stop_keep_dir(self) -> tempfile::TempDir {
         self.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(10), self.running.task)
             .await
             .expect("server stops promptly")
             .unwrap()
             .unwrap();
+        self._dir
     }
 }
 
@@ -439,4 +445,28 @@ async fn import_counts_unreadable_dir_as_failed() {
     }
     assert_eq!(report.stored, 2, "{report:?}");
     assert_eq!(report.failed, 1, "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_server_owns_its_storage_root() {
+    let srv = Server::start(1).await;
+    let root = srv._dir.path().join("store");
+    let err = Ingestor::open(StorageConfig {
+        root: root.clone(),
+        ..StorageConfig::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, slicestream_store::IngestError::Locked { .. }),
+        "{err:?}"
+    );
+    let dir = srv.stop_keep_dir().await;
+    // A stopped server has released the lock.
+    Ingestor::open(StorageConfig {
+        root: dir.path().join("store"),
+        ..StorageConfig::default()
+    })
+    .await
+    .expect("lock released after shutdown");
 }

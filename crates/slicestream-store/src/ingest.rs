@@ -4,6 +4,11 @@
 //! directory fsync) → index transaction → acknowledge → broadcast. A blob may
 //! therefore exist without an index row (an orphan, removed by
 //! [`Ingestor::recover`]), but an index row never exists without its blob.
+//!
+//! One process owns a storage root: [`Ingestor::open`] takes an exclusive
+//! advisory lock on `<root>/LOCK` and holds it for the life of the
+//! [`Ingestor`]. Every other safety mechanism here (the per-UID stripe locks,
+//! [`Ingestor::recover`]) relies on that.
 
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -29,6 +34,8 @@ const EVENT_CAPACITY: usize = 1024;
 const LOCK_STRIPES: usize = 64;
 /// Chunk size used by [`Ingestor::import_file`].
 const IMPORT_CHUNK: usize = 64 * 1024;
+/// Lock file under the storage root, held exclusively by the owning process.
+const LOCK_FILE: &str = "LOCK";
 
 /// Where an instance came from. Recorded in the index `source` column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +123,8 @@ pub enum IngestError {
     Storage(#[from] io::Error),
     #[error("index error: {0}")]
     Index(#[from] sqlx::Error),
+    #[error("storage root {} is in use by another process (lock on {} is held)", root.display(), root.join(LOCK_FILE).display())]
+    Locked { root: PathBuf },
 }
 
 impl IngestError {
@@ -126,9 +135,10 @@ impl IngestError {
             IngestError::UidMismatch { .. } => 0xA900,
             IngestError::StudyMismatch { .. } => 0xC409,
             IngestError::UnsupportedSopClass(_) => 0x0122,
-            IngestError::TooLarge { .. } | IngestError::Storage(_) | IngestError::Index(_) => {
-                0xA700
-            }
+            IngestError::TooLarge { .. }
+            | IngestError::Storage(_)
+            | IngestError::Index(_)
+            | IngestError::Locked { .. } => 0xA700,
         }
     }
 }
@@ -237,6 +247,27 @@ pub struct Ingestor {
     shared: Arc<Shared>,
 }
 
+/// Create `root` and take an exclusive advisory lock on `root/LOCK`. The lock
+/// is released when the returned file is closed. Blocking.
+fn lock_root(root: &Path) -> Result<std::fs::File, IngestError> {
+    std::fs::create_dir_all(root)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(LOCK_FILE))?;
+    // Called through the trait: newer std has an inherent `File::try_lock`
+    // with a different error type, and the MSRV predates it.
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => Ok(file),
+        Err(fs4::TryLockError::WouldBlock) => Err(IngestError::Locked {
+            root: root.to_path_buf(),
+        }),
+        Err(fs4::TryLockError::Error(e)) => Err(IngestError::Storage(e)),
+    }
+}
+
 /// State used by the commit → index → cleanup critical section, which runs
 /// in its own task and therefore needs owned (`Arc`) access.
 #[derive(Debug)]
@@ -250,7 +281,12 @@ struct Shared {
     /// that can create, reference or delete a given blob is serialized here;
     /// without it, a cleanup could delete a blob that a concurrent ingest of
     /// the same instance has just committed and is about to index.
+    ///
+    /// These locks are per process. They are sufficient only because this
+    /// process is the sole writer of the storage root (see `_root_lock`).
     locks: Box<[Mutex<()>]>,
+    /// Exclusive lock on `<root>/LOCK`, held for the life of the ingestor.
+    _root_lock: std::fs::File,
     #[cfg(test)]
     hooks: TestHooks,
 }
@@ -381,11 +417,19 @@ impl Shared {
 }
 
 impl Ingestor {
-    /// Open the blob store at `cfg.root` and the index at
-    /// `cfg.root/index.sqlite`, creating both if missing.
+    /// Lock the storage root, then open the blob store at `cfg.root` and the
+    /// index at `cfg.root/index.sqlite`, creating both if missing.
+    ///
+    /// Fails with [`IngestError::Locked`] if another process (or another
+    /// `Ingestor` in this process) already owns the root. The lock is held
+    /// until the `Ingestor` is dropped.
     pub async fn open(cfg: StorageConfig) -> Result<Arc<Ingestor>, IngestError> {
         let root = cfg.root.clone();
-        let blobs = blocking(move || FsBlobStore::open(&root)).await??;
+        let (root_lock, blobs) = blocking(move || -> Result<_, IngestError> {
+            let lock = lock_root(&root)?;
+            Ok((lock, FsBlobStore::open(&root)?))
+        })
+        .await??;
         let index = Index::open(&cfg.root.join("index.sqlite")).await?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let locks = (0..LOCK_STRIPES).map(|_| Mutex::new(())).collect();
@@ -395,6 +439,7 @@ impl Ingestor {
             on_duplicate: cfg.on_duplicate,
             events,
             locks,
+            _root_lock: root_lock,
             #[cfg(test)]
             hooks: TestHooks::default(),
         });
@@ -471,7 +516,8 @@ impl Ingestor {
     ///
     /// Call this before accepting any writes. Running it concurrently with
     /// [`Ingestor::ingest`] could remove an in-flight spool file or a blob
-    /// that has been committed but not yet indexed.
+    /// that has been committed but not yet indexed. No other process can be
+    /// writing: the root lock taken by [`Ingestor::open`] excludes it.
     pub async fn recover(&self) -> Result<RecoveryReport, IngestError> {
         let blobs = self.shared.blobs.clone();
         let tmp_removed = blocking(move || blobs.sweep_tmp()).await??;

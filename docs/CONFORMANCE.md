@@ -88,6 +88,13 @@ Responses are `application/dicom+json` and hold (0008,1190) RetrieveURL,
 Duplicates (same SOP Instance UID) return success. With `keep`, the first copy
 stays. With `overwrite`, the index points to the new copy.
 
+## Storage ownership
+
+One process owns a storage root. `serve` and `import` take an exclusive
+advisory lock on `<root>/LOCK` and fail at startup if another process holds
+it. `import` is for a stopped server; while the server runs, send instances
+through STOW-RS, `POST /api/instances` or C-STORE.
+
 ## Interoperability testing
 
 `scripts/interop-dcmtk.sh` runs DCMTK `echoscu` and `storescu` against the

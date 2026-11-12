@@ -397,3 +397,16 @@ fn ingestor_is_send_sync() {
     fn ss<T: Send + Sync>() {}
     ss::<Arc<Ingestor>>();
 }
+
+#[tokio::test]
+async fn second_open_on_same_root_fails_until_first_is_dropped() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let first = Ingestor::open(config(&root)).await.unwrap();
+    let err = Ingestor::open(config(&root)).await.unwrap_err();
+    assert!(matches!(err, IngestError::Locked { .. }), "{err:?}");
+    assert!(err.to_string().contains("in use"), "{err}");
+    drop(first);
+    let again = Ingestor::open(config(&root)).await.unwrap();
+    drop(again);
+}

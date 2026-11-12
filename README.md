@@ -81,9 +81,11 @@ cargo run -p slicestream-server -- serve
 
 `import <DIR>` reads Part-10 files from a folder (`--recursive` descends into
 subfolders) and skips files without the `DICM` preamble. It prints
-`stored / duplicate / failed` counts. While `serve` runs, you can also push
-instances with STOW-RS, `POST /api/instances`, or C-STORE from a modality or
-another PACS (called AE title `SLICESTREAM`). They show up without a restart.
+`stored / duplicate / failed` counts. One process owns a storage root (it
+holds a lock on `<root>/LOCK`), so run `import` only while the server is
+stopped. While `serve` runs, push instances with STOW-RS,
+`POST /api/instances`, or C-STORE from a modality or another PACS (called AE
+title `SLICESTREAM`). They show up without a restart.
 
 Every setting has a default. To change them, copy
 [`slicestream.example.toml`](slicestream.example.toml) and pass

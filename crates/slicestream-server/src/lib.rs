@@ -76,23 +76,16 @@ pub struct Running {
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
-/// Open storage, run recovery, bind HTTP and (if enabled) the DIMSE SCP,
-/// and serve both until `shutdown` is cancelled.
+/// Open (and lock) storage, bind HTTP and (if enabled) the DIMSE SCP, run
+/// recovery, and serve both until `shutdown` is cancelled.
+///
+/// The listeners are bound before recovery so that a port conflict fails
+/// before anything is deleted; nothing is accepted until recovery is done.
 pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Result<Running> {
     let root = config.storage.root.clone();
     let ingestor = Ingestor::open(config.storage)
         .await
         .with_context(|| format!("opening storage at {}", root.display()))?;
-    let report = ingestor.recover().await.context("storage recovery")?;
-    tracing::info!(
-        root = %root.display(),
-        tmp_removed = report.tmp_removed,
-        orphans_removed = report.orphans_removed,
-        "storage ready"
-    );
-
-    let catalog = SeriesCatalog::new(Arc::clone(&ingestor));
-    catalog.spawn_invalidator();
 
     let listener = tokio::net::TcpListener::bind(config.http.addr)
         .await
@@ -110,6 +103,17 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         None
     };
     let dimse_addr = scp.as_ref().map(StoreScp::local_addr);
+
+    let report = ingestor.recover().await.context("storage recovery")?;
+    tracing::info!(
+        root = %root.display(),
+        tmp_removed = report.tmp_removed,
+        orphans_removed = report.orphans_removed,
+        "storage ready"
+    );
+
+    let catalog = SeriesCatalog::new(Arc::clone(&ingestor));
+    catalog.spawn_invalidator();
 
     let state = Arc::new(AppState {
         catalog,
