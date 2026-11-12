@@ -16,6 +16,11 @@ pub mod protocol;
 pub mod scheduler;
 pub mod series;
 
+/// Header attribute helpers shared with the ingest pipeline.
+pub mod attrs {
+    pub use crate::frame::{get_f64s, get_i64, get_str};
+}
+
 pub use error::{Error, Result};
 pub use frame::{Frame, FrameInfo};
 pub use scheduler::{PrefetchScheduler, SchedulerConfig};

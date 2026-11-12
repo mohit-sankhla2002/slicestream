@@ -44,3 +44,41 @@ fn scheduler_drives_full_series() {
     }
     assert_eq!(n, 8);
 }
+
+#[test]
+fn from_slices_sorts_by_position_then_instance() {
+    use slicestream_core::{FrameInfo, SliceRef};
+    use std::path::PathBuf;
+
+    let info = FrameInfo {
+        rows: 1,
+        columns: 1,
+        bits_allocated: 16,
+        bits_stored: 16,
+        samples_per_pixel: 1,
+        pixel_representation: 0,
+        photometric_interpretation: "MONOCHROME2".into(),
+        transfer_syntax: "1.2.840.10008.1.2.1".into(),
+        rescale_slope: 1.0,
+        rescale_intercept: 0.0,
+        window_center: None,
+        window_width: None,
+    };
+    let mk = |name: &str, pos: Option<f64>, inst: i64| {
+        SliceRef::new(PathBuf::from(name), 0, info.clone(), pos, Some(inst))
+    };
+    let s = Series::from_slices(
+        "1.2.3".into(),
+        None,
+        None,
+        vec![
+            mk("pos2", Some(2.0), 1),
+            mk("none", None, 5),
+            mk("pos1", Some(1.0), 9),
+        ],
+    );
+    let names: Vec<_> = (0..s.len())
+        .map(|i| s.slice(i).unwrap().path.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["none", "pos1", "pos2"]);
+}

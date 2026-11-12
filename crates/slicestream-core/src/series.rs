@@ -17,7 +17,8 @@ pub struct SliceRef {
     /// Frame number inside a (possibly multi-frame) instance.
     pub frame: u32,
     pub info: FrameInfo,
-    sort_key: (f64, i64, u32),
+    position: Option<f64>,
+    instance_number: Option<i64>,
 }
 
 /// An ordered stack of slices belonging to one SeriesInstanceUID.
@@ -44,7 +45,54 @@ pub struct SeriesSummary {
     pub first: FrameInfo,
 }
 
+impl SliceRef {
+    pub fn new(
+        path: PathBuf,
+        frame: u32,
+        info: FrameInfo,
+        position: Option<f64>,
+        instance_number: Option<i64>,
+    ) -> SliceRef {
+        SliceRef {
+            path,
+            frame,
+            info,
+            position,
+            instance_number,
+        }
+    }
+
+    fn sort_key(&self) -> (f64, i64, u32) {
+        (
+            self.position.unwrap_or(0.0),
+            self.instance_number.unwrap_or(0),
+            self.frame,
+        )
+    }
+}
+
 impl Series {
+    /// Build a series from already-indexed slices, sorting them anatomically.
+    pub fn from_slices(
+        uid: String,
+        description: Option<String>,
+        modality: Option<String>,
+        mut slices: Vec<SliceRef>,
+    ) -> Series {
+        slices.sort_by(|a, b| {
+            let (ka, kb) = (a.sort_key(), b.sort_key());
+            ka.0.total_cmp(&kb.0)
+                .then(ka.1.cmp(&kb.1))
+                .then(ka.2.cmp(&kb.2))
+        });
+        Series {
+            uid,
+            description,
+            modality,
+            slices,
+        }
+    }
+
     /// Scan `dir` (non-recursively) and group every readable DICOM image by
     /// SeriesInstanceUID. Non-DICOM files are skipped silently.
     pub fn scan_dir(dir: impl AsRef<Path>) -> Result<Vec<Series>> {
@@ -54,7 +102,9 @@ impl Series {
             source,
         })?;
 
-        let mut groups: BTreeMap<String, Series> = BTreeMap::new();
+        // uid -> (description, modality, slices)
+        type Group = (Option<String>, Option<String>, Vec<SliceRef>);
+        let mut groups: BTreeMap<String, Group> = BTreeMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -66,40 +116,38 @@ impl Series {
             else {
                 continue;
             };
-            let Ok(info) = FrameInfo::from_object(&obj, obj.meta().transfer_syntax()) else {
+            let Ok(info) = FrameInfo::from_dataset(&obj, obj.meta().transfer_syntax()) else {
                 continue; // not an image (SR, PR, ...)
             };
             let uid = get_str(&obj, tags::SERIES_INSTANCE_UID).unwrap_or_else(|| "unknown".into());
             let n_frames = get_i64(&obj, tags::NUMBER_OF_FRAMES).unwrap_or(1).max(1) as u32;
             let position = slice_position(&obj);
-            let instance = get_i64(&obj, tags::INSTANCE_NUMBER).unwrap_or(0);
+            let instance = get_i64(&obj, tags::INSTANCE_NUMBER);
 
-            let series = groups.entry(uid.clone()).or_insert_with(|| Series {
-                uid,
-                description: get_str(&obj, tags::SERIES_DESCRIPTION),
-                modality: get_str(&obj, tags::MODALITY),
-                slices: Vec::new(),
+            let group = groups.entry(uid).or_insert_with(|| {
+                (
+                    get_str(&obj, tags::SERIES_DESCRIPTION),
+                    get_str(&obj, tags::MODALITY),
+                    Vec::new(),
+                )
             });
             for frame in 0..n_frames {
-                series.slices.push(SliceRef {
-                    path: path.clone(),
+                group.2.push(SliceRef::new(
+                    path.clone(),
                     frame,
-                    info: info.clone(),
-                    sort_key: (position, instance, frame),
-                });
+                    info.clone(),
+                    position,
+                    instance,
+                ));
             }
         }
 
-        let mut out: Vec<Series> = groups.into_values().collect();
-        for s in &mut out {
-            s.slices.sort_by(|a, b| {
-                a.sort_key
-                    .0
-                    .total_cmp(&b.sort_key.0)
-                    .then(a.sort_key.1.cmp(&b.sort_key.1))
-                    .then(a.sort_key.2.cmp(&b.sort_key.2))
-            });
-        }
+        let out: Vec<Series> = groups
+            .into_iter()
+            .map(|(uid, (description, modality, slices))| {
+                Series::from_slices(uid, description, modality, slices)
+            })
+            .collect();
         if out.is_empty() {
             return Err(Error::EmptySeries);
         }
@@ -144,16 +192,16 @@ impl Series {
 }
 
 /// Distance of the slice along its normal, so stacks sort in anatomical order
-/// even when InstanceNumber is missing or wrong. Returns 0 if geometry is absent.
-fn slice_position(obj: &dicom_object::InMemDicomObject) -> f64 {
+/// even when InstanceNumber is missing or wrong. Returns `None` if geometry is absent.
+pub fn slice_position(obj: &dicom_object::InMemDicomObject) -> Option<f64> {
     let (Some(pos), Some(ori)) = (
         get_f64s(obj, tags::IMAGE_POSITION_PATIENT),
         get_f64s(obj, tags::IMAGE_ORIENTATION_PATIENT),
     ) else {
-        return 0.0;
+        return None;
     };
     if pos.len() < 3 || ori.len() < 6 {
-        return 0.0;
+        return None;
     }
     let (r, c) = (&ori[0..3], &ori[3..6]);
     let normal = [
@@ -161,5 +209,5 @@ fn slice_position(obj: &dicom_object::InMemDicomObject) -> f64 {
         r[2] * c[0] - r[0] * c[2],
         r[0] * c[1] - r[1] * c[0],
     ];
-    pos[0] * normal[0] + pos[1] * normal[1] + pos[2] * normal[2]
+    Some(pos[0] * normal[0] + pos[1] * normal[1] + pos[2] * normal[2])
 }

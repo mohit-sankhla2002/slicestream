@@ -50,7 +50,7 @@ impl FrameInfo {
         )
     }
 
-    pub(crate) fn from_object(obj: &InMemDicomObject, transfer_syntax: &str) -> Result<Self> {
+    pub fn from_dataset(obj: &InMemDicomObject, transfer_syntax: &str) -> Result<Self> {
         Ok(Self {
             rows: req_u16(obj, tags::ROWS, "Rows")?,
             columns: req_u16(obj, tags::COLUMNS, "Columns")?,
@@ -174,7 +174,7 @@ fn encapsulated_frame(
 
 // ---- small attribute helpers -------------------------------------------------
 
-pub(crate) fn get_str(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<String> {
+pub fn get_str(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<String> {
     obj.element_opt(tag)
         .ok()
         .flatten()
@@ -186,14 +186,14 @@ pub(crate) fn get_str(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<St
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) fn get_i64(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<i64> {
+pub fn get_i64(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<i64> {
     obj.element_opt(tag)
         .ok()
         .flatten()
         .and_then(|e| e.to_int::<i64>().ok())
 }
 
-pub(crate) fn get_f64s(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<Vec<f64>> {
+pub fn get_f64s(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Option<Vec<f64>> {
     obj.element_opt(tag)
         .ok()
         .flatten()
