@@ -22,6 +22,7 @@ use slicestream_store::{Expectations, IngestSource, Ingestor, TempBlob, write_pa
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, field, info, info_span, warn};
 
@@ -103,6 +104,10 @@ impl StoreScp {
     /// associations finish for up to 30 s before aborting them.
     pub async fn run(self, shutdown: CancellationToken) -> io::Result<()> {
         let options = Arc::new(build_options(&self.cfg));
+        let timeouts = Timeouts {
+            handshake: Duration::from_secs(self.cfg.handshake_timeout_secs),
+            idle: Duration::from_secs(self.cfg.idle_timeout_secs),
+        };
         let permits = Arc::new(Semaphore::new(self.cfg.max_associations));
         let mut tasks = JoinSet::new();
         info!(addr = %self.local_addr, ae_title = %self.cfg.ae_title, "DIMSE SCP listening");
@@ -124,6 +129,7 @@ impl StoreScp {
                             stream,
                             peer,
                             Arc::clone(&options),
+                            timeouts,
                             Arc::clone(&self.ingestor),
                             permit,
                         ));
@@ -184,10 +190,18 @@ fn build_options(cfg: &ScpConfig) -> Options {
     opts
 }
 
+/// Association-level timeouts (see [`ScpConfig`]).
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    handshake: Duration,
+    idle: Duration,
+}
+
 async fn serve(
     stream: TcpStream,
     peer: SocketAddr,
     options: Arc<Options>,
+    timeouts: Timeouts,
     ingestor: Arc<Ingestor>,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -198,13 +212,20 @@ async fn serve(
         called_ae = field::Empty
     );
     async move {
-        let assoc = match options.establish_async(stream).await {
-            Ok(a) => a,
-            Err(e) => {
-                info!(error = %e, "association not established");
-                return;
-            }
-        };
+        // The permit is already held, so bound the whole handshake: a silent
+        // connection must not keep its slot for longer than this.
+        let assoc =
+            match tokio::time::timeout(timeouts.handshake, options.establish_async(stream)).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(e)) => {
+                    info!(error = %e, "association not established");
+                    return;
+                }
+                Err(_) => {
+                    info!("handshake timed out; dropping connection");
+                    return;
+                }
+            };
         let calling_ae = assoc.peer_ae_title().trim().to_owned();
         let called_ae = assoc.called_ae_title().trim().to_owned();
         let span = tracing::Span::current();
@@ -218,6 +239,8 @@ async fn serve(
             called_ae,
             assembler: PdvAssembler::new(MAX_COMMAND_BYTES),
             state: State::Idle,
+            idle_timeout: timeouts.idle,
+            commands: 0,
         };
         session.run(assoc).await;
     }
@@ -268,12 +291,35 @@ struct Session {
     called_ae: String,
     assembler: PdvAssembler,
     state: State,
+    /// Abort when no DIMSE command arrives for this long while idle.
+    idle_timeout: Duration,
+    /// Complete command sets received so far.
+    commands: u64,
 }
 
 impl Session {
     async fn run(mut self, mut assoc: ServerAssoc) {
+        // The idle clock runs only between operations (state `Idle`, which
+        // includes a partially received command). While a data set is being
+        // received, the per-PDU read timeout applies instead.
+        let mut idle_deadline = Instant::now() + self.idle_timeout;
         loop {
-            let pdu = match assoc.receive().await {
+            let received = if matches!(self.state, State::Idle) {
+                match tokio::time::timeout_at(idle_deadline, assoc.receive()).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!(
+                            idle_timeout_secs = self.idle_timeout.as_secs(),
+                            "no DIMSE command within the idle timeout; aborting association"
+                        );
+                        let _ = assoc.abort().await;
+                        return;
+                    }
+                }
+            } else {
+                assoc.receive().await
+            };
+            let pdu = match received {
                 Ok(pdu) => pdu,
                 Err(e) => {
                     // Peer disconnect or timeout; any TempBlob is dropped.
@@ -281,6 +327,8 @@ impl Session {
                     return;
                 }
             };
+            let commands_before = self.commands;
+            let was_idle = matches!(self.state, State::Idle);
             match pdu {
                 Pdu::PData { data } => {
                     for pdv in data {
@@ -298,6 +346,15 @@ impl Session {
                                 return;
                             }
                         }
+                    }
+                    // Restart the idle clock after any DIMSE activity: a
+                    // complete command, or a PDU of an operation in progress
+                    // (including the one that finished it).
+                    if !was_idle
+                        || self.commands != commands_before
+                        || !matches!(self.state, State::Idle)
+                    {
+                        idle_deadline = Instant::now() + self.idle_timeout;
                     }
                 }
                 Pdu::ReleaseRQ => {
@@ -344,7 +401,10 @@ impl Session {
             }
         };
         match event {
-            PdvEvent::Command { pc_id, bytes } => self.on_command(pc_id, &bytes).await,
+            PdvEvent::Command { pc_id, bytes } => {
+                self.commands += 1;
+                self.on_command(pc_id, &bytes).await
+            }
             PdvEvent::Data { pc_id, chunk, last } => self.on_data(pc_id, &chunk, last).await,
         }
     }

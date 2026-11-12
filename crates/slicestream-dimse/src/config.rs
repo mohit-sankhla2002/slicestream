@@ -26,6 +26,13 @@ pub struct ScpConfig {
     pub read_timeout_secs: u64,
     /// Per-PDU write timeout.
     pub write_timeout_secs: u64,
+    /// Time allowed from TCP accept to an established association
+    /// (A-ASSOCIATE-RQ received and answered). The connection is dropped,
+    /// freeing its slot, when it runs out.
+    pub handshake_timeout_secs: u64,
+    /// An association that receives no DIMSE command for this long while no
+    /// operation is in progress is aborted.
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for ScpConfig {
@@ -40,6 +47,8 @@ impl Default for ScpConfig {
             max_pdu_length: 116_794,
             read_timeout_secs: 60,
             write_timeout_secs: 60,
+            handshake_timeout_secs: 30,
+            idle_timeout_secs: 300,
         }
     }
 }

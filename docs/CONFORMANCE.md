@@ -30,6 +30,21 @@ If `require_called_ae_title` is true (the default), the called AE title must
 match the configured one, or the association is rejected. If `allowed_peers` is
 not empty, only the listed calling AE titles are accepted.
 
+AE titles are not authentication: any host that can reach the port can claim
+any calling AE title. Set `allowed_peers` and also restrict the DIMSE port to
+known modality and PACS addresses with a firewall.
+
+## Association limits and timeouts
+
+At most `max_associations` associations (default 64) run at once. A TCP
+connection beyond the limit is closed at once, without an A-ASSOCIATE-RJ.
+A connection must complete association negotiation within
+`handshake_timeout_secs` (default 30 s), or it is closed and its slot freed.
+An established association that receives no DIMSE command for
+`idle_timeout_secs` (default 300 s) while no operation is in progress is
+aborted (A-ABORT). While a data set is being received, each PDU must arrive
+within `read_timeout_secs`.
+
 ## Accepted transfer syntaxes
 
 The SCP accepts every transfer syntax in `dicom-transfer-syntax-registry`
@@ -83,6 +98,8 @@ Responses are `application/dicom+json` and hold (0008,1190) RetrieveURL,
 | `[dimse] max_associations` | 64 |
 | `[dimse] max_pdu_length` | 116794 |
 | `[dimse] read_timeout_secs` / `write_timeout_secs` | 60 / 60 |
+| `[dimse] handshake_timeout_secs` | 30 |
+| `[dimse] idle_timeout_secs` | 300 |
 | Shutdown grace for in-flight associations | 30 s |
 
 Duplicates (same SOP Instance UID) return success. With `keep`, the first copy

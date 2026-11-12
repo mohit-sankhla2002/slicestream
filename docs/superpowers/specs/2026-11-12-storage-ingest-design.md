@@ -153,4 +153,6 @@ max_associations = 64
 max_pdu_length = 116794
 read_timeout_secs = 60
 write_timeout_secs = 60
+handshake_timeout_secs = 30      # TCP accept -> association established
+idle_timeout_secs = 300          # abort when no DIMSE command arrives
 ```

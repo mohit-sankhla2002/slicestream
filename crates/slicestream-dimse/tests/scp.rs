@@ -486,3 +486,62 @@ async fn data_before_command_aborts() {
     assert_eq!(dir_entries(&h.root.join("tmp")), 0);
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn silent_connection_dropped_after_handshake_timeout() {
+    use tokio::io::AsyncReadExt;
+
+    let h = Harness::start(
+        |c| {
+            c.max_associations = 1;
+            c.handshake_timeout_secs = 1;
+            c.read_timeout_secs = 30;
+        },
+        |_| {},
+    )
+    .await;
+    // A TCP connection that never sends an A-ASSOCIATE-RQ holds the only slot.
+    let mut silent = TcpStream::connect(h.addr).await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
+        .await
+        .expect("server drops the silent connection after the handshake timeout")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF");
+    // The slot is free again.
+    let scu = connect(h.addr).await;
+    scu.release().await.unwrap();
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_association_is_aborted() {
+    let h = Harness::start(
+        |c| {
+            c.max_associations = 1;
+            c.idle_timeout_secs = 1;
+        },
+        |_| {},
+    )
+    .await;
+    let mut scu = connect(h.addr).await;
+    let pc_id = pc_for(&scu, uids::VERIFICATION);
+    // Commands arriving more often than the idle timeout keep it open.
+    for id in 1..=4 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        scu.send(&pdv(pc_id, PDataValueType::Command, true, echo_rq(id)))
+            .await
+            .unwrap();
+        assert_eq!(read_status(&mut scu).await, 0x0000);
+    }
+    // Then silence: the server aborts the association.
+    match tokio::time::timeout(Duration::from_secs(5), scu.receive()).await {
+        Ok(Ok(Pdu::AbortRQ { .. })) => {}
+        other => panic!("expected A-ABORT after idle timeout, got {other:?}"),
+    }
+    drop(scu);
+    // The slot is free again.
+    let scu = connect(h.addr).await;
+    scu.release().await.unwrap();
+    h.stop().await;
+}
