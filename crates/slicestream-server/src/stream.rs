@@ -20,8 +20,10 @@ pub async fn stream_series(
     Path(uid): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let Some(series) = state.series.get(&uid).cloned() else {
-        return StatusCode::NOT_FOUND.into_response();
+    let series = match state.catalog.get(&uid).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return crate::routes::internal_error(&e),
     };
     let scheduler = PrefetchScheduler::new(series.len(), state.scheduler);
     ws.on_upgrade(move |socket| async move {

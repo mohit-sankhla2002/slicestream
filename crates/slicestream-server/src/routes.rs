@@ -6,25 +6,28 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use slicestream_core::series::SeriesSummary;
 
 use crate::AppState;
 
-pub async fn list_series(State(state): State<Arc<AppState>>) -> Json<Vec<SeriesSummary>> {
-    let mut list: Vec<_> = state.series.values().map(|s| s.summary()).collect();
-    list.sort_by(|a, b| a.uid.cmp(&b.uid));
-    Json(list)
+pub async fn list_series(State(state): State<Arc<AppState>>) -> Response {
+    match state.catalog.list().await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => internal_error(&e),
+    }
 }
 
-pub async fn get_series(
-    State(state): State<Arc<AppState>>,
-    Path(uid): Path<String>,
-) -> Result<Json<SeriesSummary>, StatusCode> {
-    state
-        .series
-        .get(&uid)
-        .map(|s| Json(s.summary()))
-        .ok_or(StatusCode::NOT_FOUND)
+pub async fn get_series(State(state): State<Arc<AppState>>, Path(uid): Path<String>) -> Response {
+    match state.catalog.get(&uid).await {
+        Ok(Some(s)) => Json(s.summary()).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => internal_error(&e),
+    }
+}
+
+/// Log the cause and return a bare 500 (index errors are not for clients).
+pub(crate) fn internal_error(e: &anyhow::Error) -> Response {
+    tracing::error!("catalog error: {e:#}");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 /// Fetch one frame over plain HTTP (fallback for clients without WebSocket,
@@ -33,8 +36,10 @@ pub async fn get_frame(
     State(state): State<Arc<AppState>>,
     Path((uid, index)): Path<(String, usize)>,
 ) -> Response {
-    let Some(series) = state.series.get(&uid).cloned() else {
-        return StatusCode::NOT_FOUND.into_response();
+    let series = match state.catalog.get(&uid).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return internal_error(&e),
     };
     let frame = match tokio::task::spawn_blocking(move || series.load_frame(index)).await {
         Ok(Ok(f)) => f,

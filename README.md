@@ -2,8 +2,9 @@
 
 **A fast, memory-safe DICOM server in Rust that streams slices to the browser in the order the user scrolls through them.**
 
-> Status: early scaffold (v0.1). The streaming core works end to end with a demo
-> viewer. Storage, DIMSE and full DICOMweb are on the [roadmap](docs/ARCHITECTURE.md#roadmap).
+> Status: early (v0.1). The streaming core works end to end with a demo viewer.
+> Instances can be stored over STOW-RS, a single-file upload or DIMSE C-STORE.
+> Query/retrieve and the full DICOMweb read path are on the [roadmap](docs/ARCHITECTURE.md#roadmap).
 > Not for clinical use.
 
 ## Why this project
@@ -50,8 +51,13 @@ for now.
   `InstanceNumber`. It extracts native or encapsulated frames, including
   multi-frame files with a Basic Offset Table. It contains the scroll-aware
   `PrefetchScheduler` and the wire protocol.
+- `slicestream-store`: crash-safe ingest into content-addressed blobs plus a
+  SQLite index, with de-duplication and startup recovery.
+- `slicestream-dimse`: a C-STORE / C-ECHO storage SCP (default port 11112).
 - `slicestream-server`: an axum server with a JSON API, single-frame HTTP fetch,
   and a WebSocket stream that changes its send order on every scroll event.
+  It also accepts STOW-RS uploads, and runs the DIMSE SCP. The series list
+  comes from the storage index, so new instances are streamable at once.
 - `web/`: a dependency-free demo viewer (mouse wheel or arrow keys).
 
 On a local synthetic series of 120 slices at 256×256, the first frame arrives in
@@ -64,29 +70,57 @@ in scroll direction, then the slices behind.
 # 1. Generate a synthetic CT series (no patient data needed)
 cargo run -p slicestream-core --example make_phantom -- data/phantom 120
 
-# 2. Serve it
-cargo run -p slicestream-server -- data
+# 2. Import it into storage (./storage by default)
+cargo run -p slicestream-server -- import data/phantom
 
-# 3. Open http://127.0.0.1:8080 and scroll
+# 3. Serve it (HTTP on 127.0.0.1:8080, DIMSE C-STORE on port 11112)
+cargo run -p slicestream-server -- serve
+
+# 4. Open http://127.0.0.1:8080 and scroll
 ```
 
-To serve real data, point the server at a folder that holds DICOM files.
-The server scans that folder and its direct subfolders.
+`import <DIR>` reads Part-10 files from a folder (`--recursive` descends into
+subfolders) and skips files without the `DICM` preamble. It prints
+`stored / duplicate / failed` counts. While `serve` runs, you can also push
+instances with STOW-RS, `POST /api/instances`, or C-STORE from a modality or
+another PACS (called AE title `SLICESTREAM`). They show up without a restart.
+
+Every setting has a default. To change them, copy
+[`slicestream.example.toml`](slicestream.example.toml) and pass
+`--config slicestream.toml` to `serve` or `import`. Unknown keys are an error.
+`Ctrl-C` or `SIGTERM` stops the server gracefully.
 
 ## HTTP API (current)
 
 | Method | Path | Returns |
 |---|---|---|
+| POST | `/dicom-web/studies` | STOW-RS: store a `multipart/related; type="application/dicom"` body |
+| POST | `/dicom-web/studies/{study}` | STOW-RS into one study (each part must match) |
+| POST | `/api/instances` | Store one Part-10 file sent as `application/dicom`; returns JSON |
 | GET | `/api/series` | JSON list of series summaries |
 | GET | `/api/series/{uid}` | One series summary |
 | GET | `/api/series/{uid}/frames/{index}` | Raw frame bytes. Metadata is in the `x-slicestream-frame-info` header. |
 | GET (WS) | `/api/series/{uid}/stream` | Scroll-aware frame stream. See [docs/PROTOCOL.md](docs/PROTOCOL.md). |
 
+If `[http] stow_token` is set, the three POST endpoints need
+`Authorization: Bearer <token>`. They have no CORS headers, so web pages on
+other origins cannot upload. The read endpoints allow any origin.
+
+## DIMSE
+
+The storage SCP listens on `0.0.0.0:11112` with AE title `SLICESTREAM`
+(`[dimse]` in the config). It handles C-ECHO and C-STORE.
+`allowed_peers` limits which calling AE titles may connect.
+Set `enabled = false` to turn it off.
+
 ## Project layout
 
 ```
 crates/slicestream-core     transport-agnostic library (index, frames, scheduler, protocol)
+crates/slicestream-store    ingest pipeline, blob store and SQLite index
+crates/slicestream-dimse    DIMSE C-STORE / C-ECHO storage SCP
 crates/slicestream-server   reference HTTP + WebSocket server (axum/tokio)
+slicestream.example.toml    configuration with every default
 web/                        demo viewer
 docs/ARCHITECTURE.md        target architecture and roadmap
 docs/PROTOCOL.md            language-neutral wire protocol spec

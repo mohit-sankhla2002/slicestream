@@ -86,11 +86,13 @@ WADO-RS metadata, frames, bulk data, and `multipart/related`. Run as a
 Cornerstone/OHIF data source. Add a byte-offset index at ingest. Serve frames
 with `pread`.
 
-**M2 — Storage and ingest.** STOW-RS, SQLite index, filesystem and S3 storage,
-de-duplication, study "stable" detection.
+**M2 — Storage and ingest (done for the filesystem).** STOW-RS, SQLite index,
+filesystem storage, de-duplication and an `import` command are done. S3
+storage and study "stable" detection are still open.
 
-**M3 — DIMSE.** C-ECHO, C-STORE SCP, C-FIND, C-MOVE and C-GET through
-`dicom-ul`, so modalities and other PACS can push to and query the server.
+**M3 — DIMSE (C-ECHO and C-STORE SCP done).** C-ECHO and the C-STORE SCP are
+done, so modalities and other PACS can push to the server. C-FIND, C-MOVE and
+C-GET through `dicom-ul`, so they can also query it, are still open.
 
 **M4 — Progressive codecs.** Transcode to HTJ2K RPCL at ingest or on demand.
 Stream byte ranges progressively. Add a WASM decoder for the demo viewer.
@@ -109,4 +111,5 @@ benchmarks against Orthanc and dcm4chee.
   acknowledgement, so priority changes take effect only after the socket
   buffer drains.
 - The demo viewer renders only native (uncompressed) grayscale.
-- The server holds no persistent state. It scans folders at startup.
+- Storage is the local filesystem only, and the series list is rebuilt from
+  the index on demand. There is no QIDO-RS/WADO-RS yet.

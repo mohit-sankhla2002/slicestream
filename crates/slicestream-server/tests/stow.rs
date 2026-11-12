@@ -4,7 +4,6 @@
 #[path = "../../slicestream-core/examples/make_phantom.rs"]
 mod phantom;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,7 +15,7 @@ use serde_json::{Value, json};
 use slicestream_core::SchedulerConfig;
 use slicestream_server::config::HttpConfig;
 use slicestream_server::stow::{PartResult, stow_response};
-use slicestream_server::{AppState, app};
+use slicestream_server::{AppState, SeriesCatalog, app};
 use slicestream_store::{BlobHash, Ingestor, StorageConfig, Stored};
 use tower::ServiceExt;
 
@@ -56,7 +55,7 @@ async fn harness_with(
     let mut cfg = HttpConfig::default();
     http(&mut cfg);
     let state = Arc::new(AppState {
-        series: HashMap::new(),
+        catalog: SeriesCatalog::new(Arc::clone(&ingestor)),
         scheduler: SchedulerConfig::default(),
         ingestor: Arc::clone(&ingestor),
         http: cfg,
@@ -394,7 +393,7 @@ async fn post_instance_too_large_413() {
     .await
     .unwrap();
     let router = app(Arc::new(AppState {
-        series: HashMap::new(),
+        catalog: SeriesCatalog::new(Arc::clone(&ingestor)),
         scheduler: SchedulerConfig::default(),
         ingestor,
         http: HttpConfig::default(),

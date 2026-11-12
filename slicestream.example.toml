@@ -1,0 +1,20 @@
+[storage]
+root = "storage"                 # tmp/, objects/, index.sqlite live here
+max_instance_bytes = 2147483648  # 2 GiB
+on_duplicate = "keep"            # keep | overwrite
+
+[http]
+addr = "127.0.0.1:8080"
+max_request_bytes = 17179869184  # 16 GiB
+# stow_token = "..."
+
+[dimse]
+enabled = true
+ae_title = "SLICESTREAM"
+addr = "0.0.0.0:11112"
+require_called_ae_title = true
+allowed_peers = []               # e.g. ["CT01", "MR02"]
+max_associations = 64
+max_pdu_length = 116794
+read_timeout_secs = 60
+write_timeout_secs = 60

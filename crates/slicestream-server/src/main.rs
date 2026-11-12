@@ -1,114 +1,135 @@
 //! Reference server for slicestream.
 //!
 //! ```sh
-//! slicestream-server <dicom-root> [--addr 127.0.0.1:8080] [--web web]
+//! slicestream-server import data/phantom          # ingest existing files
+//! slicestream-server serve --config slicestream.toml
 //! ```
 //!
-//! `<dicom-root>` and each of its immediate sub-directories are scanned for
-//! DICOM series. Open http://127.0.0.1:8080 for the demo viewer.
+//! `serve` is the default subcommand. Without `--config`, every setting has
+//! its default (see `slicestream.example.toml`). Open http://127.0.0.1:8080
+//! for the demo viewer.
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::ExitCode;
 
 use anyhow::{Context, bail};
-use slicestream_core::{SchedulerConfig, Series};
-use slicestream_server::config::HttpConfig;
-use slicestream_server::{AppState, app};
-use slicestream_store::{Ingestor, StorageConfig};
+use clap::{Parser, Subcommand};
+use slicestream_server::config::Config;
+use slicestream_server::{import_dir, start};
+use slicestream_store::Ingestor;
+use tokio_util::sync::CancellationToken;
 
-struct Args {
-    root: PathBuf,
-    addr: SocketAddr,
-    web: PathBuf,
+#[derive(Parser)]
+#[command(version, about = "DICOM server that streams slices in scroll order")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-fn parse_args() -> anyhow::Result<Args> {
-    let mut root = None;
-    let mut addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    let mut web = PathBuf::from("web");
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--addr" => addr = it.next().context("--addr needs a value")?.parse()?,
-            "--web" => web = it.next().context("--web needs a value")?.into(),
-            "-h" | "--help" => {
-                println!("usage: slicestream-server <dicom-root> [--addr HOST:PORT] [--web DIR]");
-                std::process::exit(0);
-            }
-            other if root.is_none() => root = Some(PathBuf::from(other)),
-            other => bail!("unexpected argument: {other}"),
-        }
-    }
-    Ok(Args {
-        root: root.context("missing <dicom-root>; try --help")?,
-        addr,
-        web,
-    })
-}
-
-fn load_series(root: &PathBuf) -> anyhow::Result<HashMap<String, Arc<Series>>> {
-    let mut dirs = vec![root.clone()];
-    for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            dirs.push(path);
-        }
-    }
-    let mut map = HashMap::new();
-    for dir in dirs {
-        if let Ok(found) = Series::scan_dir(&dir) {
-            for s in found {
-                tracing::info!(uid = %s.uid, slices = s.len(), dir = %dir.display(), "indexed series");
-                map.insert(s.uid.clone(), Arc::new(s));
-            }
-        }
-    }
-    if map.is_empty() {
-        bail!("no DICOM series found under {}", root.display());
-    }
-    Ok(map)
+#[derive(Subcommand)]
+enum Command {
+    /// Run the HTTP/WebSocket server and the DIMSE storage SCP (default).
+    Serve {
+        /// TOML configuration file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Ingest existing DICOM files into storage.
+    Import {
+        /// Directory holding Part-10 files.
+        dir: PathBuf,
+        /// TOML configuration file (only `[storage]` is used).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Descend into sub-directories.
+        #[arg(long)]
+        recursive: bool,
+    },
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     tracing_subscriber::fmt::init();
-    let args = parse_args()?;
+    match Cli::parse()
+        .command
+        .unwrap_or(Command::Serve { config: None })
+    {
+        Command::Serve { config } => serve(Config::load(config.as_deref())?).await,
+        Command::Import {
+            dir,
+            config,
+            recursive,
+        } => import(Config::load(config.as_deref())?, dir, recursive).await,
+    }
+}
 
-    let root = args.root.clone();
-    let series = tokio::task::spawn_blocking(move || load_series(&root)).await??;
+async fn serve(config: Config) -> anyhow::Result<ExitCode> {
+    let shutdown = CancellationToken::new();
+    let running = start(config, shutdown.clone()).await?;
+    tracing::info!("listening on http://{}", running.http_addr);
+    if let Some(addr) = running.dimse_addr {
+        tracing::info!("DIMSE storage SCP on {addr}");
+    }
 
-    let ingestor = Ingestor::open(StorageConfig::default())
-        .await
-        .context("opening storage")?;
-    let report = ingestor.recover().await.context("storage recovery")?;
-    tracing::info!(
-        tmp_removed = report.tmp_removed,
-        orphans_removed = report.orphans_removed,
-        "storage ready"
-    );
-
-    let http = HttpConfig {
-        addr: args.addr,
-        web_dir: args.web,
-        ..HttpConfig::default()
-    };
-    let state = Arc::new(AppState {
-        series,
-        scheduler: SchedulerConfig::default(),
-        ingestor,
-        http,
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown requested; finishing in-flight work");
+        shutdown.cancel();
     });
 
-    let listener = tokio::net::TcpListener::bind(args.addr).await?;
-    tracing::info!("listening on http://{}", args.addr);
-    axum::serve(
-        listener,
-        app(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    running.task.await.context("server task panicked")??;
+    tracing::info!("stopped");
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn import(config: Config, dir: PathBuf, recursive: bool) -> anyhow::Result<ExitCode> {
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    // No `recover()` here: a server may be running on the same storage root,
+    // and recovery would remove its in-flight spool files.
+    let root = config.storage.root.clone();
+    let ingestor = Ingestor::open(config.storage)
+        .await
+        .with_context(|| format!("opening storage at {}", root.display()))?;
+    let r = import_dir(&ingestor, &dir, recursive).await;
+    println!(
+        "stored {} / duplicate {} / failed {} (skipped {} non-DICOM)",
+        r.stored, r.duplicate, r.failed, r.skipped
+    );
+    Ok(if r.failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Resolve on Ctrl-C, or on SIGTERM on Unix.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("cannot listen for Ctrl-C: {e}");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

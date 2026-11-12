@@ -1,9 +1,34 @@
-//! `[http]` configuration.
+//! Server configuration: one TOML file with `[storage]`, `[http]` and `[dimse]`.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use slicestream_dimse::ScpConfig;
+use slicestream_store::StorageConfig;
+
+/// The whole configuration file. Every section and key has a default, and
+/// unknown keys are rejected so typos do not silently fall back to defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub storage: StorageConfig,
+    pub http: HttpConfig,
+    pub dimse: ScpConfig,
+}
+
+impl Config {
+    /// Read `path` as TOML, or return the defaults when `path` is `None`.
+    pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
+        let Some(path) = path else {
+            return Ok(Config::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    }
+}
 
 /// HTTP server settings. Every field has a default, so `[http]` may be empty.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
