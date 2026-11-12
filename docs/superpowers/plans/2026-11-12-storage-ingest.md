@@ -106,6 +106,7 @@
   - `pub enum DuplicatePolicy { Keep, Overwrite }` (serde `lowercase`).
   - `pub enum UpsertOutcome { Inserted, Duplicate { existing: BlobHash }, Replaced { previous: BlobHash } }`
   - `pub struct Index` — `pub async fn open(db_path: &Path) -> Result<Index, sqlx::Error>` (`create_if_missing`, `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5s`, `sqlx::migrate!("./migrations")`); `pub async fn upsert_instance(&self, rec: &InstanceRecord, policy: DuplicatePolicy) -> Result<UpsertOutcome, sqlx::Error>`; `pub async fn blob_hashes(&self) -> Result<HashSet<BlobHash>, sqlx::Error>`; `pub async fn blob_in_use(&self, hash: &BlobHash) -> Result<bool, sqlx::Error>`; `pub async fn list_series(&self) -> Result<Vec<SeriesRow>, sqlx::Error>`; `pub async fn series_slices(&self, series_uid: &str) -> Result<Vec<SliceRow>, sqlx::Error>`.
+  - `pub async fn instance(&self, sop_instance_uid: &str) -> Result<Option<InstanceSummary>, sqlx::Error>`; `pub struct InstanceSummary { pub sop_instance_uid: String, pub series_instance_uid: String, pub blob: BlobHash, pub source: String, pub calling_ae: Option<String> }` (used by Task 6/7 tests).
   - `pub struct SeriesRow { pub series_instance_uid: String, pub study_instance_uid: String, pub modality: Option<String>, pub series_description: Option<String>, pub instance_count: i64 }`
   - `pub struct SliceRow { pub blob: BlobHash, pub number_of_frames: u32, pub instance_number: Option<i64>, pub slice_position: Option<f64>, pub frame_info: FrameInfo }` — only rows with non-NULL `frame_info`.
 - Schema (`0001_init.sql`): `patients(id INTEGER PRIMARY KEY, patient_id TEXT NOT NULL UNIQUE, patient_name TEXT)` (missing PatientID stored as `''`); `studies(id, study_instance_uid TEXT NOT NULL UNIQUE, patient_fk INTEGER NOT NULL REFERENCES patients(id), study_date, study_description, accession_number, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`; `series(id, series_instance_uid TEXT NOT NULL UNIQUE, study_fk REFERENCES studies(id), modality, series_number INTEGER, series_description, created_at, updated_at)`; `instances(id, sop_instance_uid TEXT NOT NULL UNIQUE, series_fk REFERENCES series(id), sop_class_uid TEXT NOT NULL, instance_number INTEGER, number_of_frames INTEGER NOT NULL, transfer_syntax TEXT NOT NULL, slice_position REAL, frame_info TEXT, blob_sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL, source TEXT NOT NULL, calling_ae TEXT, received_at TEXT NOT NULL)`; indexes on `instances(series_fk)`, `instances(blob_sha256)`, `series(study_fk)`. Timestamps RFC 3339 UTC.
@@ -213,7 +214,7 @@
   - `wrong_called_ae_rejected` — called AE `"NOPE"` → `establish_async` returns `Err`.
   - `peer_not_allowed_rejected` — `allowed_peers = ["CT01"]`, calling `TESTSCU` → rejected.
   - `uid_mismatch_returns_a900` — command Affected SOP Instance UID differs from dataset → status 0xA900, nothing stored.
-  - `oversize_then_normal_on_same_association` — `max_instance_bytes = 1024`, send 32×32 phantom (≈2 KiB+) → 0xA700; then send an 8×8 phantom (under 1024 bytes) on the same association → 0x0000.
+  - `oversize_then_normal_on_same_association` — `max_instance_bytes = 1024`, send 32×32 phantom (≈2 KiB+) → 0xA700; then send an 8×8 phantom on the same association → 0x0000. The limit counts spooled bytes including the Part-10 prefix; pick any limit (e.g. 1024–1600) where the first instance exceeds it and the second fits, and assert that in the test.
   - `abort_mid_instance_leaves_nothing` — send command + first data PDV (not last), then `abort()`; after 200 ms `tmp/` and `objects/` are empty and no index rows.
   - `max_associations_enforced` — `max_associations = 1`; hold one association open; second `establish_async` fails.
 - [ ] **Step 2:** `cargo test -p slicestream-dimse --test scp` → FAIL.
@@ -228,6 +229,7 @@
 **Files:**
 - Create: `crates/slicestream-server/src/stow.rs`
 - Modify: `crates/slicestream-server/src/main.rs` (routes), `Cargo.toml` (`multer`, `mime`, `slicestream-store`)
+- Create: `crates/slicestream-server/src/config.rs` with `pub struct HttpConfig { pub addr: SocketAddr, pub max_request_bytes: u64, pub stow_token: Option<String>, pub web_dir: PathBuf }` (serde, defaults `127.0.0.1:8080`, 17179869184, None, `web`). `AppState` gains `pub ingestor: Arc<Ingestor>` and `pub http: HttpConfig`; the existing `series` map and folder scan in `main.rs` stay until Task 8 (main opens an `Ingestor` at `storage/` with `StorageConfig::default()`).
 - Test: `crates/slicestream-server/tests/stow.rs` (router via `tower::ServiceExt::oneshot`; expose `pub fn app(state) -> Router` from a `lib.rs` so tests can build it — move `routes`, `stream`, `stow` modules under `src/lib.rs`, keep `main.rs` thin).
 
 **Interfaces:**
@@ -271,6 +273,9 @@
   - `pub struct Config { pub storage: StorageConfig, pub http: HttpConfig, pub dimse: ScpConfig }`, `pub struct HttpConfig { pub addr: SocketAddr, pub max_request_bytes: u64, pub stow_token: Option<String>, pub web_dir: PathBuf }`; `pub fn Config::load(path: Option<&Path>) -> anyhow::Result<Config>` (defaults when `None`; unknown keys are an error via `#[serde(deny_unknown_fields)]`).
   - CLI (clap derive): `slicestream-server serve [--config PATH]` (default subcommand) and `slicestream-server import <DIR> [--config PATH] [--recursive]` (prints `stored / duplicate / failed` counts; non-DICOM files counted as skipped, not failed).
   - `pub struct SeriesCatalog` — `pub fn new(ingestor: Arc<Ingestor>) -> Arc<Self>`; `pub async fn list(&self) -> anyhow::Result<Vec<SeriesSummary>>`; `pub async fn get(&self, series_uid: &str) -> anyhow::Result<Option<Arc<Series>>>` (built from `index.series_slices` → `SliceRef::new(blobs.path_of(&row.blob), frame, row.frame_info, row.slice_position, row.instance_number)` for each frame → `Series::from_slices`; cached in `RwLock<HashMap>`); `pub fn spawn_invalidator(self: &Arc<Self>)` (removes cache entry on each `StoredEvent`; on `RecvError::Lagged` clears the whole cache).
+  - `pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Result<Running>`; `pub struct Running { pub http_addr: SocketAddr, pub dimse_addr: Option<SocketAddr>, pub task: tokio::task::JoinHandle<anyhow::Result<()>> }` — `serve` and `e2e.rs` both use it (ports `:0` in tests).
+  - `pub async fn import_dir(ingestor: &Ingestor, dir: &Path, recursive: bool) -> ImportReport`; `pub struct ImportReport { pub stored: usize, pub duplicate: usize, pub failed: usize, pub skipped: usize }`. A file is *skipped* (not failed) when it is shorter than 132 bytes or bytes 128..132 are not `DICM`.
+  - `Config` moves `HttpConfig` (from Task 7) under `Config.http`.
   - `AppState` becomes `{ catalog: Arc<SeriesCatalog>, ingestor: Arc<Ingestor>, scheduler: SchedulerConfig, http: HttpConfig }`; existing `/api/series*` and WS routes read from `catalog`. `SeriesSummary` for series with no image frames is omitted from `list`.
   - `serve`: `Ingestor::open` → `recover()` (log report) → bind HTTP and (if `dimse.enabled`) `StoreScp` → run both under one `CancellationToken` cancelled on Ctrl-C/SIGTERM; HTTP uses `axum::serve(..).with_graceful_shutdown`.
 - Remove the old positional `<dicom-root>` argument and `Series::scan_dir` usage from the server (keep `scan_dir` in core for library users).
@@ -307,5 +312,5 @@
   8. `storescu -aec WRONG …` → non-zero exit (association rejected).
 - [ ] **Step 2:** Run `bash scripts/interop-dcmtk.sh` locally (install `dcmtk` if missing) → prints `interop OK`.
 - [ ] **Step 3:** Write `docs/CONFORMANCE.md`: implementation UID/version; SCP roles (Verification, Storage SCP for any storage SOP class, promiscuous negotiation note); accepted transfer syntaxes = those in `dicom-transfer-syntax-registry` 0.10.1; status codes table copied from the spec; STOW-RS media types and HTTP status codes; limits and defaults.
-- [ ] **Step 4:** Push branch; CI `test` and `interop` jobs green.
+- [ ] **Step 4:** No git remote exists: do not push. Validate the workflow YAML parses (`python3 -c 'import yaml,sys;yaml.safe_load(open(".github/workflows/ci.yml"))'`) and rely on Step 2's local run.
 - [ ] **Step 5:** Commit `test: DCMTK interop script, CI job and conformance statement`.
