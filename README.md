@@ -118,7 +118,7 @@ Every setting has a default. To change them, copy
 | GET | `/api/series` | JSON list of series summaries |
 | GET | `/api/series/{uid}` | One series summary |
 | GET | `/api/series/{uid}/frames/{index}` | Raw frame bytes. Metadata is in the `x-slicestream-frame-info` header. |
-| GET | `/api/metrics` | Latest process, storage, ingest and connection numbers. Off with `metrics_enabled = false`. |
+| GET | `/api/metrics` | Latest process, storage, ingest and connection numbers. Off with `metrics_enabled = false`, which also turns off the console's metrics and series panels. |
 | GET | `/api/metrics/history` | The last 300 one-second samples, oldest first |
 | GET | `/api/console/series` | Every series with study and patient details, for the test console |
 | GET (WS) | `/api/series/{uid}/stream` | Scroll-aware frame stream. See [docs/PROTOCOL.md](docs/PROTOCOL.md). |

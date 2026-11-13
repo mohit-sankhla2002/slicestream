@@ -1,5 +1,6 @@
 // Metrics panel: polls the server and renders KPIs, charts, storage and facts.
 import { DASH, formatBytes, formatNumber, formatRate } from "./lib/format.js";
+import { createStaleTracker } from "./lib/stale.js";
 import { SampleRing, areaPath, linePath, niceMax } from "./lib/series.js";
 
 const POLL_MS = 1000;
@@ -10,26 +11,38 @@ const WINDOW = 300;
 
 async function getJson(url) {
   const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(3000) });
-  if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`${url}: HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
 // Loads history once, then polls /api/metrics every second.
 // onHistory(samples) gets the history array; onSample(snapshot) every poll;
-// onStatus("live" | "offline") on each poll result.
+// onStatus("live" | "stale" | "offline" | "off") on each poll result; "off" (HTTP 404:
+// metrics disabled) is final and stops polling.
 export function startMetrics({ onSample, onStatus, onHistory }) {
   let stopped = false;
   let timer = 0;
+  const staleness = createStaleTracker(3);
 
   async function poll() {
     let snap = null;
     try {
       snap = await getJson("/api/metrics");
-    } catch {
-      // Network error, timeout or non-2xx: the server is unreachable or not ready.
+    } catch (err) {
+      // 404: `[http] metrics_enabled = false`; stop for good.
+      if (err.status === 404) {
+        if (!stopped) onStatus?.("off");
+        return;
+      }
+      // Otherwise network error, timeout or non-2xx: unreachable or not ready.
     }
     if (stopped) return;
-    onStatus?.(snap ? "live" : "offline");
+    const stale = snap && typeof snap.sampled_at_ms === "number" && staleness.observe(snap.sampled_at_ms);
+    onStatus?.(snap ? (stale ? "stale" : "live") : "offline");
     if (snap) {
       try {
         onSample?.(snap);

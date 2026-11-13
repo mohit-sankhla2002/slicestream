@@ -6,6 +6,7 @@ import { createThrottle } from "./lib/throttle.js";
 
 const POLL_MS = 5000;
 const THROTTLE_MS = 1000;
+const SERIES_LIMIT = 500; // server caps /api/console/series at this many
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +24,8 @@ export function startSeriesTable({ onSelect }) {
   let known = null; // series UIDs from the previous render; null before the first
   let inFlight = false;
   let again = false;
+  let disabled = false;
+  let pollTimer = 0;
 
   function cell(tr, text, cls) {
     const td = document.createElement("td");
@@ -75,11 +78,15 @@ export function startSeriesTable({ onSelect }) {
     if (focused) el.body.querySelector(`tr[data-uid="${CSS.escape(focused)}"]`)?.focus({ preventScroll: true });
     el.empty.hidden = true;
     el.wrap.hidden = false;
-    el.note.textContent = `${rows.length.toLocaleString()} series · updates on ingest`;
+    el.note.textContent =
+      rows.length >= SERIES_LIMIT
+        ? `latest ${SERIES_LIMIT} · updates on ingest`
+        : `${rows.length.toLocaleString()} series · updates on ingest`;
     known = new Set(rows.map((r) => r.series_uid));
   }
 
   async function refresh() {
+    if (disabled) return;
     if (inFlight) {
       again = true;
       return;
@@ -87,6 +94,17 @@ export function startSeriesTable({ onSelect }) {
     inFlight = true;
     try {
       const res = await fetch("/api/console/series", { cache: "no-store" });
+      if (res.status === 404) {
+        // `[http] metrics_enabled = false`: the console endpoints are off.
+        disabled = true;
+        clearInterval(pollTimer);
+        el.wrap.hidden = true;
+        el.empty.hidden = false;
+        el.emptyTitle.textContent = "Console endpoints are disabled ([http] metrics_enabled = false)";
+        el.emptyHint.textContent = "Series listing needs the console endpoints enabled in the server config";
+        el.note.textContent = "disabled";
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
       if (text !== lastJson) {
@@ -130,6 +148,6 @@ export function startSeriesTable({ onSelect }) {
   });
 
   addEventListener("slicestream:stored", () => throttle.call());
-  setInterval(() => throttle.call(), POLL_MS);
+  pollTimer = setInterval(() => throttle.call(), POLL_MS);
   throttle.call();
 }

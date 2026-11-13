@@ -9,9 +9,9 @@ const $ = (id) => document.getElementById(id);
 
 function setStatus(status) {
   const pill = $("h-live");
-  const live = status === "live";
-  pill.className = `pill ${live ? "live" : "offline"}`;
-  pill.textContent = live ? "live · 1 s" : "offline";
+  const label = { live: "live · 1 s", stale: "stale", off: "metrics off" }[status] ?? "offline";
+  pill.className = `pill ${status in { live: 1, stale: 1, off: 1 } ? status : "offline"}`;
+  pill.textContent = label;
 }
 
 function renderHeader(s) {

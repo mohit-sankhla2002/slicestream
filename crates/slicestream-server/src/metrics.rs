@@ -330,6 +330,12 @@ fn read_process(sys: &mut System, pid: Pid) -> ProcRead {
     }
 }
 
+/// Records a failed process read; true only for the first failure after a
+/// success, so a persistent fault logs once rather than every second.
+fn should_warn_on_failure(read_ok: &mut bool) -> bool {
+    std::mem::replace(read_ok, false)
+}
+
 struct Prev {
     at: Instant,
     ingest_total: u64,
@@ -361,6 +367,7 @@ pub fn spawn_sampler(
         let pid = Pid::from_u32(std::process::id());
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let mut sys = Some(System::new());
+        let mut read_ok = true;
         let mut prev: Option<Prev> = None;
         let mut storage: Option<(Instant, StorageSample)> = None;
         loop {
@@ -369,17 +376,24 @@ pub fn spawn_sampler(
                 _ = tick.tick() => {}
             }
             let now = Instant::now();
-            let Some(mut s) = sys.take() else { break };
+            let mut s = sys.take().unwrap_or_default();
             let (s, pr) = match tokio::task::spawn_blocking(move || {
                 let r = read_process(&mut s, pid);
                 (s, r)
             })
             .await
             {
-                Ok(v) => v,
+                Ok(v) => {
+                    read_ok = true;
+                    v
+                }
                 Err(e) => {
-                    tracing::debug!(error = %e, "metrics: process read failed");
-                    break;
+                    // The System moved into the failed task is gone; `sys`
+                    // stays None so the next tick builds a fresh one.
+                    if should_warn_on_failure(&mut read_ok) {
+                        tracing::warn!(error = %e, "metrics: process read failed; resetting sampler");
+                    }
+                    continue;
                 }
             };
             sys = Some(s);
@@ -472,6 +486,15 @@ pub fn spawn_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warns_only_on_first_failure_after_success() {
+        let mut ok = true;
+        assert!(should_warn_on_failure(&mut ok));
+        assert!(!should_warn_on_failure(&mut ok));
+        ok = true; // a success resets it
+        assert!(should_warn_on_failure(&mut ok));
+    }
 
     #[test]
     fn ring_keeps_last_cap_items() {

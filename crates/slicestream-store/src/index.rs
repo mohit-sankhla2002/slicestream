@@ -84,6 +84,9 @@ pub struct StorageCounts {
     pub objects_count: i64,
 }
 
+/// Most series [`Index::console_series`] returns.
+pub const CONSOLE_SERIES_LIMIT: usize = 500;
+
 /// One series row for the test console.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ConsoleSeriesRow {
@@ -322,10 +325,10 @@ impl Index {
         })
     }
 
-    /// All series with study/patient context and instance aggregates, most
-    /// recently updated first.
+    /// The newest [`CONSOLE_SERIES_LIMIT`] series with study/patient context
+    /// and instance aggregates, most recently updated first.
     pub async fn console_series(&self) -> Result<Vec<ConsoleSeriesRow>, sqlx::Error> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT s.series_instance_uid, st.study_instance_uid, p.patient_name,
                     st.study_date, s.modality, s.series_description,
                     COUNT(i.id) AS instance_count,
@@ -336,8 +339,9 @@ impl Index {
              JOIN patients p ON p.id = st.patient_fk
              LEFT JOIN instances i ON i.series_fk = s.id
              GROUP BY s.id
-             ORDER BY s.updated_at DESC, s.id DESC",
-        )
+             ORDER BY s.updated_at DESC, s.id DESC
+             LIMIT {CONSOLE_SERIES_LIMIT}"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.iter()

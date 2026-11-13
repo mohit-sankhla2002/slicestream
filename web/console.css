@@ -17,12 +17,14 @@ header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:
 .logo span{color:var(--acc)}
 .logo em{font-style:normal;color:var(--mute);font-weight:400}
 .pill{font:11px var(--mono);color:var(--mute);border:1px solid var(--line);padding:3px 8px;border-radius:999px;white-space:nowrap}
-.live,.offline{transition:color .2s,border-color .2s,background .2s}
+.live,.offline,.stale{transition:color .2s,border-color .2s,background .2s}
 .live{color:var(--ok);border-color:#1f3b2c;background:#0f1d16}
 .offline{color:var(--bad);border-color:#4a2020;background:#1f1010}
-.live::before,.offline::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
+.stale{color:var(--acc2);border-color:#4a3a1a;background:#1f1a0e}
+.live::before,.offline::before,.stale::before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:1px}
 .live::before{background:var(--ok);box-shadow:0 0 8px var(--ok);animation:pulse 2s ease-in-out infinite}
 .offline::before{background:var(--bad)}
+.stale::before{background:var(--acc2)}
 @keyframes pulse{50%{opacity:.45}}
 header .grow{flex:1}
 

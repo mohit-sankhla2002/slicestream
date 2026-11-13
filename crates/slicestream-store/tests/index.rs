@@ -216,3 +216,24 @@ async fn console_series_rows() {
     assert_eq!(a.patient_name, hs[0].patient_name);
     assert_eq!(a.study_date, hs[0].study_date);
 }
+
+#[tokio::test]
+async fn console_series_is_limited_to_newest() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = Index::open(&dir.path().join("index.db")).await.unwrap();
+    let base = phantom_headers(&dir.path().join("p"), 1).remove(0);
+    let n = slicestream_store::CONSOLE_SERIES_LIMIT + 1;
+    for i in 0..n {
+        let mut h = base.clone();
+        h.series_instance_uid = format!("1.2.3.{i}");
+        h.sop_instance_uid = format!("1.2.3.{i}.1");
+        idx.upsert_instance(&record(h, 0xaa), DuplicatePolicy::Keep)
+            .await
+            .unwrap();
+    }
+    let rows = idx.console_series().await.unwrap();
+    assert_eq!(rows.len(), slicestream_store::CONSOLE_SERIES_LIMIT);
+    // Newest first: the last inserted series is on top, the first is cut.
+    assert_eq!(rows[0].series_uid, format!("1.2.3.{}", n - 1));
+    assert!(rows.iter().all(|r| r.series_uid != "1.2.3.0"));
+}
