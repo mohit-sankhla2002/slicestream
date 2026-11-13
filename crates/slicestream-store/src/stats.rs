@@ -15,13 +15,17 @@ pub struct IngestStats {
     pub stored: u64,
     /// Instances that were already indexed (duplicates).
     pub duplicate: u64,
-    /// Calls to `ingest` that returned an error.
+    /// Calls to `ingest` or `ingest_nifti` that returned an error.
     pub failed: u64,
-    /// Spooled bytes of every successful ingest.
+    /// Spooled bytes of every successful ingest (DICOM and NIfTI).
     pub bytes: u64,
-    /// Median ingest latency over the last 60 s, in milliseconds.
+    /// NIfTI volumes stored.
+    pub nifti_stored: u64,
+    /// NIfTI volumes that were already indexed (duplicates).
+    pub nifti_duplicate: u64,
+    /// Median DICOM ingest latency over the last 60 s, in milliseconds.
     pub latency_p50_ms: Option<f64>,
-    /// 95th percentile ingest latency over the last 60 s, in milliseconds.
+    /// 95th percentile DICOM ingest latency over the last 60 s, in milliseconds.
     pub latency_p95_ms: Option<f64>,
 }
 
@@ -64,6 +68,8 @@ pub(crate) struct Stats {
     duplicate: AtomicU64,
     failed: AtomicU64,
     bytes: AtomicU64,
+    nifti_stored: AtomicU64,
+    nifti_duplicate: AtomicU64,
     window: Mutex<LatencyWindow>,
 }
 
@@ -78,6 +84,17 @@ impl Stats {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         let mut w = self.window.lock().unwrap_or_else(|e| e.into_inner());
         w.record(Instant::now(), elapsed.as_secs_f64() * 1000.0);
+    }
+
+    /// A successful `ingest_nifti`. Not part of the latency window.
+    pub(crate) fn record_nifti_success(&self, duplicate: bool, bytes: u64) {
+        let counter = if duplicate {
+            &self.nifti_duplicate
+        } else {
+            &self.nifti_stored
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub(crate) fn record_failure(&self) {
@@ -95,6 +112,8 @@ impl Stats {
             duplicate: self.duplicate.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
+            nifti_stored: self.nifti_stored.load(Ordering::Relaxed),
+            nifti_duplicate: self.nifti_duplicate.load(Ordering::Relaxed),
             latency_p50_ms: p50,
             latency_p95_ms: p95,
         }

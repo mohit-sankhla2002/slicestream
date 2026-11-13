@@ -1,8 +1,9 @@
 //! Streaming temp blobs and a content-addressed filesystem blob store.
 //!
 //! Layout under the root: `tmp/<random>.part` for in-flight spools and
-//! `objects/aa/bb/<sha256-hex>.dcm` for committed blobs. Names are derived only
-//! from random numbers or SHA-256 hex, never from external input.
+//! `objects/aa/bb/<sha256-hex>.<ext>` for committed blobs, where `<ext>` comes
+//! from the [`BlobKind`] (`dcm`, `nii`, `nii.gz`). Names are derived only from
+//! random numbers, SHA-256 hex and the kind, never from external input.
 
 use std::fs;
 use std::io;
@@ -12,6 +13,9 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+
+/// Chunk size used by [`FsBlobStore::spool_sync`].
+const SYNC_CHUNK: usize = 64 * 1024;
 
 /// SHA-256 digest identifying a blob.
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
@@ -45,6 +49,38 @@ impl BlobHash {
             *o = nib(b[2 * i])? << 4 | nib(b[2 * i + 1])?;
         }
         Some(BlobHash(out))
+    }
+}
+
+/// What a committed blob holds; selects its file extension. Blobs are stored
+/// exactly as received.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+pub enum BlobKind {
+    Dicom,
+    Nifti,
+    NiftiGz,
+}
+
+impl BlobKind {
+    /// Every kind, longest extension first (so `nii.gz` is tried before `nii`).
+    const ALL: [BlobKind; 3] = [BlobKind::NiftiGz, BlobKind::Nifti, BlobKind::Dicom];
+
+    /// File extension without the leading dot.
+    pub fn ext(self) -> &'static str {
+        match self {
+            BlobKind::Dicom => "dcm",
+            BlobKind::Nifti => "nii",
+            BlobKind::NiftiGz => "nii.gz",
+        }
+    }
+
+    /// Parse a committed blob's file name: exactly `<64 lowercase hex>.<ext>`,
+    /// i.e. a name [`FsBlobStore::path_of`] could have produced.
+    fn parse_file_name(name: &str) -> Option<(BlobHash, BlobKind)> {
+        let (stem, ext) = name.split_once('.')?;
+        let kind = BlobKind::ALL.into_iter().find(|k| k.ext() == ext)?;
+        let hash = BlobHash::from_hex(stem)?;
+        (hash.to_hex() == stem).then_some((hash, kind))
     }
 }
 
@@ -172,11 +208,61 @@ impl FsBlobStore {
         })
     }
 
-    /// Atomically move a spooled blob into `objects/` and fsync the directory.
-    /// Blocking: call from `spawn_blocking` in async code.
-    pub fn commit(&self, mut spooled: SpooledBlob) -> io::Result<BlobHash> {
+    /// Blocking twin of [`TempBlob`]: copy `reader` into a new spool file in
+    /// 64 KiB chunks, hashing as it goes, then fsync. Fails with
+    /// [`SpoolError::TooLarge`] once more than `limit` bytes are read. On any
+    /// error the spool file is removed. Never holds more than one chunk in
+    /// memory.
+    pub fn spool_sync(
+        &self,
+        reader: &mut dyn io::Read,
+        limit: u64,
+    ) -> Result<SpooledBlob, SpoolError> {
+        use std::io::Write;
+        let id: u128 = rand::random();
+        let path = self.root.join("tmp").join(format!("{id:032x}.part"));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        // Removes the spool file on any early return. Created only after the
+        // `create_new` open succeeded, so it never removes someone else's file.
+        // (It drops before `file`; unlinking an open file is fine on Unix.)
+        let mut guard = SpooledBlob {
+            hash: BlobHash([0; 32]),
+            len: 0,
+            path,
+            committed: false,
+        };
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; SYNC_CHUNK];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let new_len = guard.len.saturating_add(n as u64);
+            if new_len > limit {
+                return Err(SpoolError::TooLarge { limit });
+            }
+            file.write_all(&buf[..n])?;
+            hasher.update(&buf[..n]);
+            guard.len = new_len;
+        }
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        guard.hash = BlobHash(hasher.finalize().into());
+        Ok(guard)
+    }
+
+    /// Atomically move a spooled blob into `objects/` as `kind` and fsync the
+    /// directory. Blocking: call from `spawn_blocking` in async code.
+    pub fn commit(&self, mut spooled: SpooledBlob, kind: BlobKind) -> io::Result<BlobHash> {
         let hash = spooled.hash;
-        let target = self.path_of(&hash);
+        let target = self.path_of(&hash, kind);
         let parent = target.parent().expect("target has parent");
         if target.is_file() {
             // Another committer may have renamed but not yet fsynced; make the
@@ -192,17 +278,19 @@ impl FsBlobStore {
         Ok(hash)
     }
 
-    pub fn path_of(&self, hash: &BlobHash) -> PathBuf {
+    pub fn path_of(&self, hash: &BlobHash, kind: BlobKind) -> PathBuf {
         let hex = hash.to_hex();
         self.root
             .join("objects")
             .join(&hex[0..2])
             .join(&hex[2..4])
-            .join(format!("{hex}.dcm"))
+            .join(format!("{hex}.{}", kind.ext()))
     }
 
-    pub fn delete(&self, hash: &BlobHash) -> io::Result<()> {
-        match fs::remove_file(self.path_of(hash)) {
+    /// Remove the blob `hash` of `kind`; other kinds with the same hash are
+    /// untouched. A missing file is not an error.
+    pub fn delete(&self, hash: &BlobHash, kind: BlobKind) -> io::Result<()> {
+        match fs::remove_file(self.path_of(hash, kind)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
@@ -230,22 +318,20 @@ impl FsBlobStore {
         Ok(n)
     }
 
-    /// Enumerate all committed blobs.
-    pub fn list(&self) -> io::Result<Vec<BlobHash>> {
+    /// Enumerate all committed blobs with their kinds. Files whose names are
+    /// not `<64 hex>.<known ext>` are ignored.
+    pub fn list(&self) -> io::Result<Vec<(BlobHash, BlobKind)>> {
         let mut out = Vec::new();
         for a in read_dirs(&self.root.join("objects"))? {
             for b in read_dirs(&a)? {
                 for entry in fs::read_dir(&b)? {
-                    let path = entry?.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("dcm") {
-                        continue;
-                    }
-                    if let Some(h) = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .and_then(BlobHash::from_hex)
+                    let entry = entry?;
+                    if let Some(parsed) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(BlobKind::parse_file_name)
                     {
-                        out.push(h);
+                        out.push(parsed);
                     }
                 }
             }
@@ -348,15 +434,15 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let store = FsBlobStore::open(d.path()).unwrap();
         let a = spool(&store, b"same").await;
-        let h1 = store.commit(a).unwrap();
+        let h1 = store.commit(a, BlobKind::Dicom).unwrap();
         let b = spool(&store, b"same").await;
-        let h2 = store.commit(b).unwrap();
+        let h2 = store.commit(b, BlobKind::Dicom).unwrap();
         assert_eq!(h1, h2);
-        assert!(store.path_of(&h1).is_file());
-        assert_eq!(store.list().unwrap(), vec![h1]);
+        assert!(store.path_of(&h1, BlobKind::Dicom).is_file());
+        assert_eq!(store.list().unwrap(), vec![(h1, BlobKind::Dicom)]);
         assert_eq!(count_files(&d.path().join("tmp")), 0);
-        store.delete(&h1).unwrap();
-        store.delete(&h1).unwrap();
+        store.delete(&h1, BlobKind::Dicom).unwrap();
+        store.delete(&h1, BlobKind::Dicom).unwrap();
         assert!(store.list().unwrap().is_empty());
     }
 
@@ -364,23 +450,144 @@ mod tests {
     async fn commit_existing_target_returns_hash_and_cleans_temp() {
         let d = tempfile::tempdir().unwrap();
         let store = FsBlobStore::open(d.path()).unwrap();
-        let h1 = store.commit(spool(&store, b"dup").await).unwrap();
+        let h1 = store
+            .commit(spool(&store, b"dup").await, BlobKind::Dicom)
+            .unwrap();
         let b = spool(&store, b"dup").await;
         let tmp = b.path().to_path_buf();
         assert!(tmp.exists());
-        assert_eq!(store.commit(b).unwrap(), h1);
+        assert_eq!(store.commit(b, BlobKind::Dicom).unwrap(), h1);
         assert!(!tmp.exists());
-        assert!(store.path_of(&h1).is_file());
+        assert!(store.path_of(&h1, BlobKind::Dicom).is_file());
     }
 
     #[tokio::test]
     async fn sweep_and_list() {
         let d = tempfile::tempdir().unwrap();
         let store = FsBlobStore::open(d.path()).unwrap();
-        let h = store.commit(spool(&store, b"x").await).unwrap();
+        let h = store
+            .commit(spool(&store, b"x").await, BlobKind::Dicom)
+            .unwrap();
         std::fs::write(d.path().join("tmp/x.part"), b"junk").unwrap();
         assert_eq!(store.sweep_tmp().unwrap(), 1);
-        assert_eq!(store.list().unwrap(), vec![h]);
+        assert_eq!(store.list().unwrap(), vec![(h, BlobKind::Dicom)]);
+    }
+
+    #[tokio::test]
+    async fn nifti_kinds_have_own_extension() {
+        let d = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::open(d.path()).unwrap();
+        let h = store
+            .commit(spool(&store, b"nii-gz bytes").await, BlobKind::NiftiGz)
+            .unwrap();
+        let hex = h.to_hex();
+        let p = store.path_of(&h, BlobKind::NiftiGz);
+        assert!(p.ends_with(format!(
+            "objects/{}/{}/{hex}.nii.gz",
+            &hex[0..2],
+            &hex[2..4]
+        )));
+        assert!(p.is_file());
+        assert!(
+            store
+                .path_of(&h, BlobKind::Nifti)
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("{hex}.nii"))
+        );
+        assert!(
+            store
+                .path_of(&h, BlobKind::Dicom)
+                .to_str()
+                .unwrap()
+                .ends_with(&format!("{hex}.dcm"))
+        );
+        assert!(!store.path_of(&h, BlobKind::Dicom).exists());
+        assert_eq!(BlobKind::Dicom.ext(), "dcm");
+        assert_eq!(BlobKind::Nifti.ext(), "nii");
+        assert_eq!(BlobKind::NiftiGz.ext(), "nii.gz");
+        store.delete(&h, BlobKind::Dicom).unwrap();
+        assert!(
+            p.is_file(),
+            "deleting another kind must not touch this file"
+        );
+        store.delete(&h, BlobKind::NiftiGz).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[tokio::test]
+    async fn list_returns_kinds() {
+        let d = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::open(d.path()).unwrap();
+        let a = store
+            .commit(spool(&store, b"a").await, BlobKind::Dicom)
+            .unwrap();
+        let b = store
+            .commit(spool(&store, b"b").await, BlobKind::Nifti)
+            .unwrap();
+        let c = store
+            .commit(spool(&store, b"c").await, BlobKind::NiftiGz)
+            .unwrap();
+        // Same hash under two kinds: two entries.
+        store
+            .commit(spool(&store, b"a").await, BlobKind::Nifti)
+            .unwrap();
+        // Unknown names are ignored.
+        let dir = store
+            .path_of(&a, BlobKind::Dicom)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join(format!("{}.gz", a.to_hex())), b"x").unwrap();
+        std::fs::write(dir.join(format!("{}.dcm.bak", a.to_hex())), b"x").unwrap();
+        std::fs::write(dir.join("abc.nii.gz"), b"x").unwrap();
+        let upper = format!("{}.nii", a.to_hex().to_uppercase());
+        std::fs::write(dir.join(upper), b"x").unwrap();
+        let mut got = store.list().unwrap();
+        got.sort_by_key(|(h, k)| (h.to_hex(), k.ext()));
+        let mut want = vec![
+            (a, BlobKind::Dicom),
+            (a, BlobKind::Nifti),
+            (b, BlobKind::Nifti),
+            (c, BlobKind::NiftiGz),
+        ];
+        want.sort_by_key(|(h, k)| (h.to_hex(), k.ext()));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn spool_sync_hashes_and_limits() {
+        let d = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::open(d.path()).unwrap();
+        // Larger than one 64 KiB chunk.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let s = store.spool_sync(&mut &data[..], data.len() as u64).unwrap();
+        let want: [u8; 32] = Sha256::digest(&data).into();
+        assert_eq!(s.hash, BlobHash(want));
+        assert_eq!(s.len, data.len() as u64);
+        assert_eq!(std::fs::read(s.path()).unwrap(), data);
+        drop(s);
+        assert_eq!(count_files(&d.path().join("tmp")), 0);
+
+        let err = store
+            .spool_sync(&mut &data[..], data.len() as u64 - 1)
+            .unwrap_err();
+        assert!(matches!(err, SpoolError::TooLarge { limit } if limit == data.len() as u64 - 1));
+        assert_eq!(count_files(&d.path().join("tmp")), 0);
+
+        // Read errors also leave nothing behind.
+        struct Failing;
+        impl io::Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("boom"))
+            }
+        }
+        assert!(matches!(
+            store.spool_sync(&mut Failing, 10),
+            Err(SpoolError::Io(_))
+        ));
+        assert_eq!(count_files(&d.path().join("tmp")), 0);
     }
 
     #[test]

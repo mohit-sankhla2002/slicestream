@@ -9,8 +9,8 @@ use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
 use dicom_dictionary_std::uids::CT_IMAGE_STORAGE;
 use slicestream_store::{
-    DuplicatePolicy, Expectations, IngestError, IngestSource, Ingestor, RecoveryReport,
-    SpooledBlob, StorageConfig, is_storage_sop_class,
+    BlobKind, DuplicatePolicy, Expectations, IngestError, IngestSource, Ingestor, NiftiMeta,
+    RecoveryReport, SpooledBlob, StorageConfig, is_storage_sop_class,
 };
 
 fn config(root: &Path) -> StorageConfig {
@@ -72,7 +72,7 @@ async fn ingest_stores_and_indexes() {
         .unwrap();
     assert!(!stored.duplicate);
     assert!(!stored.replaced);
-    assert!(ing.blobs().path_of(&stored.blob).is_file());
+    assert!(ing.blobs().path_of(&stored.blob, BlobKind::Dicom).is_file());
 
     let series = ing.index().list_series().await.unwrap();
     assert_eq!(series.len(), 1);
@@ -261,7 +261,10 @@ async fn recover_removes_orphans_and_tmp() {
     // Orphan: committed but never indexed.
     let mut t = ing.create_temp().unwrap();
     t.write_chunk(b"not dicom").await.unwrap();
-    let orphan = ing.blobs().commit(t.finish().await.unwrap()).unwrap();
+    let orphan = ing
+        .blobs()
+        .commit(t.finish().await.unwrap(), BlobKind::Dicom)
+        .unwrap();
     std::fs::write(root.join("tmp/stray.part"), b"junk").unwrap();
 
     let report = ing.recover().await.unwrap();
@@ -269,11 +272,12 @@ async fn recover_removes_orphans_and_tmp() {
         report,
         RecoveryReport {
             tmp_removed: 1,
-            orphans_removed: 1
+            orphans_removed: 1,
+            uploads_aborted: 0,
         }
     );
-    assert!(!ing.blobs().path_of(&orphan).exists());
-    assert!(ing.blobs().path_of(&kept.blob).is_file());
+    assert!(!ing.blobs().path_of(&orphan, BlobKind::Dicom).exists());
+    assert!(ing.blobs().path_of(&kept.blob, BlobKind::Dicom).is_file());
     assert!(files_under(&root.join("tmp")).is_empty());
 }
 
@@ -297,8 +301,8 @@ async fn overwrite_policy_replaces_and_deletes_old_blob() {
     let b = ing.import_file(&file).await.unwrap();
     assert!(b.replaced);
     assert_ne!(a.blob, b.blob);
-    assert!(!ing.blobs().path_of(&a.blob).exists());
-    assert!(ing.blobs().path_of(&b.blob).is_file());
+    assert!(!ing.blobs().path_of(&a.blob, BlobKind::Dicom).exists());
+    assert!(ing.blobs().path_of(&b.blob, BlobKind::Dicom).is_file());
     assert_eq!(files_under(&root.join("objects")).len(), 1);
 }
 
@@ -449,4 +453,249 @@ async fn stats_count_each_outcome_once() {
     assert_eq!((s.stored, s.duplicate, s.failed), (1, 1, 1));
     assert_eq!(s.bytes, 2 * file_len);
     assert!(s.latency_p50_ms.is_some());
+}
+
+/// A synthetic NIfTI-1 file: 352-byte header (sizeof_hdr = 348, magic
+/// "n+1") followed by a few voxel bytes. The store does not parse it.
+fn nifti_bytes(seed: u8) -> Vec<u8> {
+    let mut v = vec![0u8; 352];
+    v[0..4].copy_from_slice(&348i32.to_le_bytes());
+    v[344..348].copy_from_slice(b"n+1\0");
+    v.extend([seed; 16]);
+    v
+}
+
+fn nifti_meta(compressed: bool) -> NiftiMeta {
+    NiftiMeta {
+        version: 1,
+        dims: vec![3, 2, 2, 2],
+        pixdim: vec![1.0, 1.0, 1.0, 1.0],
+        datatype: 2,
+        descrip: String::new(),
+        compressed,
+        original_name: "vol.nii.gz".into(),
+    }
+}
+
+fn spool_bytes(ing: &Ingestor, bytes: &[u8]) -> SpooledBlob {
+    ing.spool_sync(&mut &bytes[..]).unwrap()
+}
+
+#[tokio::test]
+async fn ingest_nifti_stores_and_dedups() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let up = ing
+        .index()
+        .create_upload("import", "x", None)
+        .await
+        .unwrap();
+    let bytes = nifti_bytes(1);
+
+    let a = ing
+        .ingest_nifti(spool_bytes(&ing, &bytes), nifti_meta(true), up)
+        .await
+        .unwrap();
+    assert!(!a.duplicate);
+    let hex = a.blob.to_hex();
+    let expected = root
+        .join("objects")
+        .join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(format!("{hex}.nii.gz"));
+    assert!(expected.is_file());
+    assert_eq!(std::fs::read(&expected).unwrap(), bytes);
+
+    let b = ing
+        .ingest_nifti(spool_bytes(&ing, &bytes), nifti_meta(true), up)
+        .await
+        .unwrap();
+    assert!(b.duplicate);
+    assert_eq!(b.id, a.id);
+    assert_eq!(b.blob, a.blob);
+    assert_eq!(files_under(&root.join("objects")), vec![expected]);
+    assert!(files_under(&root.join("tmp")).is_empty());
+
+    let c = ing.index().storage_counts().await.unwrap();
+    assert_eq!((c.nifti_count, c.nifti_bytes), (1, bytes.len() as i64));
+    let st = ing.stats();
+    assert_eq!((st.nifti_stored, st.nifti_duplicate), (1, 1));
+
+    // Uncompressed goes to `.nii`.
+    let u = ing
+        .ingest_nifti(spool_bytes(&ing, &nifti_bytes(2)), nifti_meta(false), up)
+        .await
+        .unwrap();
+    assert!(ing.blobs().path_of(&u.blob, BlobKind::Nifti).is_file());
+}
+
+#[tokio::test]
+async fn ingest_nifti_unknown_upload_removes_blob() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let err = ing
+        .ingest_nifti(spool_bytes(&ing, &nifti_bytes(3)), nifti_meta(false), 4242)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IngestError::Index(_)), "{err:?}");
+    assert!(files_under(&root.join("objects")).is_empty());
+    assert!(files_under(&root.join("tmp")).is_empty());
+    assert_eq!(ing.stats().failed, 1);
+}
+
+#[tokio::test]
+async fn recover_keeps_indexed_nifti_and_removes_orphans() {
+    let d = tempfile::tempdir().unwrap();
+    let file = phantom_file(&d.path().join("src"));
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let dicom = ing.import_file(&file).await.unwrap();
+    let up = ing
+        .index()
+        .create_upload("import", "x", None)
+        .await
+        .unwrap();
+    let nii = ing
+        .ingest_nifti(spool_bytes(&ing, &nifti_bytes(1)), nifti_meta(true), up)
+        .await
+        .unwrap();
+    ing.index()
+        .finish_upload(up, "done", &Default::default())
+        .await
+        .unwrap();
+
+    // Hand-placed, unreferenced blobs of both kinds.
+    let stray_nii = ing
+        .blobs()
+        .commit(spool_bytes(&ing, &nifti_bytes(9)), BlobKind::Nifti)
+        .unwrap();
+    let stray_dcm = ing
+        .blobs()
+        .commit(spool_bytes(&ing, b"orphan dicom"), BlobKind::Dicom)
+        .unwrap();
+    // A file whose name is not a blob name is never touched.
+    let foreign = root.join("objects").join("README");
+    std::fs::write(&foreign, b"keep me").unwrap();
+
+    let report = ing.recover().await.unwrap();
+    assert_eq!(
+        report,
+        RecoveryReport {
+            tmp_removed: 0,
+            orphans_removed: 2,
+            uploads_aborted: 0,
+        }
+    );
+    assert!(ing.blobs().path_of(&nii.blob, BlobKind::NiftiGz).is_file());
+    assert!(ing.blobs().path_of(&dicom.blob, BlobKind::Dicom).is_file());
+    assert!(!ing.blobs().path_of(&stray_nii, BlobKind::Nifti).exists());
+    assert!(!ing.blobs().path_of(&stray_dcm, BlobKind::Dicom).exists());
+    assert!(foreign.is_file());
+
+    // A second pass finds nothing more.
+    assert_eq!(ing.recover().await.unwrap().orphans_removed, 0);
+    assert!(ing.blobs().path_of(&nii.blob, BlobKind::NiftiGz).is_file());
+}
+
+#[tokio::test]
+async fn recover_survives_restart_with_nifti() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let blob = {
+        let ing = Ingestor::open(config(&root)).await.unwrap();
+        let up = ing
+            .index()
+            .create_upload("import", "x", None)
+            .await
+            .unwrap();
+        ing.ingest_nifti(spool_bytes(&ing, &nifti_bytes(5)), nifti_meta(false), up)
+            .await
+            .unwrap()
+            .blob
+    };
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let report = ing.recover().await.unwrap();
+    assert_eq!(report.orphans_removed, 0);
+    assert_eq!(report.uploads_aborted, 1);
+    assert!(ing.blobs().path_of(&blob, BlobKind::Nifti).is_file());
+}
+
+#[tokio::test]
+async fn abort_running_uploads() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let running = ing
+        .index()
+        .create_upload("http_archive", "a.zip", None)
+        .await
+        .unwrap();
+    let done = ing
+        .index()
+        .create_upload("import", "b", None)
+        .await
+        .unwrap();
+    ing.index()
+        .finish_upload(done, "done", &Default::default())
+        .await
+        .unwrap();
+    let report = ing.recover().await.unwrap();
+    assert_eq!(report.uploads_aborted, 1);
+    let r = ing.index().upload(running).await.unwrap().unwrap();
+    assert_eq!(r.status, "aborted");
+    assert_eq!(
+        ing.index().upload(done).await.unwrap().unwrap().status,
+        "done"
+    );
+}
+
+#[tokio::test]
+async fn instance_links_after_ingest() {
+    let d = tempfile::tempdir().unwrap();
+    let file = phantom_file(&d.path().join("src"));
+    let ing = Ingestor::open(config(&d.path().join("store")))
+        .await
+        .unwrap();
+    let stored = ing.import_file(&file).await.unwrap();
+    let (patient_fk, study_fk) = ing
+        .index()
+        .instance_links(&stored.sop_instance_uid)
+        .await
+        .unwrap()
+        .expect("links for an indexed instance");
+
+    let up = ing
+        .index()
+        .create_upload("import", "x", None)
+        .await
+        .unwrap();
+    let n = ing
+        .ingest_nifti(spool_bytes(&ing, &nifti_bytes(1)), nifti_meta(true), up)
+        .await
+        .unwrap();
+    ing.index()
+        .link_nifti(n.id, Some(patient_fk), Some(study_fk))
+        .await
+        .unwrap();
+    let row = ing.index().nifti_volume(n.id).await.unwrap().unwrap();
+    assert_eq!(
+        (row.patient_fk, row.study_fk),
+        (Some(patient_fk), Some(study_fk))
+    );
+}
+
+#[tokio::test]
+async fn spool_sync_respects_max_instance_bytes() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let mut cfg = config(&root);
+    cfg.max_instance_bytes = 100;
+    let ing = Ingestor::open(cfg).await.unwrap();
+    let err = ing.spool_sync(&mut &[0u8; 101][..]).unwrap_err();
+    assert!(matches!(err, IngestError::TooLarge { limit: 100 }));
+    assert!(files_under(&root.join("tmp")).is_empty());
+    let ok = ing.spool_sync(&mut &[0u8; 100][..]).unwrap();
+    assert_eq!(ok.len, 100);
 }

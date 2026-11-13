@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 
 use slicestream_core::series::SeriesSummary;
 use slicestream_core::{Series, SliceRef};
-use slicestream_store::{Ingestor, SeriesRow};
+use slicestream_store::{BlobKind, Ingestor, SeriesRow};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -96,7 +96,7 @@ impl SeriesCatalog {
         let blobs = self.ingestor.blobs();
         let mut slices = Vec::new();
         for r in rows {
-            let path = blobs.path_of(&r.blob);
+            let path = blobs.path_of(&r.blob, BlobKind::Dicom);
             for frame in 0..r.number_of_frames {
                 slices.push(SliceRef::new(
                     path.clone(),

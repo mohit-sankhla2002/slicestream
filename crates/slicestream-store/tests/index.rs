@@ -5,8 +5,8 @@ mod phantom;
 use std::sync::Arc;
 
 use slicestream_store::{
-    BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, StorageCounts, UpsertOutcome,
-    read_header,
+    BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, NiftiMeta, StorageCounts,
+    UploadCounts, UpsertOutcome, read_header,
 };
 
 fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
@@ -198,6 +198,8 @@ async fn storage_counts_after_inserts() {
             instances: 3,
             objects_bytes: 600,
             objects_count: 3,
+            nifti_count: 0,
+            nifti_bytes: 0,
         }
     );
 }
@@ -236,4 +238,148 @@ async fn console_series_is_limited_to_newest() {
     // Newest first: the last inserted series is on top, the first is cut.
     assert_eq!(rows[0].series_uid, format!("1.2.3.{}", n - 1));
     assert!(rows.iter().all(|r| r.series_uid != "1.2.3.0"));
+}
+
+fn nifti_meta(compressed: bool) -> NiftiMeta {
+    NiftiMeta {
+        version: 1,
+        dims: vec![3, 4, 5, 6],
+        pixdim: vec![1.0, 0.5, 0.5, 2.0],
+        datatype: 4,
+        descrip: "test volume".into(),
+        compressed,
+        original_name: "brain.nii.gz".into(),
+    }
+}
+
+#[tokio::test]
+async fn upload_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = Index::open(&dir.path().join("index.db")).await.unwrap();
+    let a = idx
+        .create_upload("http_archive", "scan.zip", Some("10.0.0.1:5000"))
+        .await
+        .unwrap();
+    let b = idx.create_upload("import", "/data", None).await.unwrap();
+    assert_ne!(a, b);
+
+    let row = idx.upload(a).await.unwrap().unwrap();
+    assert_eq!(row.kind, "http_archive");
+    assert_eq!(row.name, "scan.zip");
+    assert_eq!(row.remote.as_deref(), Some("10.0.0.1:5000"));
+    assert_eq!(row.status, "running");
+    assert!(row.finished_at.is_none());
+    assert_eq!(row.counts, UploadCounts::default());
+    // RFC3339 with milliseconds, UTC.
+    assert_eq!(row.started_at.len(), "2026-11-13T00:00:00.000Z".len());
+    assert!(row.started_at.ends_with('Z'));
+
+    let counts = UploadCounts {
+        dicom_stored: 1,
+        dicom_duplicate: 2,
+        nifti_stored: 3,
+        nifti_duplicate: 4,
+        skipped: 5,
+        failed: 6,
+    };
+    idx.finish_upload(a, "done", &counts).await.unwrap();
+    let row = idx.upload(a).await.unwrap().unwrap();
+    assert_eq!(row.status, "done");
+    assert_eq!(row.counts, counts);
+    assert!(row.finished_at.is_some());
+
+    // Only the still-running upload is aborted.
+    assert_eq!(idx.abort_running_uploads().await.unwrap(), 1);
+    assert_eq!(idx.upload(a).await.unwrap().unwrap().status, "done");
+    let rb = idx.upload(b).await.unwrap().unwrap();
+    assert_eq!(rb.status, "aborted");
+    assert!(rb.finished_at.is_some());
+    assert_eq!(idx.abort_running_uploads().await.unwrap(), 0);
+    assert!(idx.upload(9999).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn blob_hashes_include_nifti() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, _) = seeded_index(dir.path()).await;
+    let up = idx.create_upload("import", "x", None).await.unwrap();
+    let nh = BlobHash([0x77; 32]);
+    let (id, duplicate) = idx
+        .insert_nifti(&nh, 4096, &nifti_meta(true), up)
+        .await
+        .unwrap();
+    assert!(!duplicate);
+    let (id2, duplicate) = idx
+        .insert_nifti(&nh, 4096, &nifti_meta(true), up)
+        .await
+        .unwrap();
+    assert!(duplicate);
+    assert_eq!(id, id2);
+
+    let hashes = idx.blob_hashes().await.unwrap();
+    assert_eq!(hashes.len(), 4);
+    assert!(hashes.contains(&nh));
+    for fill in 1..=3u8 {
+        assert!(hashes.contains(&BlobHash([fill; 32])));
+    }
+    assert!(idx.blob_in_use(&nh).await.unwrap());
+    assert!(!idx.blob_in_use(&BlobHash([0x78; 32])).await.unwrap());
+}
+
+#[tokio::test]
+async fn storage_counts_include_nifti() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, _) = seeded_index(dir.path()).await;
+    let up = idx.create_upload("import", "x", None).await.unwrap();
+    idx.insert_nifti(&BlobHash([0x71; 32]), 1000, &nifti_meta(false), up)
+        .await
+        .unwrap();
+    idx.insert_nifti(&BlobHash([0x72; 32]), 24, &nifti_meta(true), up)
+        .await
+        .unwrap();
+    assert_eq!(
+        idx.storage_counts().await.unwrap(),
+        StorageCounts {
+            studies: 1,
+            series: 2,
+            instances: 3,
+            objects_bytes: 600,
+            objects_count: 3,
+            nifti_count: 2,
+            nifti_bytes: 1024,
+        }
+    );
+}
+
+#[tokio::test]
+async fn nifti_links_and_instance_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, hs) = seeded_index(dir.path()).await;
+    let (patient_fk, study_fk) = idx
+        .instance_links(&hs[0].sop_instance_uid)
+        .await
+        .unwrap()
+        .expect("indexed instance has links");
+    assert!(idx.instance_links("1.2.3.missing").await.unwrap().is_none());
+
+    let up = idx.create_upload("import", "x", None).await.unwrap();
+    let (id, _) = idx
+        .insert_nifti(&BlobHash([0x70; 32]), 10, &nifti_meta(false), up)
+        .await
+        .unwrap();
+    let row = idx.nifti_volume(id).await.unwrap().unwrap();
+    assert_eq!(row.patient_fk, None);
+    assert_eq!(row.study_fk, None);
+    assert_eq!(row.upload_fk, up);
+    assert_eq!(row.meta, nifti_meta(false));
+    assert_eq!(row.size_bytes, 10);
+
+    idx.link_nifti(id, Some(patient_fk), Some(study_fk))
+        .await
+        .unwrap();
+    let row = idx.nifti_volume(id).await.unwrap().unwrap();
+    assert_eq!(row.patient_fk, Some(patient_fk));
+    assert_eq!(row.study_fk, Some(study_fk));
+    // Foreign keys are enforced.
+    assert!(idx.link_nifti(id, Some(9999), None).await.is_err());
 }

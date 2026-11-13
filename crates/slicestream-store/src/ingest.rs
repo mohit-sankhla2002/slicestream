@@ -4,6 +4,8 @@
 //! directory fsync) → index transaction → acknowledge → broadcast. A blob may
 //! therefore exist without an index row (an orphan, removed by
 //! [`Ingestor::recover`]), but an index row never exists without its blob.
+//! NIfTI volumes ([`Ingestor::ingest_nifti`]) follow the same order with a
+//! `nifti_volumes` row in place of the `instances` row.
 //!
 //! One process owns a storage root: [`Ingestor::open`] takes an exclusive
 //! advisory lock on `<root>/LOCK` and holds it for the life of the
@@ -24,8 +26,9 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{error, warn};
 
 use crate::{
-    BlobHash, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceHeader, InstanceRecord,
-    SpoolError, SpooledBlob, StorageConfig, TempBlob, UpsertOutcome, read_header,
+    BlobHash, BlobKind, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceHeader,
+    InstanceRecord, NiftiMeta, SpoolError, SpooledBlob, StorageConfig, TempBlob, UpsertOutcome,
+    read_header,
 };
 
 /// Capacity of the [`StoredEvent`] broadcast channel.
@@ -94,11 +97,23 @@ pub struct StoredEvent {
     pub sop_instance_uid: String,
 }
 
+/// A successfully stored (or already present) NIfTI volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredNifti {
+    /// `nifti_volumes` row id.
+    pub id: i64,
+    /// The same bytes were already indexed; the existing row is unchanged.
+    pub duplicate: bool,
+    pub blob: BlobHash,
+}
+
 /// Result of [`Ingestor::recover`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub tmp_removed: usize,
     pub orphans_removed: usize,
+    /// `uploads` rows that were still `running` and are now `aborted`.
+    pub uploads_aborted: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -373,7 +388,7 @@ impl Shared {
         let _guard = self.lock_for(&rec.header.sop_instance_uid).lock().await;
 
         let blobs = self.blobs.clone();
-        let new_blob = blocking(move || blobs.commit(spooled)).await??;
+        let new_blob = blocking(move || blobs.commit(spooled, BlobKind::Dicom)).await??;
         rec.blob = new_blob;
 
         #[cfg(test)]
@@ -388,7 +403,7 @@ impl Shared {
         let outcome = match upserted {
             Ok(o) => o,
             Err(e) => {
-                self.discard_unreferenced(new_blob).await;
+                self.discard_unreferenced(new_blob, BlobKind::Dicom).await;
                 return Err(IngestError::Index(e));
             }
         };
@@ -397,13 +412,13 @@ impl Shared {
             UpsertOutcome::Inserted => (new_blob, false, false),
             UpsertOutcome::Duplicate { existing } => {
                 if existing != new_blob {
-                    self.discard_unreferenced(new_blob).await;
+                    self.discard_unreferenced(new_blob, BlobKind::Dicom).await;
                 }
                 (existing, true, false)
             }
             UpsertOutcome::Replaced { previous } => {
                 if previous != new_blob {
-                    self.discard_unreferenced(previous).await;
+                    self.discard_unreferenced(previous, BlobKind::Dicom).await;
                 }
                 (new_blob, false, true)
             }
@@ -426,17 +441,51 @@ impl Shared {
         })
     }
 
-    /// Delete `hash` unless an index row references it. Failures are logged,
-    /// not returned: the instance outcome is already decided, and any blob
-    /// left behind is an orphan that [`Ingestor::recover`] removes.
-    async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash) {
+    /// The critical section of [`Ingestor::ingest_nifti`]: commit → index →
+    /// cleanup, serialized per blob hash (identical bytes, identical hash).
+    /// Runs in its own task so that dropping the caller cannot interrupt it.
+    async fn store_nifti(
+        self: Arc<Self>,
+        spooled: SpooledBlob,
+        meta: NiftiMeta,
+        upload_id: i64,
+    ) -> Result<StoredNifti, IngestError> {
+        let hash = spooled.hash;
+        let size = spooled.len;
+        let kind = if meta.compressed {
+            BlobKind::NiftiGz
+        } else {
+            BlobKind::Nifti
+        };
+        let _guard = self.lock_for(&hash.to_hex()).lock().await;
+
+        let blobs = self.blobs.clone();
+        let blob = blocking(move || blobs.commit(spooled, kind)).await??;
+        match self.index.insert_nifti(&blob, size, &meta, upload_id).await {
+            Ok((id, duplicate)) => Ok(StoredNifti {
+                id,
+                duplicate,
+                blob,
+            }),
+            Err(e) => {
+                self.discard_unreferenced(blob, kind).await;
+                Err(IngestError::Index(e))
+            }
+        }
+    }
+
+    /// Delete blob `hash` of `kind` unless an index row (either table)
+    /// references the hash. Failures are logged, not returned: the outcome is
+    /// already decided, and any blob left behind is an orphan that
+    /// [`Ingestor::recover`] removes.
+    async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash, kind: BlobKind) {
         match self.index.blob_in_use(&hash).await {
             Ok(false) => {
                 let shared = Arc::clone(self);
                 match blocking(move || {
                     #[cfg(test)]
                     shared.hooks.before_delete();
-                    shared.blobs.delete(&hash)
+                    shared.blobs.delete(&hash, kind)
                 })
                 .await
                 {
@@ -539,6 +588,49 @@ impl Ingestor {
         result
     }
 
+    /// Copy `reader` into a new spool file (blocking; for use on blocking
+    /// threads), limited to `max_instance_bytes`. On error nothing is left in
+    /// `tmp/`.
+    pub fn spool_sync(&self, reader: &mut dyn io::Read) -> Result<SpooledBlob, IngestError> {
+        Ok(self
+            .shared
+            .blobs
+            .spool_sync(reader, self.cfg.max_instance_bytes)?)
+    }
+
+    /// Commit and index a spooled NIfTI volume as part of upload `upload_id`.
+    ///
+    /// The blob is stored exactly as received, as `.nii.gz` if
+    /// `meta.compressed`, else `.nii`. Returns only after the blob is renamed
+    /// into place, its directories are fsynced and the index transaction has
+    /// committed. Identical bytes already indexed are a success with
+    /// `duplicate: true` and the existing row's id. On an index error the new
+    /// blob is removed if nothing references it.
+    ///
+    /// Cancellation-safe like [`Ingestor::ingest`]: the critical section runs
+    /// in a spawned task.
+    pub async fn ingest_nifti(
+        &self,
+        spooled: SpooledBlob,
+        meta: NiftiMeta,
+        upload_id: i64,
+    ) -> Result<StoredNifti, IngestError> {
+        let len = spooled.len;
+        let shared = Arc::clone(&self.shared);
+        let result = tokio::spawn(shared.store_nifti(spooled, meta, upload_id))
+            .await
+            .map_err(join_error)
+            .and_then(|r| r);
+        match &result {
+            Ok(stored) => self
+                .shared
+                .stats
+                .record_nifti_success(stored.duplicate, len),
+            Err(_) => self.shared.stats.record_failure(),
+        }
+        result
+    }
+
     /// Snapshot of the ingest counters and 60 s latency percentiles.
     pub fn stats(&self) -> crate::stats::IngestStats {
         self.shared.stats.snapshot()
@@ -585,8 +677,9 @@ impl Ingestor {
             })
     }
 
-    /// Startup-only crash recovery: remove every file in `tmp/`, then delete
-    /// committed blobs that no index row references.
+    /// Startup-only crash recovery: remove every file in `tmp/`, mark
+    /// `running` uploads `aborted`, then delete committed blobs (any kind)
+    /// whose hash no `instances` or `nifti_volumes` row references.
     ///
     /// Call this before accepting any writes. Running it concurrently with
     /// [`Ingestor::ingest`] could remove an in-flight spool file or a blob
@@ -595,13 +688,16 @@ impl Ingestor {
     pub async fn recover(&self) -> Result<RecoveryReport, IngestError> {
         let blobs = self.shared.blobs.clone();
         let tmp_removed = blocking(move || blobs.sweep_tmp()).await??;
+        let uploads_aborted = self.shared.index.abort_running_uploads().await?;
+        // If the index cannot be read completely this fails and nothing is
+        // deleted.
         let referenced: HashSet<BlobHash> = self.shared.index.blob_hashes().await?;
         let blobs = self.shared.blobs.clone();
         let orphans_removed = blocking(move || -> io::Result<usize> {
             let mut n = 0;
-            for hash in blobs.list()? {
+            for (hash, kind) in blobs.list()? {
                 if !referenced.contains(&hash) {
-                    blobs.delete(&hash)?;
+                    blobs.delete(&hash, kind)?;
                     n += 1;
                 }
             }
@@ -611,6 +707,7 @@ impl Ingestor {
         Ok(RecoveryReport {
             tmp_removed,
             orphans_removed,
+            uploads_aborted,
         })
     }
 
@@ -732,7 +829,9 @@ mod tests {
         // already finished A's delete before B could take the lock.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            ing.blobs().path_of(&indexed.blob).is_file(),
+            ing.blobs()
+                .path_of(&indexed.blob, BlobKind::Dicom)
+                .is_file(),
             "index references a blob that no longer exists"
         );
     }

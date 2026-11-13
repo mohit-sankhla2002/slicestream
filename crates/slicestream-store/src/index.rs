@@ -82,6 +82,64 @@ pub struct StorageCounts {
     pub objects_bytes: i64,
     /// Number of distinct blobs.
     pub objects_count: i64,
+    /// Number of NIfTI volumes (one blob each).
+    pub nifti_count: i64,
+    /// Total bytes over NIfTI volumes.
+    pub nifti_bytes: i64,
+}
+
+/// Per-outcome item counts of one upload / import run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct UploadCounts {
+    pub dicom_stored: u64,
+    pub dicom_duplicate: u64,
+    pub nifti_stored: u64,
+    pub nifti_duplicate: u64,
+    pub skipped: u64,
+    pub failed: u64,
+}
+
+/// One `uploads` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRow {
+    pub id: i64,
+    /// `"http_archive"` or `"import"`.
+    pub kind: String,
+    pub name: String,
+    pub remote: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    /// `"running"`, `"done"` or `"aborted"`.
+    pub status: String,
+    pub counts: UploadCounts,
+}
+
+/// Header facts of a NIfTI volume, as indexed. Store-owned; the server maps
+/// its parsed header into this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NiftiMeta {
+    /// 1 or 2.
+    pub version: u8,
+    pub dims: Vec<i64>,
+    pub pixdim: Vec<f64>,
+    pub datatype: i16,
+    pub descrip: String,
+    /// Stored gzip-compressed (`.nii.gz`).
+    pub compressed: bool,
+    pub original_name: String,
+}
+
+/// One `nifti_volumes` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NiftiRow {
+    pub id: i64,
+    pub blob: BlobHash,
+    pub size_bytes: u64,
+    pub meta: NiftiMeta,
+    pub patient_fk: Option<i64>,
+    pub study_fk: Option<i64>,
+    pub upload_fk: i64,
+    pub received_at: String,
 }
 
 /// Most series [`Index::console_series`] returns.
@@ -123,6 +181,14 @@ fn decode_err(msg: String) -> sqlx::Error {
 
 fn parse_hash(s: &str) -> Result<BlobHash, sqlx::Error> {
     BlobHash::from_hex(s).ok_or_else(|| decode_err(format!("invalid blob_sha256 {s:?}")))
+}
+
+fn to_i64(v: u64, what: &str) -> Result<i64, sqlx::Error> {
+    i64::try_from(v).map_err(|_| sqlx::Error::Encode(format!("{what} exceeds i64").into()))
+}
+
+fn to_u64(v: i64, what: &str) -> Result<u64, sqlx::Error> {
+    u64::try_from(v).map_err(|_| decode_err(format!("invalid {what} {v}")))
 }
 
 fn now() -> String {
@@ -288,20 +354,30 @@ impl Index {
         Ok(outcome)
     }
 
-    /// Every blob hash referenced by an instance row.
+    /// Every blob hash referenced by an `instances` or `nifti_volumes` row.
+    ///
+    /// Startup recovery deletes every blob not in this set, so any row whose
+    /// hash cannot be parsed fails the whole call rather than being skipped.
     pub async fn blob_hashes(&self) -> Result<HashSet<BlobHash>, sqlx::Error> {
-        let rows: Vec<String> = sqlx::query_scalar("SELECT DISTINCT blob_sha256 FROM instances")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT blob_sha256 FROM instances
+             UNION
+             SELECT blob_sha256 FROM nifti_volumes",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(|s| parse_hash(s)).collect()
     }
 
-    /// Whether any instance row references `hash`.
+    /// Whether any `instances` or `nifti_volumes` row references `hash`.
     pub async fn blob_in_use(&self, hash: &BlobHash) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM instances WHERE blob_sha256 = ?1)")
-            .bind(hash.to_hex())
-            .fetch_one(&self.pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM instances WHERE blob_sha256 = ?1)
+                 OR EXISTS(SELECT 1 FROM nifti_volumes WHERE blob_sha256 = ?1)",
+        )
+        .bind(hash.to_hex())
+        .fetch_one(&self.pool)
+        .await
     }
 
     pub async fn storage_counts(&self) -> Result<StorageCounts, sqlx::Error> {
@@ -312,7 +388,9 @@ impl Index {
                     (SELECT COALESCE(SUM(sz), 0) FROM
                         (SELECT MAX(size_bytes) AS sz FROM instances GROUP BY blob_sha256)),
                     (SELECT COUNT(*) FROM
-                        (SELECT 1 FROM instances GROUP BY blob_sha256))",
+                        (SELECT 1 FROM instances GROUP BY blob_sha256)),
+                    (SELECT COUNT(*) FROM nifti_volumes),
+                    (SELECT COALESCE(SUM(size_bytes), 0) FROM nifti_volumes)",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -322,7 +400,239 @@ impl Index {
             instances: row.try_get(2)?,
             objects_bytes: row.try_get(3)?,
             objects_count: row.try_get(4)?,
+            nifti_count: row.try_get(5)?,
+            nifti_bytes: row.try_get(6)?,
         })
+    }
+
+    /// Start an upload / import run (status `running`); returns its id.
+    /// `kind` is `"http_archive"` or `"import"`.
+    pub async fn create_upload(
+        &self,
+        kind: &str,
+        name: &str,
+        remote: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "INSERT INTO uploads (kind, name, remote, started_at, status)
+             VALUES (?1, ?2, ?3, ?4, 'running')
+             RETURNING id",
+        )
+        .bind(kind)
+        .bind(name)
+        .bind(remote)
+        .bind(now())
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Record the end of upload `id` with its final `status` and `counts`.
+    /// Fails with [`sqlx::Error::RowNotFound`] if no such upload exists.
+    pub async fn finish_upload(
+        &self,
+        id: i64,
+        status: &str,
+        counts: &UploadCounts,
+    ) -> Result<(), sqlx::Error> {
+        let n = sqlx::query(
+            "UPDATE uploads SET status = ?2, finished_at = ?3, dicom_stored = ?4,
+                 dicom_duplicate = ?5, nifti_stored = ?6, nifti_duplicate = ?7, skipped = ?8,
+                 failed = ?9
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(now())
+        .bind(to_i64(counts.dicom_stored, "dicom_stored")?)
+        .bind(to_i64(counts.dicom_duplicate, "dicom_duplicate")?)
+        .bind(to_i64(counts.nifti_stored, "nifti_stored")?)
+        .bind(to_i64(counts.nifti_duplicate, "nifti_duplicate")?)
+        .bind(to_i64(counts.skipped, "skipped")?)
+        .bind(to_i64(counts.failed, "failed")?)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if n == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        Ok(())
+    }
+
+    /// Mark every `running` upload `aborted` (startup: the server restarted
+    /// under it). Returns how many rows changed.
+    pub async fn abort_running_uploads(&self) -> Result<u64, sqlx::Error> {
+        Ok(sqlx::query(
+            "UPDATE uploads SET status = 'aborted', finished_at = ?1 WHERE status = 'running'",
+        )
+        .bind(now())
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn upload(&self, id: i64) -> Result<Option<UploadRow>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, kind, name, remote, started_at, finished_at, status, dicom_stored,
+                    dicom_duplicate, nifti_stored, nifti_duplicate, skipped, failed
+             FROM uploads WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            let count =
+                |i: usize, what: &str| -> Result<u64, sqlx::Error> { to_u64(r.try_get(i)?, what) };
+            Ok(UploadRow {
+                id: r.try_get(0)?,
+                kind: r.try_get(1)?,
+                name: r.try_get(2)?,
+                remote: r.try_get(3)?,
+                started_at: r.try_get(4)?,
+                finished_at: r.try_get(5)?,
+                status: r.try_get(6)?,
+                counts: UploadCounts {
+                    dicom_stored: count(7, "dicom_stored")?,
+                    dicom_duplicate: count(8, "dicom_duplicate")?,
+                    nifti_stored: count(9, "nifti_stored")?,
+                    nifti_duplicate: count(10, "nifti_duplicate")?,
+                    skipped: count(11, "skipped")?,
+                    failed: count(12, "failed")?,
+                },
+            })
+        })
+        .transpose()
+    }
+
+    /// Index a committed NIfTI blob in one transaction. Returns the row id
+    /// and whether `blob` was already indexed (a duplicate: the existing row
+    /// is left unchanged and its id returned).
+    pub async fn insert_nifti(
+        &self,
+        blob: &BlobHash,
+        size_bytes: u64,
+        meta: &NiftiMeta,
+        upload_id: i64,
+    ) -> Result<(i64, bool), sqlx::Error> {
+        let enc = |e: serde_json::Error| sqlx::Error::Encode(Box::new(e));
+        let dims = serde_json::to_string(&meta.dims).map_err(enc)?;
+        // Non-finite values are written as JSON `null`.
+        let pixdim = serde_json::to_string(&meta.pixdim).map_err(enc)?;
+        let blob_hex = blob.to_hex();
+        let size = to_i64(size_bytes, "size_bytes")?;
+
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let inserted: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO nifti_volumes (blob_sha256, size_bytes, compressed, nifti_version,
+                                        original_name, dims, pixdim, datatype, descrip,
+                                        upload_fk, received_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(blob_sha256) DO NOTHING
+             RETURNING id",
+        )
+        .bind(&blob_hex)
+        .bind(size)
+        .bind(meta.compressed)
+        .bind(i64::from(meta.version))
+        .bind(&meta.original_name)
+        .bind(&dims)
+        .bind(&pixdim)
+        .bind(meta.datatype)
+        .bind(&meta.descrip)
+        .bind(upload_id)
+        .bind(now())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let out = match inserted {
+            Some(id) => (id, false),
+            None => {
+                let id: i64 =
+                    sqlx::query_scalar("SELECT id FROM nifti_volumes WHERE blob_sha256 = ?1")
+                        .bind(&blob_hex)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                (id, true)
+            }
+        };
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    pub async fn nifti_volume(&self, id: i64) -> Result<Option<NiftiRow>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, blob_sha256, size_bytes, compressed, nifti_version, original_name, dims,
+                    pixdim, datatype, descrip, patient_fk, study_fk, upload_fk, received_at
+             FROM nifti_volumes WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            let dims: &str = r.try_get(6)?;
+            let pixdim: &str = r.try_get(7)?;
+            let version: i64 = r.try_get(4)?;
+            let pixdim: Vec<Option<f64>> = serde_json::from_str(pixdim)
+                .map_err(|e| decode_err(format!("invalid pixdim JSON: {e}")))?;
+            Ok(NiftiRow {
+                id: r.try_get(0)?,
+                blob: parse_hash(r.try_get(1)?)?,
+                size_bytes: to_u64(r.try_get(2)?, "size_bytes")?,
+                meta: NiftiMeta {
+                    version: u8::try_from(version)
+                        .map_err(|_| decode_err(format!("invalid nifti_version {version}")))?,
+                    dims: serde_json::from_str(dims)
+                        .map_err(|e| decode_err(format!("invalid dims JSON: {e}")))?,
+                    pixdim: pixdim.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect(),
+                    datatype: r.try_get(8)?,
+                    descrip: r.try_get(9)?,
+                    compressed: r.try_get(3)?,
+                    original_name: r.try_get(5)?,
+                },
+                patient_fk: r.try_get(10)?,
+                study_fk: r.try_get(11)?,
+                upload_fk: r.try_get(12)?,
+                received_at: r.try_get(13)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Link NIfTI volume `nifti_id` to a patient and study (either may be
+    /// `None`). Fails with [`sqlx::Error::RowNotFound`] if no such volume.
+    pub async fn link_nifti(
+        &self,
+        nifti_id: i64,
+        patient_fk: Option<i64>,
+        study_fk: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        let n =
+            sqlx::query("UPDATE nifti_volumes SET patient_fk = ?2, study_fk = ?3 WHERE id = ?1")
+                .bind(nifti_id)
+                .bind(patient_fk)
+                .bind(study_fk)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        if n == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        Ok(())
+    }
+
+    /// `(patient_fk, study_fk)` of an indexed instance, via series → study.
+    pub async fn instance_links(
+        &self,
+        sop_instance_uid: &str,
+    ) -> Result<Option<(i64, i64)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT st.patient_fk, s.study_fk
+             FROM instances i
+             JOIN series s ON s.id = i.series_fk
+             JOIN studies st ON st.id = s.study_fk
+             WHERE i.sop_instance_uid = ?1",
+        )
+        .bind(sop_instance_uid)
+        .fetch_optional(&self.pool)
+        .await
     }
 
     /// The newest [`CONSOLE_SERIES_LIMIT`] series with study/patient context
