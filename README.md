@@ -55,6 +55,9 @@ for now.
   `PrefetchScheduler` and the wire protocol.
 - `slicestream-store`: crash-safe ingest into content-addressed blobs plus a
   SQLite index, with de-duplication and startup recovery.
+- `slicestream-archive`: opens ZIP, 7z, RAR, tar, tar.gz and plain gzip
+  files (nested in any combination) and finds DICOM and NIfTI files inside,
+  with limits against zip bombs.
 - `slicestream-dimse`: a C-STORE / C-ECHO storage SCP (default port 11112).
 - `slicestream-server`: an axum server with a JSON API, single-frame HTTP fetch,
   and a WebSocket stream that changes its send order on every scroll event.
@@ -63,6 +66,9 @@ for now.
 - `web/`: a dependency-free browser test console, served by the server itself:
   - **Upload**: drop files or a folder and send them one request each, over
     STOW-RS or as single files, with an optional bearer token.
+  - **Archives and NIfTI**: drop a ZIP, 7z, RAR, tar or tar.gz, or a `.nii` /
+    `.nii.gz` file. The console shows upload and processing progress, an
+    expandable row per archive and a patient summary when it is done.
   - **Ingest results**: a stored / duplicate / failed line per file, with the
     reason for each failure.
   - **Process**: live CPU, memory, disk, ingest latency and connection counts
@@ -70,6 +76,11 @@ for now.
   - **Stored series**: every series in storage, updated as instances arrive.
   - **Viewer**: click a series to scroll through it (mouse wheel or arrow keys)
     over the streaming WebSocket.
+
+- Archive ingest: DICOM inside archives goes through the normal ingest path.
+  NIfTI volumes are stored as they are and linked to a patient or study when
+  the archive makes that clear. See
+  [docs/CONFORMANCE.md](docs/CONFORMANCE.md#archive-ingest).
 
 On a local synthetic series of 120 slices at 256×256, the first frame arrives in
 about 26 ms. Frames then come in this order: the cursor slice, the slices ahead
@@ -95,9 +106,15 @@ cargo run -p slicestream-server -- serve
 #    server metrics and an upload panel. Click the series and scroll.
 ```
 
-`import <DIR>` reads Part-10 files from a folder (`--recursive` descends into
-subfolders) and skips files without the `DICM` preamble. It prints
-`stored / duplicate / failed` counts. One process owns a storage root (it
+`import <PATH>` takes a folder or a single file. A folder is read for
+Part-10 files (`--recursive` descends into subfolders); archives and NIfTI
+files inside it are opened or stored too. A file can be a ZIP, 7z, RAR, tar,
+tar.gz, NIfTI or DICOM file. Files without the `DICM` preamble are skipped.
+It prints one line per patient, then a summary line
+`stored N · duplicate N · nifti N (linked N, unassigned N) · skipped N · failed N`.
+The exit code is 0 on success, and 1 if any file failed or the import was
+aborted (for example by a limit). Server logs go to stderr, so the summary on
+stdout stays clean. One process owns a storage root (it
 holds a lock on `<root>/LOCK`), so run `import` only while the server is
 stopped. While `serve` runs, push instances with STOW-RS,
 `POST /api/instances`, or C-STORE from a modality or another PACS (called AE
@@ -115,6 +132,8 @@ Every setting has a default. To change them, copy
 | POST | `/dicom-web/studies` | STOW-RS: store a `multipart/related; type="application/dicom"` body |
 | POST | `/dicom-web/studies/{study}` | STOW-RS into one study (each part must match) |
 | POST | `/api/instances` | Store one Part-10 file sent as `application/dicom`; returns JSON |
+| POST | `/api/archives` | Store an archive (ZIP, 7z, RAR, tar, tar.gz, gzip), a NIfTI file or one DICOM file sent as the raw body. Returns 202 `{"job", "upload_id"}`. Send the file name in `x-filename`, percent-encoded UTF-8 (`encodeURIComponent(name)`). Errors: 400 unsupported file, 401 bad token, 413 too large, 503 job queue full, 507 not enough free disk space. |
+| GET | `/api/archives/{job}` | Progress and results of a job: `status` (`queued`, `running`, `done`, `aborted`), counts, per-entry results and a patient summary. 404 for an unknown job. Shows patient names, no token, no CORS. |
 | GET | `/api/series` | JSON list of series summaries |
 | GET | `/api/series/{uid}` | One series summary |
 | GET | `/api/series/{uid}/frames/{index}` | Raw frame bytes. Metadata is in the `x-slicestream-frame-info` header. |
@@ -123,7 +142,7 @@ Every setting has a default. To change them, copy
 | GET | `/api/console/series` | Every series with study and patient details, for the test console |
 | GET (WS) | `/api/series/{uid}/stream` | Scroll-aware frame stream. See [docs/PROTOCOL.md](docs/PROTOCOL.md). |
 
-If `[http] stow_token` is set, the three POST endpoints need
+If `[http] stow_token` is set, the four POST endpoints need
 `Authorization: Bearer <token>`. They never have CORS headers, so web pages on
 other origins cannot upload. The read endpoints send CORS headers only for the
 origins in `[http] cors_allowed_origins` (empty by default: no CORS), and the
@@ -135,6 +154,29 @@ Request. This blocks DNS rebinding. By default the allowed hosts are
 `localhost`, `127.0.0.1`, `[::1]` and the host of `[http] addr`. To reach the
 server by another name (for example when binding `0.0.0.0`), list it in
 `[http] allowed_hosts`.
+
+Archive uploads can be turned off with `[archives] enabled = false` (both
+routes then return 404). Limits are in the `[archives]` section of
+[`slicestream.example.toml`](slicestream.example.toml).
+
+## RAR and the UnRAR licence
+
+RAR reading uses the bundled UnRAR library (through the `unrar_sys` crate).
+Its licence is the "UnRAR freeware" licence by Alexander Roshal. It is free to
+use, but it is not OSI-approved. It says UnRAR source code may be used in any
+software to handle RAR archives free of charge, but it may not be used to
+develop a RAR-compatible archiver or to re-create the RAR compression
+algorithm. If you redistribute it, keep the full licence text
+(`license.txt` in `unrar_sys`).
+
+The `rar` cargo feature is on by default. To build without it:
+
+```sh
+cargo build --no-default-features
+```
+
+Without it, RAR entries fail with "RAR support not built in". Everything else
+works the same.
 
 ## DIMSE
 
@@ -149,6 +191,7 @@ See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the conformance statement.
 ```
 crates/slicestream-core     transport-agnostic library (index, frames, scheduler, protocol)
 crates/slicestream-store    ingest pipeline, blob store and SQLite index
+crates/slicestream-archive  archive walking (ZIP/7z/RAR/tar/gzip), NIfTI header parsing
 crates/slicestream-dimse    DIMSE C-STORE / C-ECHO storage SCP
 crates/slicestream-server   reference HTTP + WebSocket server (axum/tokio)
 slicestream.example.toml    configuration with every default

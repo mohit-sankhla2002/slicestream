@@ -73,6 +73,8 @@ a Part-10 file.
 | `POST /dicom-web/studies` | STOW-RS |
 | `POST /dicom-web/studies/{study}` | STOW-RS, restricted to one study |
 | `POST /api/instances` | One Part-10 file, `Content-Type: application/dicom`. Returns JSON with `status` (`stored`, `duplicate`, ...). |
+| `POST /api/archives` | An archive, NIfTI or DICOM file as the raw body. Returns 202 with a job id. See [Archive ingest](#archive-ingest). |
+| `GET /api/archives/{job}` | Progress and results of an archive job. |
 
 STOW-RS requests use `Content-Type: multipart/related; type="application/dicom"`.
 Responses are `application/dicom+json` and hold (0008,1190) RetrieveURL,
@@ -124,6 +126,60 @@ DIMSE and over STOW-RS is not byte-identical: the SCP wraps the DIMSE data set
 in a Part-10 header whose Source Application Entity Title (0002,0016) is the
 calling AE title (and whose transfer syntax is the negotiated one). With
 `overwrite`, such a resend therefore replaces the stored copy.
+
+## Archive ingest
+
+`POST /api/archives`, the console and `import <PATH>` open archives and store
+what is inside.
+
+**Formats.** ZIP, 7z, RAR, tar, tar.gz / .tgz and plain gzip, nested in any
+combination, plus NIfTI-1 and NIfTI-2 (`.nii`, `.nii.gz`). The type is found
+from the first bytes of the content, never from the file name. RAR needs the
+`rar` cargo feature (on by default). Encrypted archives (password-protected
+ZIP, 7z or RAR) fail; the rest of the upload goes on.
+
+**Paths.** Entries inside nested archives are reported as
+`a.zip!/b.zip!/IM1`. Entry names are only reported, never used as file
+paths. Symlinks, hard links, devices and directories are ignored.
+
+**DICOM.** Every Part-10 file goes through the same ingest as STOW-RS
+(validation, de-duplication, crash safety).
+
+**NIfTI.** Stored unchanged as `objects/aa/bb/<sha256>.nii` or
+`.nii.gz`, with a row in `nifti_volumes`. After the upload, each volume is
+linked using scopes from the inside out: DICOM in the same folder of the same
+archive, then anywhere in that archive, then the enclosing archive, up to the
+whole upload. The first scope with DICOM decides. One patient there: the
+volume is linked to that patient, and to the study if there is exactly one.
+More than one patient, or no DICOM at all: it stays unassigned. Stored and
+duplicate DICOM counts; failed and skipped files do not. A NIfTI uploaded
+alone is never linked, even if its patient is already stored.
+
+**Skipped.** Files that are not DICOM or NIfTI, `DICOMDIR`, `.hdr`/`.img`
+pairs, and DICOM files without the `DICM` preamble.
+
+**Limits** (`[archives]`):
+
+| Setting | Default |
+|---|---|
+| `enabled` | `true` (`false`: both routes return 404) |
+| `max_depth` (nesting below the uploaded file) | 4 |
+| `max_entries` (files seen in one upload) | 200000 |
+| `max_expanded_bytes` (bytes written out of archives) | 68719476736 (64 GiB) |
+| `min_free_bytes` (free disk to keep) | 2147483648 (2 GiB) |
+| `max_concurrent_jobs` (more wait; queue cap is 4 times this) | 2 |
+| `job_retention` (finished jobs kept in memory) | 50 |
+
+Too deep: that nested archive fails and the rest goes on. Too many entries or
+too many expanded bytes: the upload is aborted (what was stored stays
+stored). Each entry is also bound by `[storage] max_instance_bytes`. The body
+is bound by `[http] max_request_bytes`. `POST` returns 507 if free space is
+below `Content-Length` plus `min_free_bytes`, and a running job aborts if free
+space drops below `min_free_bytes`. A job that is still running when the
+server stops is marked `aborted`.
+
+Responses: 202 job accepted, 400 not a supported file, 401 bad token, 413
+too large, 503 job queue full, 507 not enough free space, 404 unknown job.
 
 ## Hierarchy conflicts
 

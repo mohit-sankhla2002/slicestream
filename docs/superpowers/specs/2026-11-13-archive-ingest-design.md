@@ -170,8 +170,8 @@ import root is the outermost. (Linking only uses DICOM from the same upload.)
 ### HTTP
 
 - `POST /api/archives` — body is the archive or NIfTI file (any
-  Content-Type; detection by content). Same token and CORS rules as other
-  ingest routes. Returns **202** `{ "job": "<id>", "upload_id": n }`
+  Content-Type; detection by content). Same token rules as other
+  ingest routes; never CORS. Returns **202** `{ "job": "<id>", "upload_id": n }`
   immediately after the body is spooled; 413 if too large; 400 if the body
   is not a supported container/NIfTI/DICOM; 503 if the job queue is full
   (queue cap = 4 × `max_concurrent_jobs`). With `[archives] enabled = false`

@@ -37,6 +37,7 @@ without custom code, and with backends written in any language.
 ```
 slicestream-core       index, frame extraction, scheduler, protocol      (exists)
 slicestream-server     axum binary: wires everything together             (exists)
+slicestream-archive    ZIP/7z/RAR/tar/gzip walker, NIfTI header            (exists)
 slicestream-store      Storage trait: fs, object_store (S3/GCS/Azure)      planned
 slicestream-index      Index trait: SQLite (sqlx), PostgreSQL              planned
 slicestream-dicomweb   QIDO-RS / WADO-RS / STOW-RS handlers, multipart     planned
@@ -87,7 +88,9 @@ Cornerstone/OHIF data source. Add a byte-offset index at ingest. Serve frames
 with `pread`.
 
 **M2 — Storage and ingest (done for the filesystem).** STOW-RS, SQLite index,
-filesystem storage, de-duplication and an `import` command are done. S3
+filesystem storage, de-duplication and an `import` command are done.
+Archive and NIfTI ingest is done too: ZIP, 7z, RAR, tar and gzip files, nested,
+through `POST /api/archives`, the console and `import`. S3
 storage and study "stable" detection are still open.
 
 **M3 — DIMSE (C-ECHO and C-STORE SCP done).** C-ECHO and the C-STORE SCP are
