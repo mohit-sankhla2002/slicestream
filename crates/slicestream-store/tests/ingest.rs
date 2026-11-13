@@ -599,6 +599,58 @@ async fn recover_keeps_indexed_nifti_and_removes_orphans() {
     assert!(ing.blobs().path_of(&nii.blob, BlobKind::NiftiGz).is_file());
 }
 
+/// Corrupt one stored hash in `table` with raw SQL, then check that
+/// recovery fails and deletes nothing (referenced or not).
+async fn recover_fails_closed_on(table: &str) {
+    let d = tempfile::tempdir().unwrap();
+    let file = phantom_file(&d.path().join("src"));
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let dicom = ing.import_file(&file).await.unwrap();
+    let up = ing
+        .index()
+        .create_upload("import", "x", None)
+        .await
+        .unwrap();
+    let nii = ing
+        .ingest_nifti(spool_bytes(&ing, &nifti_bytes(1)), nifti_meta(false), up)
+        .await
+        .unwrap();
+    let stray = ing
+        .blobs()
+        .commit(spool_bytes(&ing, b"unreferenced"), BlobKind::Dicom)
+        .unwrap();
+
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
+            .await
+            .unwrap();
+    let n = sqlx::query(&format!(
+        "UPDATE {table} SET blob_sha256 = 'not-a-hash' WHERE rowid = (SELECT MIN(rowid) FROM {table})"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1);
+    pool.close().await;
+
+    assert!(ing.recover().await.is_err(), "{table}");
+    assert!(ing.blobs().path_of(&dicom.blob, BlobKind::Dicom).is_file());
+    assert!(ing.blobs().path_of(&nii.blob, BlobKind::Nifti).is_file());
+    assert!(ing.blobs().path_of(&stray, BlobKind::Dicom).is_file());
+}
+
+#[tokio::test]
+async fn recover_fails_closed_on_corrupt_instance_hash() {
+    recover_fails_closed_on("instances").await;
+}
+
+#[tokio::test]
+async fn recover_fails_closed_on_corrupt_nifti_hash() {
+    recover_fails_closed_on("nifti_volumes").await;
+}
+
 #[tokio::test]
 async fn recover_survives_restart_with_nifti() {
     let d = tempfile::tempdir().unwrap();

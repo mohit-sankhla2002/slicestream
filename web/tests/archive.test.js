@@ -35,6 +35,10 @@ test("sniff: archive magics", () => {
 
 test("sniff: DICOM and NIfTI", () => {
   assert.equal(sniff(at(128, ascii("DICM"), 256)), "dicom");
+  // Part-10 without the preamble.
+  assert.equal(sniff(at(0, ascii("DICM"), 256)), "dicom");
+  assert.equal(sniff(new Uint8Array(ascii("DICM"))), "dicom");
+  assert.equal(sniff(new Uint8Array(ascii("DIC"))), "other");
   assert.equal(sniff(nifti1(false)), "nifti");
   assert.equal(sniff(nifti1(true)), "nifti");
   assert.equal(sniff(nifti1(false, "ni1\0")), "nifti");

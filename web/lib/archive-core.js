@@ -30,12 +30,14 @@ function isNifti(b) {
 }
 
 // "dicom" | "archive" | "nifti" | "other", from the first bytes of a file
-// (same magic table as the server's detector).
+// (same magic table as the server's detector, plus Part-10 without the
+// 128-byte preamble, which the DICOM upload routes accept).
 export function sniff(bytes) {
   const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
   if (ARCHIVE_MAGICS.some((m) => starts(b, m))) return "archive";
   if (starts(b, ascii("ustar"), 257)) return "archive";
   if (starts(b, ascii("DICM"), 128)) return "dicom";
+  if (starts(b, ascii("DICM"))) return "dicom";
   if (isNifti(b)) return "nifti";
   return "other";
 }
