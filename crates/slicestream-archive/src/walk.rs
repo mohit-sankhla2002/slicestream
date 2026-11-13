@@ -464,6 +464,13 @@ impl Walker<'_> {
             };
             let entry_path = format!("{path}!/{}", String::from_utf8_lossy(&name_bytes));
             if et.is_gnu_sparse() {
+                // Raw iteration does not consume extended sparse header
+                // blocks; skipping by entry size would desynchronise.
+                if entry.header().as_gnu().is_some_and(|g| g.is_extended()) {
+                    return Err(Fail::Container(cannot_read(
+                        "unsupported extended sparse tar entry",
+                    )));
+                }
                 self.count_entry()?;
                 self.sink.event(Event::Skipped { path: &entry_path });
                 continue;
@@ -547,25 +554,37 @@ fn zip_central_directory(mut file: &File) -> io::Result<CentralDirectory> {
             continue;
         }
         let pos = start + i as u64;
-        cd.entries = cd.entries.max(le(&tail, i + 10, 2));
-        let size = le(&tail, i + 12, 4);
-        let offset = le(&tail, i + 16, 4);
-        cd.bytes = cd.bytes.max(size).max(pos.saturating_sub(offset));
-        // ZIP64 locator sits right before the EOCD and points at the record.
-        let Some(loc) = i.checked_sub(20) else {
-            continue;
-        };
-        if tail.get(loc..loc + 4) != Some(LOC64) {
-            continue;
+        let entries32 = le(&tail, i + 10, 2);
+        let size32 = le(&tail, i + 12, 4);
+        let offset32 = le(&tail, i + 16, 4);
+        // ZIP64: a locator right before the EOCD points at the ZIP64 record,
+        // whose values replace 32-bit fields holding the 0xFFFF.. sentinel.
+        let mut zip64 = None;
+        if let Some(loc_pos) = pos.checked_sub(20) {
+            let mut loc = [0u8; 20];
+            file.seek(SeekFrom::Start(loc_pos))?;
+            file.read_exact(&mut loc)?;
+            let off = le(&loc, 8, 8);
+            if loc.get(0..4) == Some(LOC64) && off.saturating_add(56) <= len {
+                let mut rec = [0u8; 56];
+                file.seek(SeekFrom::Start(off))?;
+                file.read_exact(&mut rec)?;
+                if rec.get(0..4) == Some(EOCD64) {
+                    zip64 = Some((off, rec));
+                }
+            }
         }
-        let off = le(&tail, loc + 8, 8);
-        if off.saturating_add(56) > len {
-            continue;
+        let real = |v: u64, sentinel: u64| !(zip64.is_some() && v == sentinel);
+        if real(entries32, 0xFFFF) {
+            cd.entries = cd.entries.max(entries32);
         }
-        let mut rec = [0u8; 56];
-        file.seek(SeekFrom::Start(off))?;
-        file.read_exact(&mut rec)?;
-        if rec.get(0..4) == Some(EOCD64) {
+        if real(size32, 0xFFFF_FFFF) {
+            cd.bytes = cd.bytes.max(size32);
+        }
+        if real(offset32, 0xFFFF_FFFF) {
+            cd.bytes = cd.bytes.max(pos.saturating_sub(offset32));
+        }
+        if let Some((off, rec)) = zip64 {
             cd.entries = cd.entries.max(le(&rec, 32, 8));
             let size = le(&rec, 40, 8);
             let offset = le(&rec, 48, 8);

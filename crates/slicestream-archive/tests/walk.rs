@@ -678,3 +678,48 @@ fn gzip_of_zip_is_walked() {
     );
     assert_tmp_empty(&e.tmp);
 }
+
+#[test]
+fn tar_extended_sparse_fails_container() {
+    let mut h = tar::Header::new_gnu();
+    h.set_path("sparse").unwrap();
+    h.set_entry_type(tar::EntryType::GNUSparse);
+    h.set_size(0);
+    h.set_mode(0o644);
+    let g = h.as_gnu_mut().unwrap();
+    g.set_real_size(1 << 40);
+    g.isextended[0] = 1;
+    h.set_cksum();
+    let (r, rec, _e) = run(&tar_raw_header(&h, &[]), "s.tar", &Limits::default());
+    r.unwrap();
+    assert_eq!(
+        rec.failed,
+        vec![(
+            "s.tar".to_string(),
+            "cannot read archive: unsupported extended sparse tar entry".to_string()
+        )]
+    );
+}
+
+#[test]
+fn zip64_with_many_entries_is_walked() {
+    const N: usize = 70_000;
+    let names: Vec<String> = (0..N).map(|i| format!("f{i}")).collect();
+    let mut entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+    let d = dicom("last");
+    entries.push(("IM", &d));
+    let z = zip_stored(&entries);
+    let eocd = z.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    assert_eq!(
+        &z[eocd + 10..eocd + 12],
+        &[0xFF, 0xFF],
+        "fixture must be ZIP64"
+    );
+    let (r, rec, e) = run(&z, "big.zip", &Limits::default());
+    let stats = r.unwrap();
+    assert!(rec.failed.is_empty(), "{:?}", rec.failed);
+    assert_eq!(rec.skipped.len(), N);
+    assert_eq!(rec.paths(), vec!["big.zip!/IM"]);
+    assert_eq!(stats.entries_seen, N as u64 + 1);
+    assert_tmp_empty(&e.tmp);
+}
