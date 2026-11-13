@@ -10,7 +10,14 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["rar"]
+# RAR reading through the bundled UnRAR library (freeware licence, not
+# OSI-approved). Turn off for a purely OSI build.
+rar = ["slicestream-archive/rar"]
+
 [dependencies]
+slicestream-archive = { path = "../slicestream-archive", version = "0.1.0", default-features = false }
 slicestream-core = { path = "../slicestream-core", version = "0.1.0" }
 slicestream-store = { path = "../slicestream-store", version = "0.1.0" }
 anyhow = "1.0.104"
@@ -38,8 +45,10 @@ dicom-core = "0.10.1"
 dicom-dictionary-std = "0.10.1"
 dicom-object = "0.10.1"
 dicom-transfer-syntax-registry = "0.10.1"
+flate2 = "1.1.11"
 dicom-ul = { version = "0.10.1", features = ["async"] }
 http-body-util = "0.1.5"
 tempfile = "3"
 tokio-tungstenite = "0.29.0"
 tower = { version = "0.5.3", features = ["util"] }
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"] }

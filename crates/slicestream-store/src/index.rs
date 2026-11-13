@@ -142,6 +142,18 @@ pub struct NiftiRow {
     pub received_at: String,
 }
 
+/// A study with its patient, as returned by [`Index::study_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StudyInfo {
+    pub patient_fk: i64,
+    /// `""` when the instances carried no PatientID.
+    pub patient_id: String,
+    pub patient_name: Option<String>,
+    pub study_instance_uid: String,
+    pub study_date: Option<String>,
+    pub study_description: Option<String>,
+}
+
 /// Most series [`Index::console_series`] returns.
 pub const CONSOLE_SERIES_LIMIT: usize = 500;
 
@@ -633,6 +645,31 @@ impl Index {
         .bind(sop_instance_uid)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// Study `study_fk` (a `studies` row id) with its patient, or `None`.
+    pub async fn study_info(&self, study_fk: i64) -> Result<Option<StudyInfo>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT st.patient_fk, p.patient_id, p.patient_name, st.study_instance_uid,
+                    st.study_date, st.study_description
+             FROM studies st
+             JOIN patients p ON p.id = st.patient_fk
+             WHERE st.id = ?1",
+        )
+        .bind(study_fk)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            Ok(StudyInfo {
+                patient_fk: r.try_get(0)?,
+                patient_id: r.try_get(1)?,
+                patient_name: r.try_get(2)?,
+                study_instance_uid: r.try_get(3)?,
+                study_date: r.try_get(4)?,
+                study_description: r.try_get(5)?,
+            })
+        })
+        .transpose()
     }
 
     /// The newest [`CONSOLE_SERIES_LIMIT`] series with study/patient context

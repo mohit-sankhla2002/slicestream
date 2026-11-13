@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use slicestream_store::{
     BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, NiftiMeta, StorageCounts,
-    UploadCounts, UpsertOutcome, read_header,
+    StudyInfo, UploadCounts, UpsertOutcome, read_header,
 };
 
 fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
@@ -382,4 +382,28 @@ async fn nifti_links_and_instance_links() {
     assert_eq!(row.study_fk, Some(study_fk));
     // Foreign keys are enforced.
     assert!(idx.link_nifti(id, Some(9999), None).await.is_err());
+}
+
+#[tokio::test]
+async fn study_info_by_fk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, hs) = seeded_index(dir.path()).await;
+    let (patient_fk, study_fk) = idx
+        .instance_links(&hs[0].sop_instance_uid)
+        .await
+        .unwrap()
+        .unwrap();
+    let info = idx.study_info(study_fk).await.unwrap().unwrap();
+    assert_eq!(
+        info,
+        StudyInfo {
+            patient_fk,
+            patient_id: hs[0].patient_id.clone().unwrap_or_default(),
+            patient_name: hs[0].patient_name.clone(),
+            study_instance_uid: hs[0].study_instance_uid.clone(),
+            study_date: hs[0].study_date.clone(),
+            study_description: hs[0].study_description.clone(),
+        }
+    );
+    assert!(idx.study_info(9999).await.unwrap().is_none());
 }

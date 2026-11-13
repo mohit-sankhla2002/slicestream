@@ -21,9 +21,11 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
+pub mod archive_ingest;
 pub mod catalog;
 pub mod config;
 pub mod hosts;
+pub mod linking;
 pub mod metrics;
 pub mod routes;
 pub mod stow;
@@ -297,7 +299,7 @@ pub async fn import_dir(ingestor: &Ingestor, dir: &Path, recursive: bool) -> Imp
     let mut report = ImportReport::default();
     let mut dirs = vec![dir.to_path_buf()];
     while let Some(d) = dirs.pop() {
-        let (subdirs, mut files) = list_dir(&d, &mut report).await;
+        let (subdirs, mut files) = list_dir(&d, &mut |_: &Path, _| report.failed += 1).await;
         if recursive {
             dirs.extend(subdirs);
         }
@@ -331,15 +333,18 @@ pub async fn import_dir(ingestor: &Ingestor, dir: &Path, recursive: bool) -> Imp
 
 /// Sub-directories and regular files of `dir`. Symlinks to files are
 /// followed; symlinks to directories are not, so recursion cannot loop.
-/// An unreadable directory or entry is logged and counted as failed; the
-/// rest of the directory is still listed.
-async fn list_dir(dir: &Path, report: &mut ImportReport) -> (Vec<PathBuf>, Vec<PathBuf>) {
+/// An unreadable directory or entry is logged and passed to `on_error`
+/// (path, reason); the rest of the directory is still listed.
+pub(crate) async fn list_dir(
+    dir: &Path,
+    on_error: &mut dyn FnMut(&Path, String),
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let (mut dirs, mut files) = (Vec::new(), Vec::new());
     let mut rd = match tokio::fs::read_dir(dir).await {
         Ok(rd) => rd,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), "cannot read directory: {e}");
-            report.failed += 1;
+            on_error(dir, format!("cannot read directory: {e}"));
             return (dirs, files);
         }
     };
@@ -350,7 +355,7 @@ async fn list_dir(dir: &Path, report: &mut ImportReport) -> (Vec<PathBuf>, Vec<P
             Err(e) => {
                 // A failed readdir step does not advance; stop rather than spin.
                 tracing::warn!(dir = %dir.display(), "cannot list directory: {e}");
-                report.failed += 1;
+                on_error(dir, format!("cannot list directory: {e}"));
                 break;
             }
         };
@@ -359,7 +364,7 @@ async fn list_dir(dir: &Path, report: &mut ImportReport) -> (Vec<PathBuf>, Vec<P
             Ok(ft) => ft,
             Err(err) => {
                 tracing::warn!(path = %path.display(), "cannot stat entry: {err}");
-                report.failed += 1;
+                on_error(&path, format!("cannot stat entry: {err}"));
                 continue;
             }
         };

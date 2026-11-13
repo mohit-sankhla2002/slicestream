@@ -2233,6 +2233,7 @@ dependencies = [
  "dicom-object",
  "dicom-transfer-syntax-registry",
  "dicom-ul",
+ "flate2",
  "fs4",
  "futures-util",
  "http-body-util",
@@ -2240,6 +2241,7 @@ dependencies = [
  "multer",
  "serde",
  "serde_json",
+ "slicestream-archive",
  "slicestream-core",
  "slicestream-dimse",
  "slicestream-store",
@@ -2254,6 +2256,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

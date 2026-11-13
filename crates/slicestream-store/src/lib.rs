@@ -19,8 +19,8 @@ pub use config::StorageConfig;
 pub use header::{HeaderError, InstanceHeader, read_header};
 pub use index::{
     CONSOLE_SERIES_LIMIT, ConsoleSeriesRow, DuplicatePolicy, Index, InstanceRecord,
-    InstanceSummary, NiftiMeta, NiftiRow, SeriesRow, SliceRow, StorageCounts, UploadCounts,
-    UploadRow, UpsertOutcome,
+    InstanceSummary, NiftiMeta, NiftiRow, SeriesRow, SliceRow, StorageCounts, StudyInfo,
+    UploadCounts, UploadRow, UpsertOutcome,
 };
 pub use ingest::{
     Expectations, IngestError, IngestFailure, IngestSource, Ingestor, RecoveryReport, Stored,
