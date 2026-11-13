@@ -13,8 +13,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::count::Budget;
 
-/// Cap on the header database (raw and, if compressed, decoded).
-pub(crate) const MAX_HEADER: u64 = 256 * 1024 * 1024;
+/// Cap on the header database (raw and, if compressed, decoded). A real
+/// 200 000-entry header is about 50 MB.
+pub(crate) const MAX_HEADER: u64 = 64 * 1024 * 1024;
 /// Cap on an LZMA/LZMA2 dictionary.
 pub(crate) const MAX_DICT: u64 = 256 * 1024 * 1024;
 /// Coders per folder (`sevenz-rust2`'s own limit for complex folders).

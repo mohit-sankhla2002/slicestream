@@ -606,6 +606,7 @@ impl Walker<'_> {
             let mut started = 0usize;
             let mut fatal: Option<Fail> = None;
             let mut broken: Option<String> = None;
+            let mut ours: Option<Box<dyn std::any::Any + Send>> = None;
             let res = catch_unwind(AssertUnwindSafe(|| {
                 let dec = BlockDecoder::new(1, b, &archive, &password, &mut src);
                 dec.for_each_entries(&mut |entry, r| {
@@ -613,14 +614,28 @@ impl Walker<'_> {
                     started += 1;
                     let entry_path = format!("{path}!/{}", entry.name);
                     let mut s = Counted::new(PanicGuard(r), budget, true);
-                    let res = if is_entry(entry) {
-                        self.entry(&mut s, &entry_path, depth)
-                    } else {
-                        Ok(())
+                    // Decoder panics are turned into read errors by
+                    // `PanicGuard`; a panic caught here comes from the sink
+                    // or our own walk and is re-raised below, not reported
+                    // as a broken archive.
+                    let res = catch_unwind(AssertUnwindSafe(|| {
+                        let res = if is_entry(entry) {
+                            self.entry(&mut s, &entry_path, depth)
+                        } else {
+                            Ok(())
+                        };
+                        // Whatever was not read must still be decoded (and
+                        // counted) before the next entry of the block.
+                        res.and_then(|()| self.drain(&mut s))
+                    }));
+                    let res = match res {
+                        Ok(res) => res,
+                        Err(payload) => {
+                            ours = Some(payload);
+                            return Ok(false);
+                        }
                     };
-                    // Whatever was not read must still be decoded (and
-                    // counted) before the next entry of the block.
-                    match res.and_then(|()| self.drain(&mut s)) {
+                    match res {
                         Ok(()) => {
                             current = None;
                             Ok(true)
@@ -636,6 +651,9 @@ impl Walker<'_> {
                     }
                 })
             }));
+            if let Some(payload) = ours {
+                std::panic::resume_unwind(payload);
+            }
             if let Some(f) = fatal {
                 return Err(f);
             }
@@ -810,7 +828,8 @@ impl Walker<'_> {
                 Ok(())
             }
             kind @ (Kind::Dicom | Kind::Nifti) => {
-                let mut src = Counted::new(file, self.budget, true);
+                // Already counted while UnRAR decoded it into the spool.
+                let mut src = Counted::new(file, self.budget, false);
                 self.leaf(path, kind, false, &head, &[], &mut src)
             }
             kind => match self.deeper(path, depth) {

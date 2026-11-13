@@ -1,6 +1,8 @@
 mod support;
 
-use slicestream_archive::{Kind, Limits, WalkError};
+use std::io;
+
+use slicestream_archive::{Event, Kind, Leaf, Limits, Sink, WalkError, walk_file};
 use support::*;
 
 /// Byte offset of the header database of a 7z file.
@@ -171,19 +173,22 @@ fn assert_7z_aborts(bytes: &[u8]) {
 
 #[test]
 fn seven_z_hostile_headers_are_refused_without_allocating() {
-    // declared header size over the cap (the bytes are not even there)
+    // declared header size just over the 64 MiB cap (the bytes are not
+    // even there)
     assert_7z_refused(
-        &seven_z_raw_sized(&[], &[0x01, 0x00], 300 * 1024 * 1024),
+        &seven_z_raw_sized(&[], &[0x01, 0x00], 64 * 1024 * 1024 + 1),
         "header too large",
     );
 
-    // compressed header declaring a 1 TiB unpacked size
-    let mut h = vec![0x17, 0x06, 0x00, 0x01, 0x09, 0x01, 0x00]; // pack info: 1 stream of 1 byte
-    h.extend([0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00]); // 1 folder, 1 coder: COPY
-    h.push(0x0C);
-    h.extend(sz_num(1 << 40));
-    h.extend([0x00, 0x00]);
-    assert_7z_refused(&seven_z_raw(&[0x01], &h), "header too large");
+    // compressed header declaring an unpacked size over the cap
+    for declared in [64 * 1024 * 1024 + 1, 1 << 40] {
+        let mut h = vec![0x17, 0x06, 0x00, 0x01, 0x09, 0x01, 0x00]; // pack info: 1 stream of 1 byte
+        h.extend([0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00]); // 1 folder, 1 coder: COPY
+        h.push(0x0C);
+        h.extend(sz_num(declared));
+        h.extend([0x00, 0x00]);
+        assert_7z_refused(&seven_z_raw(&[0x01], &h), "header too large");
+    }
 
     // 2^40 pack streams
     let mut h = vec![0x01, 0x04, 0x06, 0x00];
@@ -426,5 +431,43 @@ fn rar_without_feature_reports_not_built_in() {
         rec.failed,
         vec![("x.rar".to_string(), "RAR support not built in".to_string())]
     );
+    assert_tmp_empty(&e.tmp);
+}
+
+/// Panics from the sink are server bugs: they propagate out of the walk
+/// (not reported as a broken archive) and the spools are still removed.
+#[test]
+fn sink_panic_in_7z_propagates() {
+    struct Panicking;
+    impl Sink for Panicking {
+        fn leaf(&mut self, _leaf: Leaf<'_>) -> io::Result<()> {
+            panic!("sink bug");
+        }
+        fn event(&mut self, _ev: Event<'_>) {}
+    }
+    let s = seven_z_solid(&[("IM1", &dicom("A")), ("IM2", &dicom("B"))]);
+    // nested too: the inner 7z is spooled to tmp_dir when the sink panics
+    let z = zip(&[("inner.7z", &s)]);
+    for (bytes, name) in [(&s, "x.7z"), (&z, "o.zip")] {
+        let e = env(bytes);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            walk_file(&e.input, name, &e.tmp, &Limits::default(), &mut Panicking)
+        }));
+        let payload = r.expect_err("the sink panic must propagate");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"sink bug"));
+        assert_tmp_empty(&e.tmp);
+    }
+}
+
+#[cfg(feature = "rar")]
+#[test]
+fn rar_leaf_bytes_count_once() {
+    let a = dicom("A");
+    let (r, _rec, e) = run(
+        &rar5(&[RarItem::File("IM1", &a)], false),
+        "x.rar",
+        &Limits::default(),
+    );
+    assert_eq!(r.unwrap().bytes_expanded, a.len() as u64);
     assert_tmp_empty(&e.tmp);
 }

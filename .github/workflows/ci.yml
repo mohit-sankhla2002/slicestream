@@ -22,6 +22,8 @@ jobs:
       # The archive crate without RAR (UnRAR is not OSI-licensed).
       - run: cargo test -p slicestream-archive --no-default-features
       - run: cargo clippy -p slicestream-archive --no-default-features --all-targets -- -D warnings
+      # Corrupted 7z/RAR inputs (slow in debug, so release and opt-in).
+      - run: cargo test --release -p slicestream-archive --test mutate_7z_rar -- --ignored
       - uses: actions/setup-node@v4
         with:
           node-version: 22

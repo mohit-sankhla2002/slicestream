@@ -25,8 +25,9 @@ tempfile = "3"
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2", "deflate64"] }
 # Decoders only (LZMA/LZMA2 are built in); 0.20 is the last release for Rust 1.88.
 sevenz-rust2 = { version = "=0.20.2", default-features = false, features = ["bzip2", "deflate"] }
-# Same version sevenz-rust2 uses; decodes compressed 7z headers for the pre-check.
-lzma-rust2 = { version = "0.16", default-features = false, features = ["std"] }
+# Decodes compressed 7z headers for the pre-check. Must be the exact version
+# sevenz-rust2 0.20.2 resolves to (one copy, same decoder behaviour).
+lzma-rust2 = { version = "=0.16.5", default-features = false, features = ["std"] }
 crc32fast = "1"
 unrar_sys = { version = "=0.5.8", optional = true }
 

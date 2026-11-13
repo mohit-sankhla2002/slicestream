@@ -67,7 +67,10 @@ fn mutate(base: &[u8], name: &str, rounds: usize, seed: u64) {
     }
 }
 
+/// Slow in debug builds; CI runs it with
+/// `cargo test --release -p slicestream-archive --test mutate_7z_rar -- --ignored`.
 #[test]
+#[ignore]
 fn corrupted_archives_never_panic() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -115,7 +118,10 @@ fn corrupted_archives_never_panic() {
 #[test]
 #[ignore]
 fn replay() {
-    let p = std::env::var_os("MUTATE_REPLAY").expect("MUTATE_REPLAY");
+    // Does nothing unless asked (CI runs all ignored tests here).
+    let Some(p) = std::env::var_os("MUTATE_REPLAY") else {
+        return;
+    };
     let name = std::env::var("MUTATE_NAME").unwrap_or_else(|_| "x.7z".into());
     let t = std::time::Instant::now();
     let limits = Limits {
