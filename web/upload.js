@@ -1,5 +1,9 @@
 // Upload panel and ingest results: file picking, drag and drop, the upload
-// queue (4 in flight, one file per request) and the results table.
+// queue (4 in flight, one file per request) and the results table. Each
+// file's first bytes pick its route: DICOM goes to STOW-RS or
+// /api/instances, archives and NIfTI to /api/archives (archive-upload.js).
+import { uploadArchive } from "./archive-upload.js";
+import { SNIFF_LEN, sniff } from "./lib/archive-core.js";
 import { DASH, formatBytes, formatDuration, formatRate } from "./lib/format.js";
 import {
   HTTP_HINT,
@@ -15,6 +19,7 @@ const IN_FLIGHT = 4;
 const MAX_ROWS = 500;
 const TOKEN_KEY = "slicestream.uploadToken";
 const MODE_KEY = "slicestream.uploadMode";
+const DROP_TITLE = "Drop DICOM, archives or a folder";
 
 const $ = (id) => document.getElementById(id);
 
@@ -113,7 +118,12 @@ function boundary() {
   return `slicestream-${Array.from(rand, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
-// Upload one file; resolves to a row result, or null if aborted.
+// Route of a file from its first bytes: "dicom" | "archive" | "nifti" | "other".
+async function kindOf(file) {
+  return sniff(new Uint8Array(await file.slice(0, SNIFF_LEN).arrayBuffer()));
+}
+
+// Upload one DICOM file; resolves to a row result, or null if aborted.
 async function send({ file }, mode, token, signal) {
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -226,7 +236,22 @@ export function createUploadPanel() {
     const t0 = performance.now();
     let r;
     try {
-      r = await send(item, mode, el.token.value.trim(), controller.signal);
+      const kind = await kindOf(item.file);
+      if (myGen !== gen) return;
+      if (kind === "archive" || kind === "nifti") {
+        // Holds this slot only while the body uploads; the job is then polled on its own.
+        const ok = await uploadArchive(item, {
+          token: el.token.value.trim(),
+          signal: controller.signal,
+          mount: addRow,
+          onTotals: addTotals,
+        });
+        r = ok === null ? null : { status: ok ? "ARCHIVE" : "FAILED", archive: true };
+      } else if (kind === "other") {
+        r = { status: "FAILED", code: "BAD TYPE", uid: null, reason: "unsupported file type" };
+      } else {
+        r = await send(item, mode, el.token.value.trim(), controller.signal);
+      }
     } catch (err) {
       if (err?.name === "AbortError" || myGen !== gen) r = null;
       else if (err instanceof TypeError) r = { status: "FAILED", code: "NETWORK", uid: null, reason: err.message || "network error" };
@@ -239,7 +264,7 @@ export function createUploadPanel() {
       batch.done += 1;
       batch.bytesDone += item.file.size;
       if (r.status === "FAILED") batch.failed += 1;
-      record(item, r, ms);
+      if (!r.archive) record(item, r, ms); // archive rows render themselves
     }
     pump();
     draw();
@@ -260,14 +285,36 @@ export function createUploadPanel() {
 
   // ---- results ----
 
-  function record(item, r, ms) {
-    totals[r.status] += 1;
-    const b = el.totals[r.status];
-    b.textContent = totals[r.status].toLocaleString();
+  let rows = 0; // rows ever added (file rows and archive rows)
+
+  function bump(status, k) {
+    if (!k) return;
+    totals[status] += k;
+    const b = el.totals[status];
+    b.textContent = totals[status].toLocaleString();
     b.classList.remove("bump");
     void b.offsetWidth; // restart the animation
     b.classList.add("bump");
-    if (r.status === "REPLACED") el.repWrap.hidden = false;
+    if (status === "REPLACED") el.repWrap.hidden = false;
+  }
+
+  // Archive entries count towards the header totals as they are processed.
+  function addTotals(delta) {
+    for (const [status, k] of Object.entries(delta)) bump(status, k);
+  }
+
+  function addRow(tr) {
+    rows += 1;
+    el.body.prepend(tr);
+    while (el.body.childElementCount > MAX_ROWS) el.body.lastElementChild.remove();
+    el.empty.hidden = true;
+    el.wrap.hidden = false;
+    el.foot.hidden = rows <= MAX_ROWS;
+    if (!el.foot.hidden) el.foot.textContent = `showing newest ${MAX_ROWS} of ${rows.toLocaleString()} rows`;
+  }
+
+  function record(item, r, ms) {
+    bump(r.status, 1);
 
     const tr = document.createElement("tr");
     tr.className = "fresh";
@@ -297,13 +344,7 @@ export function createUploadPanel() {
     td(formatBytes(item.file.size), "n");
     td(`${Math.round(ms)} ms`, "n");
 
-    el.body.prepend(tr);
-    while (el.body.childElementCount > MAX_ROWS) el.body.lastElementChild.remove();
-    el.empty.hidden = true;
-    el.wrap.hidden = false;
-    const all = totals.STORED + totals.DUPLICATE + totals.REPLACED + totals.FAILED;
-    el.foot.hidden = all <= MAX_ROWS;
-    if (!el.foot.hidden) el.foot.textContent = `showing newest ${MAX_ROWS} of ${all.toLocaleString()} rows`;
+    addRow(tr);
 
     if (ok) {
       window.dispatchEvent(
@@ -414,7 +455,7 @@ export function createUploadPanel() {
   const leave = () => {
     depth = 0;
     el.drop.classList.remove("over");
-    el.dropTitle.textContent = "Drop DICOM files or a folder";
+    el.dropTitle.textContent = DROP_TITLE;
   };
   el.drop.addEventListener("dragleave", () => {
     depth -= 1;
@@ -428,7 +469,7 @@ export function createUploadPanel() {
     try {
       add(await fromDataTransfer(dt));
     } finally {
-      el.dropTitle.textContent = "Drop DICOM files or a folder";
+      el.dropTitle.textContent = DROP_TITLE;
     }
   });
 

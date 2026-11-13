@@ -288,14 +288,67 @@ fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
-/// The upload name from `x-filename`: its last path segment without
-/// control characters, at most 255 characters; `"upload"` if empty.
+/// The upload name from `x-filename`: percent-decoded (the console sends
+/// `encodeURIComponent(name)`; invalid UTF-8 is replaced), then its last
+/// path segment without control or format characters, at most 255
+/// characters; `"upload"` if empty.
 pub fn upload_name(headers: &HeaderMap) -> String {
     let raw = headers
         .get("x-filename")
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .map(|v| String::from_utf8_lossy(&percent_decode(v.as_bytes())).into_owned())
         .unwrap_or_default();
     sanitize_name(&raw)
+}
+
+/// Decode `%XX` escapes; malformed escapes are kept as they are.
+fn percent_decode(raw: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                raw.get(i + 1).copied().and_then(hex),
+                raw.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+            continue;
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Unicode format characters (general category Cf): invisible marks such
+/// as zero-width spaces and bidi overrides that can disguise a name.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{AD}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61C}'
+            | '\u{6DD}'
+            | '\u{70F}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 /// See [`upload_name`].
@@ -303,7 +356,7 @@ fn sanitize_name(raw: &str) -> String {
     let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
     let name: String = last
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|&c| !c.is_control() && !is_format(c))
         .take(MAX_NAME_CHARS)
         .collect();
     if name.trim().is_empty() {
@@ -474,6 +527,34 @@ mod tests {
         assert_eq!(sanitize_name("x\x7f\ny\u{9b}z.zip"), "xyz.zip");
         assert_eq!(name(b"dir/"), "upload");
         assert_eq!(name("é".repeat(300).as_bytes()), "é".repeat(255));
+    }
+
+    #[test]
+    fn upload_names_are_percent_decoded() {
+        assert_eq!(name(b"plain-name_1.zip"), "plain-name_1.zip");
+        assert_eq!(name(b"my%20scan.zip"), "my scan.zip");
+        assert_eq!(name(b"%C3%A9t%C3%A9.nii.gz"), "été.nii.gz");
+        // Decoded before the last segment is taken: %2F still splits.
+        assert_eq!(name(b"a%2Fb%5Cc.zip"), "c.zip");
+        // Invalid UTF-8 after decoding is replaced, not rejected.
+        assert_eq!(name(b"x%FFy.zip"), "x\u{fffd}y.zip");
+        // Malformed escapes stay as they are.
+        assert_eq!(name(b"100%.zip"), "100%.zip");
+        assert_eq!(name(b"a%zz%4.zip"), "a%zz%4.zip");
+        // Encoded control characters are still dropped.
+        assert_eq!(name(b"a%0Ab%00.zip"), "ab.zip");
+    }
+
+    #[test]
+    fn upload_names_drop_format_characters() {
+        assert_eq!(sanitize_name("a\u{200B}b\u{200F}c.zip"), "abc.zip");
+        assert_eq!(sanitize_name("evil\u{202E}piz.exe"), "evilpiz.exe");
+        assert_eq!(sanitize_name("\u{2066}x\u{2069}\u{FEFF}.nii"), "x.nii");
+        assert_eq!(sanitize_name("soft\u{AD}hyphen"), "softhyphen");
+        assert_eq!(sanitize_name("\u{200E}\u{202A}"), "upload");
+        assert_eq!(name(b"a%E2%80%AEb.zip"), "ab.zip");
+        // Ordinary non-ASCII letters are kept.
+        assert_eq!(sanitize_name("Müller 日本.zip"), "Müller 日本.zip");
     }
 
     #[tokio::test]

@@ -29,8 +29,8 @@
       <div class="cb">
         <div class="drop" id="u-drop" role="button" tabindex="0" aria-describedby="u-drop-hint">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
-          <b id="u-drop-title">Drop DICOM files or a folder</b>
-          <small id="u-drop-hint">or click to pick files · <button type="button" class="link" id="u-pick-dir">pick a folder</button> · one file per request</small>
+          <b id="u-drop-title">Drop DICOM, archives or a folder</b>
+          <small id="u-drop-hint">or click to pick files · <button type="button" class="link" id="u-pick-dir">pick a folder</button> · one file per request<br>ZIP, 7z, RAR, tar, gzip and NIfTI are unpacked by the server</small>
           <input type="file" id="u-files" multiple hidden>
           <input type="file" id="u-dir" webkitdirectory multiple hidden>
         </div>
@@ -56,7 +56,7 @@
       <div class="empty" id="r-empty">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
         <b>No uploads yet</b>
-        <small>Each uploaded file gets a row with its status, SOP UID, size and time</small>
+        <small>Each uploaded file gets a row with its status, SOP UID, size and time; archives expand to their entries</small>
       </div>
       <div class="results" id="r-wrap" hidden>
         <table>
@@ -108,6 +108,7 @@
       <div>Threads <b id="f-threads">—</b></div><div>Open FDs <b id="f-fds">—</b></div><div>Virtual mem <b id="f-virt">—</b></div>
       <div>DIMSE assoc <b id="f-dimse">—</b></div><div>WS streams <b id="f-ws">—</b></div><div>HTTP in-flight <b id="f-http">—</b></div>
       <div>Studies <b id="f-studies">—</b></div><div>Series <b id="f-series">—</b></div><div>Instances <b id="f-inst">—</b></div>
+      <div>NIfTI volumes <b id="f-nifti">—</b></div><div>NIfTI size <b id="f-nifti-size">—</b></div><div>DICOM blobs <b id="f-blobs">—</b></div>
     </div>
   </section>
 

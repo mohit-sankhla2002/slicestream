@@ -190,12 +190,13 @@ export function createMetricsPanel() {
     if (st.root) setText($("d-root"), `Storage root · ${st.root}`);
     if (st.root) $("d-root").title = st.root;
     setText($("d-free"), `${formatBytes(total)} used · ${formatBytes(st.volume_free_bytes)} free on volume`);
-    const parts = [st.objects_bytes, st.index_bytes, st.tmp_bytes];
+    const parts = [objectsBytes(st), st.index_bytes, st.tmp_bytes];
     const bars = $("d-bar").children;
     parts.forEach((b, i) => {
       bars[i].style.width = total ? `${(Math.max(b ?? 0, 0) / total) * 100}%` : "0";
     });
-    setText($("d-obj"), `objects ${formatBytes(st.objects_bytes)} · ${count(st.objects_count)} blobs`);
+    const nii = st.nifti_count ? ` + ${count(st.nifti_count)} NIfTI` : "";
+    setText($("d-obj"), `objects ${formatBytes(objectsBytes(st))} · ${count(st.objects_count)} blobs${nii}`);
     setText($("d-idx"), `index.sqlite + WAL ${formatBytes(st.index_bytes)}`);
     setText($("d-tmp"), `tmp ${formatBytes(st.tmp_bytes)}`);
 
@@ -211,6 +212,9 @@ export function createMetricsPanel() {
     setText($("f-studies"), count(st.studies));
     setText($("f-series"), count(st.series));
     setText($("f-inst"), count(st.instances));
+    setText($("f-nifti"), count(st.nifti_count));
+    setText($("f-nifti-size"), formatBytes(st.nifti_bytes));
+    setText($("f-blobs"), count(st.objects_count));
   }
 
   return {
@@ -233,8 +237,14 @@ export function createMetricsPanel() {
   };
 }
 
+// DICOM blobs plus NIfTI volumes (both live under objects/).
+function objectsBytes(st) {
+  if (st.objects_bytes == null && st.nifti_bytes == null) return null;
+  return (st.objects_bytes ?? 0) + (st.nifti_bytes ?? 0);
+}
+
 function storageTotal(st) {
-  const parts = [st.objects_bytes, st.index_bytes, st.tmp_bytes];
+  const parts = [objectsBytes(st), st.index_bytes, st.tmp_bytes];
   if (parts.every((v) => v === null || v === undefined)) return null;
   return parts.reduce((a, v) => a + (v ?? 0), 0);
 }

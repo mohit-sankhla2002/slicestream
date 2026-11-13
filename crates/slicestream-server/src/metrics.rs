@@ -117,6 +117,9 @@ pub struct StorageSample {
     pub root: Option<String>,
     pub objects_bytes: Option<i64>,
     pub objects_count: Option<i64>,
+    /// NIfTI volumes, stored apart from the DICOM objects.
+    pub nifti_count: Option<i64>,
+    pub nifti_bytes: Option<i64>,
     pub index_bytes: Option<u64>,
     pub tmp_bytes: Option<u64>,
     pub volume_free_bytes: Option<u64>,
@@ -271,6 +274,8 @@ async fn read_storage(ing: &Ingestor) -> StorageSample {
         Ok(c) => {
             s.objects_bytes = Some(c.objects_bytes);
             s.objects_count = Some(c.objects_count);
+            s.nifti_count = Some(c.nifti_count);
+            s.nifti_bytes = Some(c.nifti_bytes);
             s.studies = Some(c.studies);
             s.series = Some(c.series);
             s.instances = Some(c.instances);
@@ -561,6 +566,8 @@ mod tests {
     fn snapshot_json_shape() {
         let mut s = sample();
         s.storage.root = Some("storage".into());
+        s.storage.nifti_count = Some(2);
+        s.storage.nifti_bytes = Some(4096);
         let snap = Snapshot {
             pid: 7,
             version: "0.1.0",
@@ -590,12 +597,16 @@ mod tests {
         assert_eq!(v["ingest"]["latency_ms"]["p50"], 1.0);
         assert!(v["ingest"]["latency_ms"]["p95"].is_null());
         assert_eq!(v["storage"]["root"], "storage");
+        assert_eq!(v["storage"]["nifti_count"], 2);
+        assert_eq!(v["storage"]["nifti_bytes"], 4096);
         assert!(v["dimse_addr"].is_null());
 
         let h = serde_json::to_value(sample()).unwrap();
         assert!(h.get("pid").is_none());
         assert!(h["storage"].get("root").is_none());
         assert!(h["storage"]["objects_bytes"].is_null());
+        assert!(h["storage"]["nifti_count"].is_null());
+        assert!(h["storage"]["nifti_bytes"].is_null());
     }
 
     #[test]
