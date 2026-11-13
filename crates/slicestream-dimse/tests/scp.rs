@@ -545,3 +545,42 @@ async fn idle_association_is_aborted() {
     scu.release().await.unwrap();
     h.stop().await;
 }
+
+async fn wait_for_count(count: &std::sync::atomic::AtomicUsize, want: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while count.load(std::sync::atomic::Ordering::SeqCst) != want {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "active associations never reached {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_associations_tracks_open_association() {
+    let dir = tempfile::tempdir().unwrap();
+    let scfg = StorageConfig {
+        root: dir.path().join("store"),
+        ..StorageConfig::default()
+    };
+    let ingestor = Ingestor::open(scfg).await.unwrap();
+    let cfg = ScpConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        ..ScpConfig::default()
+    };
+    let scp = StoreScp::bind(cfg, ingestor).await.unwrap();
+    let addr = scp.local_addr();
+    let active = scp.active_associations();
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(scp.run(shutdown.clone()));
+
+    assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let scu = connect(addr).await;
+    wait_for_count(&active, 1).await;
+    scu.release().await.unwrap();
+    wait_for_count(&active, 0).await;
+
+    shutdown.cancel();
+    server.await.unwrap().unwrap();
+}

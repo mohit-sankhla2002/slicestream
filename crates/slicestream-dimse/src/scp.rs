@@ -7,6 +7,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dicom_dictionary_std::uids;
@@ -82,6 +83,7 @@ pub struct StoreScp {
     ingestor: Arc<Ingestor>,
     listener: TcpListener,
     local_addr: SocketAddr,
+    active: Arc<AtomicUsize>,
 }
 
 impl StoreScp {
@@ -93,11 +95,18 @@ impl StoreScp {
             ingestor,
             listener,
             local_addr,
+            active: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Live count of open associations. Clone the handle before [`run`](Self::run)
+    /// consumes the SCP.
+    pub fn active_associations(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.active)
     }
 
     /// Accept associations until `shutdown` is cancelled, then let in-flight
@@ -131,6 +140,7 @@ impl StoreScp {
                             Arc::clone(&options),
                             timeouts,
                             Arc::clone(&self.ingestor),
+                            ActiveGuard::new(&self.active),
                             permit,
                         ));
                     }
@@ -197,12 +207,30 @@ struct Timeouts {
     idle: Duration,
 }
 
+/// Counts one open association; decrements on drop, so aborts and panics
+/// are covered too.
+struct ActiveGuard(Arc<AtomicUsize>);
+
+impl ActiveGuard {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        ActiveGuard(Arc::clone(counter))
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn serve(
     stream: TcpStream,
     peer: SocketAddr,
     options: Arc<Options>,
     timeouts: Timeouts,
     ingestor: Arc<Ingestor>,
+    _active: ActiveGuard,
     _permit: OwnedSemaphorePermit,
 ) {
     let span = info_span!(
