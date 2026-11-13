@@ -46,6 +46,7 @@ dicom-dictionary-std = "0.10.1"
 dicom-object = "0.10.1"
 dicom-transfer-syntax-registry = "0.10.1"
 flate2 = "1.1.11"
+tar = "0.4.46"
 dicom-ul = { version = "0.10.1", features = ["async"] }
 http-body-util = "0.1.5"
 tempfile = "3"

@@ -2247,6 +2247,7 @@ dependencies = [
  "slicestream-store",
  "subtle",
  "sysinfo",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

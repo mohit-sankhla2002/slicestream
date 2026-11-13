@@ -2,7 +2,9 @@ mod support;
 
 use std::io;
 
-use slicestream_archive::{Event, Kind, Leaf, Limits, Sink, WalkError, walk_file};
+use slicestream_archive::{
+    Event, Kind, Leaf, Limits, Sink, WalkError, WalkStats, walk_file, walk_file_continue,
+};
 use support::*;
 
 #[test]
@@ -396,7 +398,7 @@ fn sink_error_is_io() {
     }
     let z = zip(&[("IM", &dicom("1"))]);
     let e = env(&z);
-    let r = walk_file(&e.input, "o.zip", &e.tmp, &Limits::default(), &mut Failing);
+    let (_, r) = walk_file(&e.input, "o.zip", &e.tmp, &Limits::default(), &mut Failing);
     assert!(matches!(r, Err(WalkError::Io(_))), "{r:?}");
     assert_tmp_empty(&e.tmp);
 }
@@ -616,4 +618,79 @@ fn zip64_with_many_entries_is_walked() {
     assert_eq!(rec.paths(), vec!["big.zip!/IM"]);
     assert_eq!(stats.entries_seen, N as u64 + 1);
     assert_tmp_empty(&e.tmp);
+}
+
+#[test]
+fn unread_leaf_is_skipped_in_tar_gz() {
+    let mut a = dicom("A");
+    a.resize(200_000, 7);
+    let b = dicom("B");
+    let tgz = gz(&tar(&[TarItem::File("IM1", &a), TarItem::File("IM2", &b)]));
+    let rec = Recorder {
+        unread: vec!["t.tgz!/IM1".to_string()],
+        ..Recorder::default()
+    };
+    let (_, r, rec, e) = run_rec(&tgz, "t.tgz", &Limits::default(), rec);
+    r.unwrap();
+    assert_eq!(rec.paths(), vec!["t.tgz!/IM2"]);
+    assert_eq!(rec.leaves[0].sha, sha(&b));
+    assert_tmp_empty(&e.tmp);
+}
+
+#[test]
+fn stats_survive_abort_and_progress_is_reported() {
+    let d = dicom("x");
+    let z = zip(&[("a", &d), ("b", &d), ("c", &d)]);
+    let (stats, r, rec, _e) = run_rec(&z, "z.zip", &Limits::default(), Recorder::default());
+    r.unwrap();
+    assert_eq!(stats.entries_seen, 3);
+    let entries: Vec<u64> = rec.progress.iter().map(|p| p.0).collect();
+    assert_eq!(entries, vec![1, 2, 3]);
+    // bytes lag by the entry being counted
+    assert_eq!(rec.progress[2].1, 2 * d.len() as u64);
+
+    let mut bomb = dicom("BOMB");
+    bomb.resize(4 * 1024 * 1024, 0);
+    let z = zip(&[("IM1", &d), ("bomb", &bomb)]);
+    let limits = Limits {
+        max_expanded_bytes: 1024 * 1024,
+        ..Limits::default()
+    };
+    let (stats, r, _rec, _e) = run_rec(&z, "b.zip", &limits, Recorder::default());
+    assert!(matches!(r, Err(WalkError::Aborted(_))), "{r:?}");
+    assert_eq!(stats.entries_seen, 2);
+    assert!(stats.bytes_expanded > 1024 * 1024, "{stats:?}");
+}
+
+#[test]
+fn continued_walk_shares_the_budget() {
+    let d = dicom("x");
+    let z = zip(&[("a", &d), ("b", &d)]);
+    let e = env(&z);
+    let limits = Limits {
+        max_entries: 3,
+        ..Limits::default()
+    };
+    let spent = WalkStats {
+        entries_seen: 2,
+        bytes_expanded: 10,
+    };
+    let mut rec = Recorder::default();
+    let (stats, r) = walk_file_continue(&e.input, "z.zip", &e.tmp, &limits, spent, &mut rec);
+    match r {
+        Err(WalkError::Aborted(reason)) => assert_eq!(reason, "too many entries (limit 3)"),
+        other => panic!("expected abort, got {other:?}"),
+    }
+    assert_eq!(stats, spent);
+
+    let limits = Limits {
+        max_entries: 4,
+        ..Limits::default()
+    };
+    let mut rec = Recorder::default();
+    let (stats, r) = walk_file_continue(&e.input, "z.zip", &e.tmp, &limits, spent, &mut rec);
+    r.unwrap();
+    assert_eq!(stats.entries_seen, 4);
+    assert_eq!(stats.bytes_expanded, 10 + 2 * d.len() as u64);
+    assert_eq!(rec.progress.first().map(|p| p.0), Some(3));
 }

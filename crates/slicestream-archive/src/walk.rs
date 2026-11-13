@@ -81,6 +81,12 @@ pub trait Sink {
     /// incomplete. The walker reports the failure itself.
     fn leaf(&mut self, leaf: Leaf<'_>) -> io::Result<()>;
     fn event(&mut self, ev: Event<'_>);
+    /// Running totals, called each time a file entry is counted (before it
+    /// is read, so `bytes_expanded` lags by up to one entry). Cheap; the
+    /// default does nothing.
+    fn progress(&mut self, entries_seen: u64, bytes_expanded: u64) {
+        let _ = (entries_seen, bytes_expanded);
+    }
 }
 
 #[derive(Debug)]
@@ -115,15 +121,44 @@ pub struct WalkStats {
     pub bytes_expanded: u64,
 }
 
-/// Walk `path` (any Kind), reporting leaves and events to `sink`.
+/// Walk `path` (any Kind), reporting leaves and events to `sink`. Returns
+/// the totals counted so far even when the walk fails or aborts.
 pub fn walk_file(
     path: &Path,
     display_name: &str,
     tmp_dir: &Path,
     limits: &Limits,
     sink: &mut dyn Sink,
-) -> Result<WalkStats, WalkError> {
-    let budget = Budget::new(limits, tmp_dir.to_path_buf());
+) -> (WalkStats, Result<(), WalkError>) {
+    walk_file_continue(
+        path,
+        display_name,
+        tmp_dir,
+        limits,
+        WalkStats::default(),
+        sink,
+    )
+}
+
+/// [`walk_file`] for one of several files that share one budget: `spent`
+/// is what earlier walks used (counted against `limits`, included in the
+/// returned and reported totals). A local file that cannot be opened or
+/// read fails with `WalkError::Io` before any entry is counted, so the
+/// returned totals equal `spent`.
+pub fn walk_file_continue(
+    path: &Path,
+    display_name: &str,
+    tmp_dir: &Path,
+    limits: &Limits,
+    spent: WalkStats,
+    sink: &mut dyn Sink,
+) -> (WalkStats, Result<(), WalkError>) {
+    let budget = Budget::new(
+        limits,
+        tmp_dir.to_path_buf(),
+        spent.entries_seen,
+        spent.bytes_expanded,
+    );
     let mut w = Walker {
         budget: &budget,
         tmp_dir,
@@ -134,14 +169,15 @@ pub fn walk_file(
         entries_seen: budget.entries(),
         bytes_expanded: budget.bytes(),
     };
-    match res {
-        Ok(()) => Ok(stats),
+    let res = match res {
+        Ok(()) => Ok(()),
         Err(Fail::Abort(r)) => Err(WalkError::Aborted(r)),
         Err(Fail::Io(e)) => Err(WalkError::Io(e)),
         // `container` turns these into events; only reachable if that
         // invariant breaks, so report rather than panic.
         Err(Fail::Container(r)) => Err(WalkError::Io(io::Error::other(r))),
-    }
+    };
+    (stats, res)
 }
 
 /// Internal failure, by blast radius.
@@ -184,8 +220,11 @@ impl Walker<'_> {
         }
     }
 
-    fn count_entry(&self) -> Result<(), Fail> {
-        self.budget.add_entry().map_err(Fail::Abort)
+    fn count_entry(&mut self) -> Result<(), Fail> {
+        let res = self.budget.add_entry().map_err(Fail::Abort);
+        self.sink
+            .progress(self.budget.entries(), self.budget.bytes());
+        res
     }
 
     /// Classify an error from reading untrusted input.

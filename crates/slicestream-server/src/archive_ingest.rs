@@ -8,7 +8,6 @@
 //! most a few spooled entries wait on disk. Nothing is held whole in memory.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,7 +15,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use slicestream_archive::{
-    Event, Kind, Leaf, Limits, SNIFF_LEN, Sink, WalkError, detect, parse_nifti_header, walk_file,
+    Event, Kind, Leaf, Limits, Sink, WalkError, WalkStats, parse_nifti_header, walk_file,
+    walk_file_continue,
 };
 use slicestream_store::{
     Expectations, IngestError, IngestSource, Ingestor, NiftiMeta, SpooledBlob, UploadCounts,
@@ -82,7 +82,8 @@ pub struct NiftiSummary {
 /// Called from the async consumer, in order.
 pub trait Progress: Send + Sync {
     fn entry(&self, r: &EntryResult);
-    /// Walker totals so far (after each walked file).
+    /// Walker totals so far: after each counted entry (bytes lag by up to
+    /// one entry) and exactly after each walked file, also on abort.
     fn stats(&self, entries_seen: u64, bytes_expanded: u64);
 }
 
@@ -95,7 +96,7 @@ pub struct UploadOutcome {
     pub counts: UploadCounts,
     pub patients: Vec<PatientSummary>,
     pub nifti: NiftiSummary,
-    /// Walker totals of the files that were walked to the end.
+    /// Walker totals, including an aborted walk.
     pub entries_seen: u64,
     pub bytes_expanded: u64,
 }
@@ -126,9 +127,9 @@ pub async fn process_upload(
     let tmp = tmp_dir(&ingestor);
     run(ingestor, upload_id, progress, Vec::new(), move |sink| {
         sink.source = source;
-        let stats = walk_file(&file, &display_name, &tmp, &limits, sink)?;
-        sink.stats(stats.entries_seen, stats.bytes_expanded);
-        Ok(())
+        let (stats, res) = walk_file(&file, &display_name, &tmp, &limits, sink);
+        sink.stats(stats);
+        res
     })
     .await
 }
@@ -138,8 +139,9 @@ pub async fn process_upload(
 /// content: DICOM and NIfTI are entries named by their path relative to
 /// `dir`; archives are walked under that name; anything else is skipped.
 ///
-/// The entry and expanded-byte limits apply to the archives of the folder
-/// together; loose files do not count against them.
+/// The folder is one upload for the limits: every file, loose or inside an
+/// archive, counts toward `max_entries` and `max_expanded_bytes`. A file
+/// that cannot be opened or read is a failed entry; the import goes on.
 pub async fn process_dir(
     ingestor: Arc<Ingestor>,
     dir: &Path,
@@ -152,32 +154,23 @@ pub async fn process_dir(
     let files = list_files(dir, recursive, &mut pre).await;
     let tmp = tmp_dir(&ingestor);
     run(ingestor, upload_id, progress, pre, move |sink| {
-        let (mut entries, mut bytes) = (0u64, 0u64);
-        // Spent by archives (loose files do not count).
-        let (mut spent_entries, mut spent_bytes) = (0u64, 0u64);
+        let mut spent = WalkStats::default();
         for (path, name) in files {
-            let container = match sniff(&path) {
-                Ok(kind) => !matches!(kind, Kind::Dicom | Kind::Nifti | Kind::Other),
-                Err(e) => {
+            sink.source = IngestSource::Import { path: path.clone() };
+            let (stats, res) = walk_file_continue(&path, &name, &tmp, &limits, spent, sink);
+            match res {
+                // Nothing was counted: the file itself could not be opened
+                // or read (a sink failure always follows a counted entry).
+                Err(WalkError::Io(e)) if stats == spent => {
                     let r = failed(&name, "other", None, format!("cannot read file: {e}"));
                     sink.send(Item::Done(r)).map_err(WalkError::Io)?;
-                    continue;
                 }
-            };
-            let left = Limits {
-                max_entries: limits.max_entries.saturating_sub(spent_entries),
-                max_expanded_bytes: limits.max_expanded_bytes.saturating_sub(spent_bytes),
-                ..limits.clone()
-            };
-            sink.source = IngestSource::Import { path: path.clone() };
-            let stats = walk_file(&path, &name, &tmp, &left, sink)?;
-            entries += stats.entries_seen;
-            bytes += stats.bytes_expanded;
-            if container {
-                spent_entries += stats.entries_seen;
-                spent_bytes += stats.bytes_expanded;
+                res => {
+                    spent = stats;
+                    sink.stats(spent);
+                    res?;
+                }
             }
-            sink.stats(entries, bytes);
         }
         Ok(())
     })
@@ -186,15 +179,6 @@ pub async fn process_dir(
 
 fn tmp_dir(ingestor: &Ingestor) -> PathBuf {
     ingestor.config().root.join("tmp")
-}
-
-/// Detect the kind of a local file from its first bytes.
-fn sniff(path: &Path) -> io::Result<Kind> {
-    let mut head = Vec::with_capacity(SNIFF_LEN);
-    File::open(path)?
-        .take(SNIFF_LEN as u64)
-        .read_to_end(&mut head)?;
-    Ok(detect(&head))
 }
 
 /// Regular files under `dir` as `(path, name relative to dir)`, sorted.
@@ -280,6 +264,9 @@ struct ChannelSink {
     ingestor: Arc<Ingestor>,
     tx: mpsc::Sender<Item>,
     source: IngestSource,
+    /// Path and kind of the leaf last handed to `leaf`, so that an
+    /// `EntryFailed` for it (its reader failed) reports the right kind.
+    last_leaf: Option<(String, &'static str)>,
 }
 
 impl ChannelSink {
@@ -290,8 +277,9 @@ impl ChannelSink {
             .map_err(|_| io::Error::other("upload processing stopped"))
     }
 
-    fn stats(&self, entries: u64, bytes: u64) {
-        let _ = self.send(Item::Stats(entries, bytes));
+    /// If the consumer is gone the next leaf stops the walk.
+    fn stats(&self, s: WalkStats) {
+        let _ = self.send(Item::Stats(s.entries_seen, s.bytes_expanded));
     }
 }
 
@@ -317,6 +305,7 @@ impl Sink for ChannelSink {
     fn leaf(&mut self, leaf: Leaf<'_>) -> io::Result<()> {
         let path = leaf.path.to_owned();
         let kind = kind_str(leaf.kind);
+        self.last_leaf = Some((path.clone(), kind));
         let meta = if leaf.kind == Kind::Nifti {
             match parse_nifti_header(leaf.head) {
                 Ok(h) => Some(NiftiMeta {
@@ -379,10 +368,20 @@ impl Sink for ChannelSink {
                 size: None,
             },
             Event::ContainerFailed { path, reason } => failed(path, "archive", None, reason),
-            Event::EntryFailed { path, reason } => failed(path, "other", None, reason),
+            Event::EntryFailed { path, reason } => {
+                let kind = match &self.last_leaf {
+                    Some((p, kind)) if p == path => kind,
+                    _ => "other",
+                };
+                failed(path, kind, None, reason)
+            }
         };
         // If the consumer is gone the next leaf stops the walk.
         let _ = self.send(Item::Done(r));
+    }
+
+    fn progress(&mut self, entries_seen: u64, bytes_expanded: u64) {
+        let _ = self.send(Item::Stats(entries_seen, bytes_expanded));
     }
 }
 
@@ -608,6 +607,7 @@ where
         ingestor: Arc::clone(&ingestor),
         tx,
         source: IngestSource::Http { remote: None },
+        last_leaf: None,
     };
     // The sink (and its sender) is dropped when the walk returns or
     // unwinds, which ends the loop below.
@@ -726,6 +726,7 @@ mod tests {
                 ingestor,
                 tx,
                 source: IngestSource::Http { remote: None },
+                last_leaf: None,
             };
             let mut data: &[u8] = &[0u8; 200];
             sink.leaf(Leaf {

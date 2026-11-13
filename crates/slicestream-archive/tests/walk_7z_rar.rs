@@ -451,7 +451,7 @@ fn sink_panic_in_7z_propagates() {
     for (bytes, name) in [(&s, "x.7z"), (&z, "o.zip")] {
         let e = env(bytes);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            walk_file(&e.input, name, &e.tmp, &Limits::default(), &mut Panicking)
+            walk_file(&e.input, name, &e.tmp, &Limits::default(), &mut Panicking).1
         }));
         let payload = r.expect_err("the sink panic must propagate");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"sink bug"));
@@ -470,4 +470,51 @@ fn rar_leaf_bytes_count_once() {
     );
     assert_eq!(r.unwrap().bytes_expanded, a.len() as u64);
     assert_tmp_empty(&e.tmp);
+}
+
+/// A leaf the sink acknowledges without reading must not disturb the next
+/// one: the walker skips the rest of the unread entry.
+fn assert_unread_leaf_skipped(bytes: &[u8], name: &str, first: &str, second: &str, data: &[u8]) {
+    let rec = Recorder {
+        unread: vec![first.to_string()],
+        ..Recorder::default()
+    };
+    let (_, r, rec, e) = run_rec(bytes, name, &Limits::default(), rec);
+    r.unwrap();
+    assert_eq!(rec.paths(), vec![second], "{name}");
+    assert_eq!(rec.leaves[0].sha, sha(data), "{name}");
+    assert!(
+        rec.entry_failed.is_empty(),
+        "{name}: {:?}",
+        rec.entry_failed
+    );
+    assert_tmp_empty(&e.tmp);
+}
+
+#[test]
+fn unread_leaf_is_skipped_in_7z() {
+    let mut a = dicom("A");
+    a.resize(200_000, 7);
+    let b = dicom("B");
+    let entries: [(&str, &[u8]); 2] = [("IM1", &a), ("IM2", &b)];
+    assert_unread_leaf_skipped(&seven_z(&entries), "n.7z", "n.7z!/IM1", "n.7z!/IM2", &b);
+    assert_unread_leaf_skipped(
+        &seven_z_solid(&entries),
+        "s.7z",
+        "s.7z!/IM1",
+        "s.7z!/IM2",
+        &b,
+    );
+}
+
+#[cfg(feature = "rar")]
+#[test]
+fn unread_leaf_is_skipped_in_rar() {
+    let mut a = dicom("A");
+    a.resize(200_000, 7);
+    let b = dicom("B");
+    for solid in [false, true] {
+        let r5 = rar5(&[RarItem::File("IM1", &a), RarItem::File("IM2", &b)], solid);
+        assert_unread_leaf_skipped(&r5, "x.rar", "x.rar!/IM1", "x.rar!/IM2", &b);
+    }
 }

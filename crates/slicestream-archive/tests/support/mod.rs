@@ -196,10 +196,17 @@ pub struct Recorder {
     pub failed: Vec<(String, String)>,
     pub entry_failed: Vec<(String, String)>,
     pub skipped: Vec<String>,
+    /// Leaves at these paths are acknowledged without reading their bytes.
+    pub unread: Vec<String>,
+    /// `Sink::progress` calls.
+    pub progress: Vec<(u64, u64)>,
 }
 
 impl Sink for Recorder {
     fn leaf(&mut self, leaf: Leaf<'_>) -> io::Result<()> {
+        if self.unread.iter().any(|p| p == leaf.path) {
+            return Ok(());
+        }
         let mut h = Sha256::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -229,6 +236,10 @@ impl Sink for Recorder {
             }
             Event::Skipped { path } => self.skipped.push(path.to_string()),
         }
+    }
+
+    fn progress(&mut self, entries_seen: u64, bytes_expanded: u64) {
+        self.progress.push((entries_seen, bytes_expanded));
     }
 }
 
@@ -278,10 +289,20 @@ pub fn run(
     name: &str,
     limits: &Limits,
 ) -> (Result<WalkStats, WalkError>, Recorder, Env) {
+    let (stats, r, rec, e) = run_rec(bytes, name, limits, Recorder::default());
+    (r.map(|()| stats), rec, e)
+}
+
+/// Like [`run`] with a prepared recorder; returns the stats even on error.
+pub fn run_rec(
+    bytes: &[u8],
+    name: &str,
+    limits: &Limits,
+    mut rec: Recorder,
+) -> (WalkStats, Result<(), WalkError>, Recorder, Env) {
     let e = env(bytes);
-    let mut rec = Recorder::default();
-    let r = walk_file(&e.input, name, &e.tmp, limits, &mut rec);
-    (r, rec, e)
+    let (stats, r) = walk_file(&e.input, name, &e.tmp, limits, &mut rec);
+    (stats, r, rec, e)
 }
 
 pub fn assert_tmp_empty(tmp: &Path) {

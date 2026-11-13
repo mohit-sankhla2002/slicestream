@@ -23,6 +23,11 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 /// Part-10 CT image of patient `patient` (`P<patient>`), study `study`,
 /// series `series`, instance `inst`. UIDs are derived from those numbers.
 fn dicom(patient: u32, study: u32, series: u32, inst: u32) -> Vec<u8> {
+    dicom_sized(patient, study, series, inst, 32)
+}
+
+/// [`dicom`] with `pixel_bytes` of pixel data.
+fn dicom_sized(patient: u32, study: u32, series: u32, inst: u32, pixel_bytes: usize) -> Vec<u8> {
     let study_uid = format!("2.25.9{patient}0{study}");
     let series_uid = format!("{study_uid}.{series}");
     let sop_uid = format!("{series_uid}.{inst}");
@@ -61,7 +66,7 @@ fn dicom(patient: u32, study: u32, series: u32, inst: u32) -> Vec<u8> {
         DataElement::new(
             tags::PIXEL_DATA,
             VR::OW,
-            PrimitiveValue::from(vec![7u8; 32]),
+            PrimitiveValue::from(vec![7u8; pixel_bytes]),
         ),
     ]);
     let file = obj
@@ -335,6 +340,9 @@ async fn zip_single_patient_counts() {
     let txt = rec.outcome_of("p1.zip!/readme.txt");
     assert_eq!((txt.kind, txt.outcome), ("other", EntryOutcome::Skipped));
     assert_eq!(rec.entries().len(), 4);
+    // Live progress: one call per counted entry, then the final totals.
+    let seen: Vec<u64> = rec.stats.lock().unwrap().iter().map(|s| s.0).collect();
+    assert_eq!(seen, vec![1, 2, 3, 4, 4]);
     assert_eq!(
         rec.stats.lock().unwrap().last().copied(),
         Some((out.entries_seen, out.bytes_expanded))
@@ -437,11 +445,12 @@ async fn encrypted_and_truncated_fail_alone() {
     let enc = mark_encrypted(zip(&[("IM9", &dicom(9, 1, 1, 1))]));
     let whole = zip(&[("IM8", &dicom(8, 1, 1, 1))]);
     let cut = whole[..whole.len() / 2].to_vec();
-    // A stored DICOM entry with one flipped byte fails its CRC check only
-    // after all bytes were read: the spool must be discarded, not ingested.
-    let bad = dicom(7, 1, 1, 1);
+    // A stored DICOM entry (larger than the sniffed head) with one flipped
+    // pixel byte fails its CRC check only after the sink read all bytes:
+    // the spool must be discarded, not ingested.
+    let bad = dicom_sized(7, 1, 1, 1, 8192);
     let mut crc = zip_stored(&[("IM7", &bad)]);
-    let at = crc.windows(4).position(|w| w == b"DICM").unwrap() + 40;
+    let at = crc.windows(4).position(|w| w == b"DICM").unwrap() + 4000;
     crc[at] ^= 0xFF;
     let outer = zip(&[
         ("enc.zip", &enc),
@@ -467,7 +476,7 @@ async fn encrypted_and_truncated_fail_alone() {
         Some("encrypted archive")
     );
     let r = rec.outcome_of("o.zip!/crc.zip!/IM7");
-    assert_eq!((r.kind, r.outcome), ("other", EntryOutcome::Failed));
+    assert_eq!((r.kind, r.outcome), ("dicom", EntryOutcome::Failed));
     assert!(
         e.ingestor
             .index()
@@ -495,8 +504,15 @@ async fn aborted_upload_keeps_stored_items() {
         max_expanded_bytes: 2 * len + len / 2,
         ..Limits::default()
     };
-    let (out, _) = e.upload("big.zip", &z, limits).await;
+    let (out, rec) = e.upload("big.zip", &z, limits).await;
     assert_eq!(out.status, "aborted");
+    // Walker totals survive the abort (the third entry crossed the limit).
+    assert_eq!(out.entries_seen, 3);
+    assert!(out.bytes_expanded > 2 * len, "{}", out.bytes_expanded);
+    assert_eq!(
+        rec.stats.lock().unwrap().last().copied(),
+        Some((out.entries_seen, out.bytes_expanded))
+    );
     assert!(out.reason.as_deref().is_some_and(|r| !r.is_empty()));
     assert_eq!(out.counts.dicom_stored, 2);
     let row = e
@@ -673,4 +689,126 @@ async fn process_dir_with_archive_and_loose_nifti() {
     assert_eq!(out.counts.skipped, 1);
     assert_eq!(rec.entries().len(), 3);
     e.assert_tmp_empty();
+}
+
+/// NIfTI-2 magic with a header cut short: detected as NIfTI, but the header
+/// cannot be parsed.
+fn short_nifti2() -> Vec<u8> {
+    let mut v = vec![0u8; 100];
+    v[0..4].copy_from_slice(&540i32.to_le_bytes());
+    v[4..8].copy_from_slice(b"n+2\0");
+    v
+}
+
+fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    for (name, data) in entries {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, name, *data).unwrap();
+    }
+    gz(&b.into_inner().unwrap())
+}
+
+#[tokio::test]
+async fn invalid_nifti_header_fails_alone_in_tar_gz() {
+    let e = env().await;
+    // The bad NIfTI is not read at all; the walker must skip its bytes so
+    // the following DICOM arrives intact. (Only an entry shorter than the
+    // header can fail to parse after detection.)
+    let bad = short_nifti2();
+    let im = dicom(1, 1, 1, 1);
+    let t = tar_gz(&[("bad.nii", &bad), ("IM1", &im)]);
+    let (out, rec) = e.upload("t.tar.gz", &t, Limits::default()).await;
+    assert_eq!(out.status, "done");
+    let r = rec.outcome_of("t.tar.gz!/bad.nii");
+    assert_eq!((r.kind, r.outcome), ("nifti", EntryOutcome::Failed));
+    assert_eq!(r.reason.as_deref(), Some("invalid NIfTI header"));
+    let r = rec.outcome_of("t.tar.gz!/IM1");
+    assert_eq!(r.outcome, EntryOutcome::Stored);
+    assert_eq!(r.size, Some(im.len() as u64));
+    assert_eq!(out.counts.failed, 1);
+    assert_eq!(out.counts.dicom_stored, 1);
+    e.assert_tmp_empty();
+}
+
+async fn import(e: &Env, dir: &std::path::Path, limits: Limits) -> (UploadOutcome, Arc<Recorder>) {
+    let id = e
+        .ingestor
+        .index()
+        .create_upload("import", "x", None)
+        .await
+        .unwrap();
+    let rec = Arc::new(Recorder::default());
+    let out = process_dir(Arc::clone(&e.ingestor), dir, true, id, limits, rec.clone()).await;
+    (out, rec)
+}
+
+#[tokio::test]
+async fn process_dir_loose_files_count_toward_limits() {
+    let e = env().await;
+    let dir = e.input.join("many");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 1..=4 {
+        std::fs::write(dir.join(format!("IM{i}")), dicom(1, 1, 1, i)).unwrap();
+    }
+    let limits = Limits {
+        max_entries: 2,
+        ..Limits::default()
+    };
+    let (out, rec) = import(&e, &dir, limits).await;
+    assert_eq!(out.status, "aborted");
+    assert_eq!(out.reason.as_deref(), Some("too many entries (limit 2)"));
+    assert_eq!(out.counts.dicom_stored, 2);
+    let paths: Vec<String> = rec.entries().into_iter().map(|r| r.path).collect();
+    assert_eq!(paths, vec!["IM1", "IM2"]);
+    assert_eq!(out.entries_seen, 3);
+    e.links(&sop(1, 1, 1, 2)).await;
+
+    // Bytes too: loose files are counted like archive entries.
+    let dir2 = e.input.join("bytes");
+    std::fs::create_dir_all(&dir2).unwrap();
+    let im = dicom(2, 1, 1, 1);
+    std::fs::write(dir2.join("IM1"), &im).unwrap();
+    std::fs::write(dir2.join("IM2"), dicom(2, 1, 1, 2)).unwrap();
+    let limits = Limits {
+        max_expanded_bytes: im.len() as u64 + 10,
+        ..Limits::default()
+    };
+    let (out, _) = import(&e, &dir2, limits).await;
+    assert_eq!(out.status, "aborted");
+    assert_eq!(
+        out.reason,
+        Some(format!(
+            "expanded size limit reached ({} bytes)",
+            im.len() + 10
+        ))
+    );
+    assert_eq!(out.counts.dicom_stored, 1);
+    e.assert_tmp_empty();
+}
+
+#[tokio::test]
+async fn process_dir_unreadable_file_fails_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env().await;
+    let dir = e.input.join("perm");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("IM1"), dicom(1, 1, 1, 1)).unwrap();
+    std::fs::write(dir.join("IM2"), dicom(1, 1, 1, 2)).unwrap();
+    std::fs::set_permissions(dir.join("IM1"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(dir.join("IM1")).is_ok() {
+        return; // running as root: permissions are not enforced
+    }
+    let (out, rec) = import(&e, &dir, Limits::default()).await;
+    assert_eq!(out.status, "done");
+    let r = rec.outcome_of("IM1");
+    assert_eq!(r.outcome, EntryOutcome::Failed);
+    assert!(
+        r.reason.as_deref().unwrap().starts_with("cannot read file"),
+        "{r:?}"
+    );
+    assert_eq!(out.counts.dicom_stored, 1);
 }

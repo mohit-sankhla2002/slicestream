@@ -22,13 +22,18 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-    pub(crate) fn new(limits: &Limits, tmp_dir: PathBuf) -> Self {
+    /// A budget that has already spent `entries` and `bytes`.
+    pub(crate) fn new(limits: &Limits, tmp_dir: PathBuf, entries: u64, bytes: u64) -> Self {
         Budget {
             limits: limits.clone(),
             tmp_dir,
-            bytes: Cell::new(0),
-            entries: Cell::new(0),
-            next_disk_check: Cell::new(DISK_CHECK_EVERY),
+            bytes: Cell::new(bytes),
+            entries: Cell::new(entries),
+            next_disk_check: Cell::new(
+                (bytes / DISK_CHECK_EVERY)
+                    .saturating_add(1)
+                    .saturating_mul(DISK_CHECK_EVERY),
+            ),
             aborted: Cell::new(false),
             reason: RefCell::new(None),
         }
