@@ -3,28 +3,102 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>slicestream demo</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { margin: 0; background: #0b0d10; color: #d6dae0; font: 14px/1.4 system-ui, sans-serif; }
-    header { display: flex; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid #222; }
-    main { display: grid; place-items: center; height: calc(100vh - 90px); }
-    canvas { max-width: 100%; max-height: 100%; image-rendering: pixelated; background: #000; }
-    #bar { height: 6px; display: flex; margin: 0 16px; }
-    #bar span { flex: 1; background: #222; }
-    #bar span.got { background: #2f7d4f; }
-    #bar span.cur { background: #e0b341; }
-    select, output { font: inherit; }
-  </style>
+  <title>slicestream console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='3' width='12' height='2' rx='1' fill='%234fd1c5'/%3E%3Crect x='2' y='7' width='12' height='2' rx='1' fill='%234fd1c5' opacity='.7'/%3E%3Crect x='2' y='11' width='12' height='2' rx='1' fill='%234fd1c5' opacity='.4'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="console.css">
+  <script type="module" src="console.js"></script>
 </head>
 <body>
-  <header>
-    <strong>slicestream</strong>
-    <select id="series"></select>
-    <output id="status">connecting…</output>
-  </header>
-  <div id="bar"></div>
-  <main><canvas id="view" width="512" height="512"></canvas></main>
-  <script src="client.js"></script>
+<header>
+  <div class="logo">slice<span>stream</span> <em>console</em></div>
+  <span class="pill" id="h-live">connecting</span>
+  <span class="pill" id="h-proc">pid — · v—</span>
+  <div class="grow"></div>
+  <span class="pill" id="h-uptime">uptime —</span>
+  <span class="pill" id="h-addr">http — · dimse —</span>
+</header>
+<main>
+  <div class="col">
+    <section class="card" id="upload-card">
+      <div class="ch"><h3>Upload</h3><div class="seg"><span class="on">STOW-RS</span><span>Single file</span></div></div>
+      <div class="cb">
+        <div class="empty">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+          <b>Upload is not wired up yet</b>
+          <small>Drag and drop, folder pick and STOW-RS land in the next build</small>
+        </div>
+      </div>
+    </section>
+    <section class="card" id="results-card">
+      <div class="ch"><h3>Ingest results</h3><span class="note">this page</span></div>
+      <div class="empty">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        <b>No uploads yet</b>
+        <small>Each uploaded file will get a row with its status, SOP UID, size and time</small>
+      </div>
+    </section>
+  </div>
+
+  <section class="card" id="process-card">
+    <div class="ch"><h3>slicestream process</h3><span class="note">window: 5 min</span></div>
+    <div class="kpis">
+      <div class="kpi"><div class="l">CPU</div><div class="v"><span id="k-cpu">—</span><small>%</small></div><div class="s" id="k-cpu-s">of 1 core</div></div>
+      <div class="kpi"><div class="l">RAM (RSS)</div><div class="v" id="k-rss">—</div><div class="s" id="k-rss-s">peak —</div></div>
+      <div class="kpi"><div class="l">Storage</div><div class="v" id="k-sto">—</div><div class="s" id="k-sto-s">—</div></div>
+      <div class="kpi"><div class="l">Ingest</div><div class="v"><span id="k-ing">—</span><small>/s</small></div><div class="s" id="k-ing-s">p95 —</div></div>
+    </div>
+    <div class="charts">
+      <div class="chart" id="c-cpu"><div class="t"><span>CPU %</span><b class="cur" style="color:var(--cpu)">—</b></div>
+        <div class="plot"><svg viewBox="0 0 300 70" preserveAspectRatio="none" aria-hidden="true">
+          <defs><linearGradient id="g-cpu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4fd1c5" stop-opacity=".35"/><stop offset="1" stop-color="#4fd1c5" stop-opacity="0"/></linearGradient></defs>
+          <path class="grid" d="M0 35H300"/><path class="area" fill="url(#g-cpu)"/><path class="line" stroke="var(--cpu)"/></svg>
+          <span class="ymax">—</span></div><div class="axis"><span>−5 min</span><span>now</span></div></div>
+      <div class="chart" id="c-rss"><div class="t"><span>RAM RSS MB</span><b class="cur" style="color:var(--ram)">—</b></div>
+        <div class="plot"><svg viewBox="0 0 300 70" preserveAspectRatio="none" aria-hidden="true">
+          <defs><linearGradient id="g-rss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9f7aea" stop-opacity=".35"/><stop offset="1" stop-color="#9f7aea" stop-opacity="0"/></linearGradient></defs>
+          <path class="grid" d="M0 35H300"/><path class="area" fill="url(#g-rss)"/><path class="line" stroke="var(--ram)"/></svg>
+          <span class="ymax">—</span></div><div class="axis"><span>−5 min</span><span>now</span></div></div>
+      <div class="chart" id="c-disk"><div class="t"><span>Disk write / read MB/s</span><b class="cur" style="color:var(--io)">—</b></div>
+        <div class="plot"><svg viewBox="0 0 300 70" preserveAspectRatio="none" aria-hidden="true">
+          <path class="grid" d="M0 35H300"/><path class="line l2 dash" stroke="var(--read)"/><path class="line l1" stroke="var(--io)"/></svg>
+          <span class="ymax">—</span></div><div class="axis"><span>−5 min</span><span>now</span></div>
+        <div class="legend"><span><i style="background:var(--io)"></i>write</span><span><i style="background:var(--read)"></i>read</span></div></div>
+      <div class="chart" id="c-lat"><div class="t"><span>Ingest latency ms</span><b class="cur">—</b></div>
+        <div class="plot"><svg viewBox="0 0 300 70" preserveAspectRatio="none" aria-hidden="true">
+          <path class="grid" d="M0 35H300"/><path class="line l1" stroke="var(--acc)"/><path class="line l2" stroke="var(--bad)"/></svg>
+          <span class="ymax">—</span></div><div class="axis"><span>−5 min</span><span>now</span></div>
+        <div class="legend"><span><i style="background:var(--acc)"></i>p50</span><span><i style="background:var(--bad)"></i>p95</span></div></div>
+    </div>
+    <div class="disk">
+      <div class="dhead"><span class="root" id="d-root">Storage root · —</span><span class="mono" id="d-free">—</span></div>
+      <div class="bar" id="d-bar"><i style="background:var(--acc)"></i><i style="background:var(--ram)"></i><i style="background:var(--io)"></i></div>
+      <div class="legend"><span><i style="background:var(--acc)"></i><span id="d-obj">objects —</span></span><span><i style="background:var(--ram)"></i><span id="d-idx">index.sqlite + WAL —</span></span><span><i style="background:var(--io)"></i><span id="d-tmp">tmp —</span></span></div>
+    </div>
+    <div class="facts">
+      <div>Threads <b id="f-threads">—</b></div><div>Open FDs <b id="f-fds">—</b></div><div>Virtual mem <b id="f-virt">—</b></div>
+      <div>DIMSE assoc <b id="f-dimse">—</b></div><div>WS streams <b id="f-ws">—</b></div><div>HTTP in-flight <b id="f-http">—</b></div>
+      <div>Studies <b id="f-studies">—</b></div><div>Series <b id="f-series">—</b></div><div>Instances <b id="f-inst">—</b></div>
+    </div>
+  </section>
+
+  <div class="bottom">
+    <section class="card" id="series-card">
+      <div class="ch"><h3>Stored series</h3><span class="note">updates on ingest</span></div>
+      <div class="empty">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M10 10v10"/></svg>
+        <b>Series list is not wired up yet</b>
+        <small>Stored studies and series will appear here; click one to open it</small>
+      </div>
+    </section>
+    <section class="card" id="viewer-card">
+      <div class="ch"><h3>Viewer</h3><span class="note">no series selected</span></div>
+      <div class="empty tall">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg>
+        <b>Select a series to view it</b>
+        <small>Frames stream over WebSocket; scroll with the wheel or arrow keys</small>
+      </div>
+    </section>
+  </div>
+</main>
 </body>
 </html>

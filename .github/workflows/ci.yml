@@ -19,6 +19,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+      - run: node --test 'web/tests/*.test.js'
 
   msrv:
     runs-on: ubuntu-latest
