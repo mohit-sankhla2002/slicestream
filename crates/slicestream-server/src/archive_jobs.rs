@@ -446,6 +446,9 @@ pub async fn post_archive(
 /// space is checked at the first chunk and every
 /// [`FREE_SPACE_CHECK_BYTES`] after (507 below `min_free_bytes`), which also
 /// covers bodies without `Content-Length`. Any error removes the spool file.
+// The error is the HTTP response to send; it is built once per request, so
+// its size does not matter.
+#[allow(clippy::result_large_err)]
 async fn spool(
     jobs: &ArchiveJobs,
     ingestor: &Ingestor,
