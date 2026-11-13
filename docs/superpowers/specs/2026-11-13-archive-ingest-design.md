@@ -132,6 +132,7 @@ max_expanded_bytes = 68719476736    # 64 GiB of decompressed data per upload
 min_free_bytes = 2147483648         # keep 2 GiB free on the volume
 max_concurrent_jobs = 2             # further uploads wait in a queue
 job_retention = 50                  # finished jobs kept in memory for the API
+body_idle_timeout_secs = 60         # a body silent this long is refused (408)
 ```
 
 *Builder's call:* `max_expanded_bytes` counts every byte extraction writes

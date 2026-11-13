@@ -168,18 +168,23 @@ pairs, and DICOM files without the `DICM` preamble.
 | `max_expanded_bytes` (bytes written out of archives) | 68719476736 (64 GiB) |
 | `min_free_bytes` (free disk to keep) | 2147483648 (2 GiB) |
 | `max_concurrent_jobs` (more wait; queue cap is 4 times this) | 2 |
-| `job_retention` (finished jobs kept in memory) | 50 |
+| `job_retention` (finished jobs kept in memory, at least 1) | 50 |
+| `body_idle_timeout_secs` (body silent this long: 408) | 60 |
 
 Too deep: that nested archive fails and the rest goes on. Too many entries or
 too many expanded bytes: the upload is aborted (what was stored stays
 stored). Each entry is also bound by `[storage] max_instance_bytes`. The body
 is bound by `[http] max_request_bytes`. `POST` returns 507 if free space is
-below `Content-Length` plus `min_free_bytes`, and a running job aborts if free
-space drops below `min_free_bytes`. A job that is still running when the
+below `Content-Length` plus `min_free_bytes`, or (also without
+`Content-Length`) if free space falls below `min_free_bytes` while the body is
+received (checked every 64 MiB); a running job aborts if free space drops
+below `min_free_bytes`. A body that sends nothing for `body_idle_timeout_secs`
+gets 408. Reported entry names are cut to 1024 bytes and paths to 4096 bytes
+(ending in `…`). A job that is still running when the
 server stops is marked `aborted`.
 
-Responses: 202 job accepted, 400 not a supported file, 401 bad token, 413
-too large, 503 job queue full, 507 not enough free space, 404 unknown job.
+Responses: 202 job accepted, 400 not a supported file, 401 bad token, 408
+body stalled, 413 too large, 503 job queue full, 507 not enough free space, 404 unknown job.
 
 ## Hierarchy conflicts
 
