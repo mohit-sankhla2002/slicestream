@@ -1,0 +1,14 @@
+[package]
+name = "slicestream-archive"
+description = "Archive and NIfTI detection and parsing for slicestream."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/slicestream-core", "crates/slicestream-dimse", "crates/slicestream-server", "crates/slicestream-store"]
+members = ["crates/slicestream-archive", "crates/slicestream-core", "crates/slicestream-dimse", "crates/slicestream-server", "crates/slicestream-store"]
 
 [workspace.package]
 version = "0.1.0"
