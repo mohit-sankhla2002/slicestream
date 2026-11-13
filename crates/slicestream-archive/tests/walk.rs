@@ -706,15 +706,21 @@ fn huge_pax_path_is_capped() {
     r.unwrap();
     assert_eq!(rec.leaves.len(), 2);
     let paths = rec.paths();
-    let long = paths
-        .iter()
-        .find(|p| p.ends_with('…'))
-        .expect("capped path");
+    let long = paths.iter().find(|p| p.contains('…')).expect("capped path");
     assert!(long.len() <= MAX_PATH_BYTES, "{}", long.len());
-    assert!(long.len() <= "x.tgz!/".len() + MAX_NAME_BYTES + '…'.len_utf8());
+    assert!(long.len() <= "x.tgz!/".len() + MAX_NAME_BYTES + 20);
     assert!(long.starts_with("x.tgz!/a/a/"));
     assert!(paths.contains(&"x.tgz!/IM2"));
     assert_tmp_empty(&e.tmp);
+
+    // Two huge pax names sharing their first ~1 KiB stay distinct.
+    let (n1, n2) = (format!("{name}X"), format!("{name}Y"));
+    let t = tar(&[TarItem::PaxFile(&n1, &a), TarItem::PaxFile(&n2, &a)]);
+    let (r, rec, _e) = run(&gz(&t), "x.tgz", &Limits::default());
+    r.unwrap();
+    let paths = rec.paths();
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1]);
 
     // A huge top-level display name is capped too.
     let display = "n".repeat(10_000);

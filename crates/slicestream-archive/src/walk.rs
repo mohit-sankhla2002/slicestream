@@ -534,9 +534,15 @@ impl Walker<'_> {
                 Some(n) => n,
                 None => entry.path_bytes().into_owned(),
             };
-            // Decode only what can be reported (a pax path may be 1 MiB).
-            let shown = &name_bytes[..name_bytes.len().min(MAX_NAME_BYTES + 4)];
-            let entry_path = entry_path(path, &String::from_utf8_lossy(shown));
+            // Decode only what can be reported (a pax path may be 1 MiB),
+            // but fingerprint the whole name so long names stay distinct.
+            let shown = if name_bytes.len() > MAX_NAME_BYTES + MARKER_LEN {
+                let head = String::from_utf8_lossy(&name_bytes[..MAX_NAME_BYTES]);
+                format!("{head}{}", marker(&name_bytes)).into()
+            } else {
+                String::from_utf8_lossy(&name_bytes)
+            };
+            let entry_path = entry_path(path, &shown);
             if et.is_gnu_sparse() {
                 // Raw iteration does not consume extended sparse header
                 // blocks; skipping by entry size would desynchronise.
@@ -642,7 +648,7 @@ impl Walker<'_> {
                 for f in members.iter().filter(|f| is_entry(f)) {
                     self.count_entry()?;
                     self.sink.event(Event::EntryFailed {
-                        path: &format!("{path}!/{}", f.name),
+                        path: &entry_path(path, &f.name),
                         reason: "encrypted archive".into(),
                     });
                 }
@@ -721,7 +727,7 @@ impl Walker<'_> {
                     self.count_entry()?;
                 }
                 self.sink.event(Event::EntryFailed {
-                    path: &format!("{path}!/{}", f.name),
+                    path: &entry_path(path, &f.name),
                     reason: reason.clone(),
                 });
             }
@@ -730,7 +736,7 @@ impl Walker<'_> {
         for f in &archive.files {
             if !f.has_stream && is_entry(f) {
                 let mut s = Counted::new(io::empty(), budget, true);
-                self.entry(&mut s, &format!("{path}!/{}", f.name), depth)?;
+                self.entry(&mut s, &entry_path(path, &f.name), depth)?;
             }
         }
         Ok(())
@@ -924,25 +930,37 @@ pub const MAX_NAME_BYTES: usize = 1024;
 /// Longest reported path, including the marker.
 pub const MAX_PATH_BYTES: usize = 4096;
 const ELLIPSIS: &str = "…";
+/// Bytes of the `…#<16 hex>` marker [`capped`] appends.
+const MARKER_LEN: usize = 3 + 1 + 16;
 
 /// `s` if it fits in `max` bytes, else its longest prefix (on a char
-/// boundary) that leaves room for `…`, followed by `…`.
+/// boundary) that leaves room for the marker, followed by `…#<16 hex>`: a
+/// fingerprint of the whole of `s`, so two long names that share a prefix
+/// stay distinct (they are compared when linking NIfTI to patients).
 fn capped(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     if s.len() <= max {
         return s.into();
     }
-    let mut end = max.saturating_sub(ELLIPSIS.len());
+    let marker = marker(s.as_bytes());
+    let mut end = max.saturating_sub(marker.len());
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{ELLIPSIS}", &s[..end]).into()
+    format!("{}{marker}", &s[..end]).into()
+}
+
+/// `…#<16 hex>`: the truncation marker with a fingerprint of all of `bytes`.
+fn marker(bytes: &[u8]) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hasher::write(&mut h, bytes);
+    format!("{ELLIPSIS}#{:016x}", std::hash::Hasher::finish(&h))
 }
 
 /// The reported path of entry `name` inside `parent`: `<parent>!/<name>`,
 /// with the name capped at [`MAX_NAME_BYTES`] and the whole at
 /// [`MAX_PATH_BYTES`] (entry names are untrusted and may be huge).
 fn entry_path(parent: &str, name: &str) -> String {
-    let name = capped(name, MAX_NAME_BYTES + ELLIPSIS.len());
+    let name = capped(name, MAX_NAME_BYTES + MARKER_LEN);
     capped(&format!("{parent}!/{name}"), MAX_PATH_BYTES).into_owned()
 }
 
@@ -1152,14 +1170,27 @@ mod tests {
         assert_eq!(entry_path("a.zip", "x/y"), "a.zip!/x/y");
         let long = "é".repeat(5000);
         let p = entry_path("a.zip", &long);
-        assert!(p.ends_with(ELLIPSIS));
-        assert!(p.len() <= "a.zip!/".len() + MAX_NAME_BYTES + ELLIPSIS.len());
+        assert!(p.contains(ELLIPSIS));
+        assert!(p.len() <= "a.zip!/".len() + MAX_NAME_BYTES + MARKER_LEN);
         let parent = "p".repeat(MAX_PATH_BYTES);
         let p = entry_path(&parent, &long);
-        assert!(p.len() <= MAX_PATH_BYTES && p.ends_with(ELLIPSIS));
+        assert!(p.len() <= MAX_PATH_BYTES && p.contains(ELLIPSIS));
         assert_eq!(capped("abc", 3), "abc");
-        assert_eq!(capped("abcd", 3), ELLIPSIS);
-        assert_eq!(capped("abcde", 4), "a…");
+        let hundred = "a".repeat(100);
+        let c = capped(&hundred, 30);
+        assert!(c.len() <= 30 && c.starts_with("aaaaaaaaaa") && c.contains("…#"));
+    }
+
+    #[test]
+    fn capped_names_sharing_a_prefix_stay_distinct() {
+        let base = "d".repeat(2000);
+        let a = entry_path("a.zip", &format!("{base}X/in1.zip"));
+        let b = entry_path("a.zip", &format!("{base}Y/in2.zip"));
+        assert_ne!(a, b);
+        // Deterministic: the same name always maps to the same path.
+        assert_eq!(a, entry_path("a.zip", &format!("{base}X/in1.zip")));
+        // The fingerprint holds no '/', so it cannot invent a directory.
+        assert!(!a[a.find(ELLIPSIS).unwrap()..].contains('/'));
     }
 
     #[test]
