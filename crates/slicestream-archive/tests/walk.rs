@@ -1,115 +1,9 @@
 mod support;
 
 use std::io;
-use std::path::Path;
 
-use sha2::{Digest, Sha256};
-use slicestream_archive::{Event, Kind, Leaf, Limits, Sink, WalkError, WalkStats, walk_file};
+use slicestream_archive::{Event, Kind, Leaf, Limits, Sink, WalkError, walk_file};
 use support::*;
-
-#[derive(Debug, Clone, PartialEq)]
-struct Rec {
-    path: String,
-    kind: Kind,
-    compressed: bool,
-    sha: String,
-    head_len: usize,
-}
-
-#[derive(Default)]
-struct Recorder {
-    leaves: Vec<Rec>,
-    failed: Vec<(String, String)>,
-    entry_failed: Vec<(String, String)>,
-    skipped: Vec<String>,
-}
-
-impl Sink for Recorder {
-    fn leaf(&mut self, leaf: Leaf<'_>) -> io::Result<()> {
-        let mut h = Sha256::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = leaf.reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            h.update(&buf[..n]);
-        }
-        self.leaves.push(Rec {
-            path: leaf.path.to_string(),
-            kind: leaf.kind,
-            compressed: leaf.compressed,
-            sha: hex(&h.finalize()),
-            head_len: leaf.head.len(),
-        });
-        Ok(())
-    }
-
-    fn event(&mut self, ev: Event<'_>) {
-        match ev {
-            Event::ContainerFailed { path, reason } => {
-                self.failed.push((path.to_string(), reason));
-            }
-            Event::EntryFailed { path, reason } => {
-                self.entry_failed.push((path.to_string(), reason));
-            }
-            Event::Skipped { path } => self.skipped.push(path.to_string()),
-        }
-    }
-}
-
-impl Recorder {
-    fn paths(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.leaves.iter().map(|l| l.path.as_str()).collect();
-        v.sort();
-        v
-    }
-    fn leaf(&self, path: &str) -> &Rec {
-        self.leaves
-            .iter()
-            .find(|l| l.path == path)
-            .unwrap_or_else(|| panic!("no leaf {path}: {:?}", self.paths()))
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn sha(b: &[u8]) -> String {
-    hex(&Sha256::digest(b))
-}
-
-struct Env {
-    _dir: tempfile::TempDir,
-    tmp: std::path::PathBuf,
-    input: std::path::PathBuf,
-}
-
-fn env(bytes: &[u8]) -> Env {
-    let dir = tempfile::tempdir().unwrap();
-    let tmp = dir.path().join("tmp");
-    std::fs::create_dir(&tmp).unwrap();
-    let input = dir.path().join("input.bin");
-    std::fs::write(&input, bytes).unwrap();
-    Env {
-        _dir: dir,
-        tmp,
-        input,
-    }
-}
-
-fn run(bytes: &[u8], name: &str, limits: &Limits) -> (Result<WalkStats, WalkError>, Recorder, Env) {
-    let e = env(bytes);
-    let mut rec = Recorder::default();
-    let r = walk_file(&e.input, name, &e.tmp, limits, &mut rec);
-    (r, rec, e)
-}
-
-fn assert_tmp_empty(tmp: &Path) {
-    let left: Vec<_> = std::fs::read_dir(tmp).unwrap().collect();
-    assert!(left.is_empty(), "tmp_dir not empty: {left:?}");
-}
 
 #[test]
 fn limits_default_matches_spec() {
@@ -465,7 +359,7 @@ fn encrypted_zip_fails_alone() {
 }
 
 #[test]
-fn seven_zip_and_rar_are_placeholders() {
+fn broken_seven_zip_fails_alone() {
     let seven = b"7z\xBC\xAF\x27\x1C\x00\x04rest".to_vec();
     let z = zip(&[("a.7z", &seven), ("IM", &dicom("1"))]);
     let (r, rec, e) = run(&z, "o.zip", &Limits::default());
@@ -474,7 +368,7 @@ fn seven_zip_and_rar_are_placeholders() {
         rec.failed,
         vec![(
             "o.zip!/a.7z".to_string(),
-            "unsupported archive type".to_string()
+            "cannot read archive: truncated".to_string()
         )]
     );
     assert_eq!(rec.paths(), vec!["o.zip!/IM"]);

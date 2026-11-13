@@ -4,6 +4,9 @@
 mod count;
 mod detect;
 mod nifti;
+#[cfg(feature = "rar")]
+mod rar;
+mod sevenz;
 mod walk;
 
 pub use detect::{Kind, SNIFF_LEN, detect};

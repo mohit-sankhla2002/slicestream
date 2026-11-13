@@ -1,5 +1,6 @@
-//! Recursive, streaming walk over an uploaded file: ZIP, tar and gzip
-//! containers (nested to `max_depth`), DICOM and NIfTI leaves.
+//! Recursive, streaming walk over an uploaded file: ZIP, tar, gzip, 7z and
+//! RAR (feature `rar`) containers (nested to `max_depth`), DICOM and NIfTI
+//! leaves.
 //!
 //! Input is untrusted. Entry names are only reported, never used as paths;
 //! nested containers are spooled to `NamedTempFile`s in `tmp_dir` that are
@@ -8,12 +9,14 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
 use tempfile::NamedTempFile;
 
 use crate::count::{Budget, Counted};
+use crate::sevenz::{self, Problem};
 use crate::{Kind, SNIFF_LEN, detect};
 
 /// Safety limits for one walk (`[archives]` config).
@@ -59,9 +62,10 @@ pub struct Leaf<'a> {
 pub enum Event<'a> {
     /// A container could not be read; its siblings are still walked.
     ContainerFailed { path: &'a str, reason: String },
-    /// One entry of a random-access container (ZIP) could not be read
-    /// (bad local header, CRC mismatch, unsupported method, encrypted); the
-    /// rest of the container is still walked.
+    /// One entry could not be read (bad local header, CRC mismatch,
+    /// unsupported method, encrypted) and the rest of the container is still
+    /// walked: ZIP entries, non-solid RAR entries, and the entries of one 7z
+    /// block (a broken solid block fails all its remaining entries).
     EntryFailed { path: &'a str, reason: String },
     /// An entry that is neither a container, DICOM nor NIfTI (or a DICOMDIR,
     /// or a GNU sparse tar entry).
@@ -176,7 +180,7 @@ impl Walker<'_> {
                 let mut src = Counted::new(file, self.budget, true);
                 self.leaf(name, kind, false, &head, &[], &mut src)
             }
-            kind => self.container(file, kind, name, 0),
+            kind => self.container(file, path, kind, name, 0),
         }
     }
 
@@ -229,15 +233,29 @@ impl Walker<'_> {
         self.settle(res, read_error)
     }
 
-    /// Walk a container held in a local file. Failures of this container
-    /// become a `ContainerFailed` event; aborts and I/O errors propagate.
-    fn container(&mut self, file: File, kind: Kind, path: &str, depth: u32) -> Result<(), Fail> {
+    /// Walk a container held in the local file `disk` (`file` is open on
+    /// it). Failures of this container become a `ContainerFailed` event;
+    /// aborts and I/O errors propagate.
+    fn container(
+        &mut self,
+        file: File,
+        disk: &Path,
+        kind: Kind,
+        path: &str,
+        depth: u32,
+    ) -> Result<(), Fail> {
         let res = match kind {
             Kind::Zip => self.zip(file, path, depth),
             Kind::Tar => self.tar(BufReader::new(file), path, depth, true),
             Kind::Gzip => self.gzip(file, path, depth),
-            // Task 4 adds these.
-            Kind::SevenZ | Kind::Rar => Err(Fail::Container("unsupported archive type".into())),
+            Kind::SevenZ => self.seven_z(file, path, depth),
+            #[cfg(feature = "rar")]
+            Kind::Rar => self.rar(disk, path, depth),
+            #[cfg(not(feature = "rar"))]
+            Kind::Rar => {
+                let _ = disk;
+                Err(Fail::Container("RAR support not built in".into()))
+            }
             Kind::Dicom | Kind::Nifti | Kind::Other => Ok(()),
         };
         match res {
@@ -283,6 +301,17 @@ impl Walker<'_> {
         path: &str,
         depth: u32,
     ) -> Result<(), Fail> {
+        let Some(depth) = self.deeper(path, depth) else {
+            return Ok(());
+        };
+        let spool = self.spool(head, src)?;
+        self.container(reopen(&spool)?, spool.path(), kind, path, depth)
+        // `spool` is dropped (and deleted) here.
+    }
+
+    /// The depth for a container nested at `depth`, or `None` (reported)
+    /// when that is too deep.
+    fn deeper(&mut self, path: &str, depth: u32) -> Option<u32> {
         let max = self.budget.limits().max_depth;
         let depth = depth.saturating_add(1);
         if depth > max {
@@ -290,13 +319,16 @@ impl Walker<'_> {
                 path,
                 reason: format!("too deeply nested (limit {max})"),
             });
-            return Ok(());
+            return None;
         }
-        let spool = self.spool(head, src)?;
-        let mut file = spool.as_file().try_clone().map_err(Fail::Io)?;
-        file.seek(SeekFrom::Start(0)).map_err(Fail::Io)?;
-        self.container(file, kind, path, depth)
-        // `spool` is dropped (and deleted) here.
+        Some(depth)
+    }
+
+    /// Read everything left in `src` (counted) and drop it.
+    fn drain<R: Read>(&self, src: &mut Counted<'_, R>) -> Result<(), Fail> {
+        let res = io::copy(src, &mut io::sink()).map(drop);
+        let read_error = src.take_error();
+        self.settle(res, read_error)
     }
 
     /// Copy `head` + the rest of `src` to a temp file in `tmp_dir`. The bytes
@@ -485,6 +517,309 @@ impl Walker<'_> {
         Ok(())
     }
 
+    /// 7z through `sevenz-rust2`, after `sevenz::check` has vetted the
+    /// header. Blocks are decoded one at a time; every byte decoded (also for
+    /// entries that are skipped, which a solid block must decode to reach
+    /// later ones) is read through a `Counted`. A block that fails fails its
+    /// remaining entries; other blocks are still walked.
+    fn seven_z(&mut self, file: File, path: &str, depth: u32) -> Result<(), Fail> {
+        use sevenz_rust2::{Archive, ArchiveEntry, BlockDecoder, Password};
+
+        let remaining = self
+            .budget
+            .limits()
+            .max_entries
+            .saturating_sub(self.budget.entries());
+        match sevenz::check(&file, remaining, self.budget) {
+            Ok(c) if c.empty => return Ok(()),
+            Ok(_) => {}
+            Err(Problem::TooManyEntries) => return Err(Fail::Abort(self.budget.abort_entries())),
+            Err(Problem::Encrypted) => return Err(Fail::Container("encrypted archive".into())),
+            Err(Problem::Bad(m)) => return Err(Fail::Container(cannot_read(m))),
+            Err(Problem::Abort(r)) => return Err(Fail::Abort(r)),
+            Err(Problem::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(Fail::Container(cannot_read("truncated")));
+            }
+            Err(Problem::Io(e)) => return Err(Fail::Io(e)),
+        }
+        let password = Password::empty();
+        let mut src = BufReader::new(file);
+        let archive = catch_unwind(AssertUnwindSafe(|| Archive::read(&mut src, &password)))
+            .map_err(|_| Fail::Container(cannot_read(INTERNAL)))?
+            .map_err(|e| Fail::Container(cannot_read(e)))?;
+
+        // Directories, anti-items and symlinks are not entries (as in ZIP).
+        let is_entry = |f: &ArchiveEntry| !(f.is_directory || f.is_anti_item || is_symlink_7z(f));
+        let encrypted: Vec<bool> = archive
+            .blocks
+            .iter()
+            .map(|b| {
+                b.coders
+                    .iter()
+                    .any(|c| c.encoder_method_id() == sevenz::ID_AES)
+            })
+            .collect();
+        // Every file with data encrypted: the archive is.
+        let (mut files, mut locked) = (0usize, 0usize);
+        for (i, f) in archive.files.iter().enumerate() {
+            if f.has_stream && is_entry(f) {
+                files += 1;
+                let block = archive
+                    .stream_map
+                    .file_block_index
+                    .get(i)
+                    .copied()
+                    .flatten();
+                locked += usize::from(block.is_some_and(|b| encrypted.get(b) == Some(&true)));
+            }
+        }
+        if files > 0 && locked == files {
+            return Err(Fail::Container("encrypted archive".into()));
+        }
+
+        let budget = self.budget;
+        for (b, &is_encrypted) in encrypted.iter().enumerate() {
+            let first = archive.stream_map.block_first_file_index.get(b).copied();
+            let count = BlockDecoder::new(1, b, &archive, &password, &mut src).entry_count();
+            let members = first
+                .and_then(|f| archive.files.get(f..f.checked_add(count)?))
+                .ok_or_else(|| Fail::Container(cannot_read("bad block layout")))?;
+            // sevenz-rust2 hands out a block's entries as this contiguous
+            // run of the file list; a file without data inside it would
+            // displace a later one (which would then never be read).
+            if !members.iter().all(|f| f.has_stream) {
+                return Err(Fail::Container(cannot_read("unsupported entry order")));
+            }
+            if is_encrypted {
+                for f in members.iter().filter(|f| is_entry(f)) {
+                    self.count_entry()?;
+                    self.sink.event(Event::EntryFailed {
+                        path: &format!("{path}!/{}", f.name),
+                        reason: "encrypted archive".into(),
+                    });
+                }
+                continue;
+            }
+            // Index (in `members`) of the entry being handed out, if its
+            // callback has not finished; and how many callbacks started.
+            let mut current: Option<usize> = None;
+            let mut started = 0usize;
+            let mut fatal: Option<Fail> = None;
+            let mut broken: Option<String> = None;
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                let dec = BlockDecoder::new(1, b, &archive, &password, &mut src);
+                dec.for_each_entries(&mut |entry, r| {
+                    current = Some(started);
+                    started += 1;
+                    let entry_path = format!("{path}!/{}", entry.name);
+                    let mut s = Counted::new(PanicGuard(r), budget, true);
+                    let res = if is_entry(entry) {
+                        self.entry(&mut s, &entry_path, depth)
+                    } else {
+                        Ok(())
+                    };
+                    // Whatever was not read must still be decoded (and
+                    // counted) before the next entry of the block.
+                    match res.and_then(|()| self.drain(&mut s)) {
+                        Ok(()) => {
+                            current = None;
+                            Ok(true)
+                        }
+                        Err(Fail::Container(reason)) => {
+                            broken = Some(reason);
+                            Ok(false)
+                        }
+                        Err(f) => {
+                            fatal = Some(f);
+                            Ok(false)
+                        }
+                    }
+                })
+            }));
+            if let Some(f) = fatal {
+                return Err(f);
+            }
+            let reason = match res {
+                Err(_) => Some(cannot_read(INTERNAL)),
+                Ok(Err(e)) => Some(cannot_read(e)),
+                Ok(Ok(_)) => broken,
+            };
+            let Some(reason) = reason else { continue };
+            // The entry in progress (already counted, if an entry) and every
+            // later one in the block fail.
+            for (k, f) in members.iter().enumerate().skip(current.unwrap_or(started)) {
+                if !is_entry(f) {
+                    continue;
+                }
+                if Some(k) != current {
+                    self.count_entry()?;
+                }
+                self.sink.event(Event::EntryFailed {
+                    path: &format!("{path}!/{}", f.name),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        // Files without data (none of them inside a block, checked above).
+        for f in &archive.files {
+            if !f.has_stream && is_entry(f) {
+                let mut s = Counted::new(io::empty(), budget, true);
+                self.entry(&mut s, &format!("{path}!/{}", f.name), depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// RAR through UnRAR: one listing pass (entry count, encryption,
+    /// dictionary sizes, volumes), then one pass that tests each entry,
+    /// streaming its data into a spool in `tmp_dir`. UnRAR itself never
+    /// writes a file. Non-solid archives fail per entry; in a solid archive
+    /// a failed entry fails the rest of the archive.
+    #[cfg(feature = "rar")]
+    fn rar(&mut self, disk: &Path, path: &str, depth: u32) -> Result<(), Fail> {
+        use crate::rar::{Mode, Op, Rar};
+
+        let reason = |e: crate::rar::Error| {
+            if e.encrypted() {
+                "encrypted archive".to_string()
+            } else {
+                cannot_read(e)
+            }
+        };
+        let fail = |e| Fail::Container(reason(e));
+        let budget = self.budget;
+        let remaining = budget.limits().max_entries.saturating_sub(budget.entries());
+
+        let mut list = Rar::open(disk, Mode::List).map_err(fail)?;
+        if list.encrypted_headers() {
+            return Err(Fail::Container("encrypted archive".into()));
+        }
+        if list.is_volume() {
+            return Err(Fail::Container(cannot_read("multi-volume archive")));
+        }
+        let (mut declared, mut files, mut locked) = (0u64, 0u64, 0u64);
+        while let Some(h) = list.read_header().map_err(fail)? {
+            declared += 1;
+            if declared > remaining {
+                return Err(Fail::Abort(budget.abort_entries()));
+            }
+            if h.dictionary() > sevenz::MAX_DICT {
+                return Err(Fail::Container(cannot_read(format!(
+                    "dictionary too large (limit {} MiB)",
+                    sevenz::MAX_DICT >> 20
+                ))));
+            }
+            if h.is_file() {
+                files += 1;
+                locked += u64::from(h.encrypted());
+            }
+            list.process(Op::Skip, &mut |_| true).map_err(fail)?;
+        }
+        drop(list);
+        if files > 0 && locked == files {
+            return Err(Fail::Container("encrypted archive".into()));
+        }
+
+        let mut ar = Rar::open(disk, Mode::Extract).map_err(fail)?;
+        let solid = ar.is_solid();
+        // Count decoded bytes that are thrown away.
+        let mut count_only = |d: &[u8]| budget.add_bytes(d.len() as u64).is_ok();
+        while let Some(h) = ar.read_header().map_err(fail)? {
+            let entry_path = format!("{path}!/{}", h.name);
+            if !h.is_file() || h.encrypted() {
+                if h.is_file() {
+                    self.count_entry()?;
+                    if solid {
+                        return Err(Fail::Container("encrypted archive".into()));
+                    }
+                    self.sink.event(Event::EntryFailed {
+                        path: &entry_path,
+                        reason: "encrypted archive".into(),
+                    });
+                }
+                // A solid archive decodes skipped data too: count it.
+                let op = if solid { Op::Test } else { Op::Skip };
+                let res = ar.process(op, &mut count_only);
+                if let Some(r) = budget.aborted() {
+                    return Err(Fail::Abort(r));
+                }
+                res.map_err(fail)?;
+                continue;
+            }
+            let spool = NamedTempFile::new_in(self.tmp_dir).map_err(Fail::Io)?;
+            let mut write_error = None;
+            let res = {
+                let mut w = BufWriter::with_capacity(64 * 1024, spool.as_file());
+                let res = ar.process(Op::Test, &mut |d| {
+                    if budget.add_bytes(d.len() as u64).is_err() {
+                        return false;
+                    }
+                    if let Err(e) = w.write_all(d) {
+                        write_error = Some(e);
+                        return false;
+                    }
+                    true
+                });
+                if let Err(e) = w.flush()
+                    && write_error.is_none()
+                {
+                    write_error = Some(e);
+                }
+                res
+            };
+            if let Some(r) = budget.aborted() {
+                return Err(Fail::Abort(r));
+            }
+            if let Some(e) = write_error {
+                return Err(Fail::Io(e));
+            }
+            match res {
+                Ok(()) => self.entry_file(&spool, &entry_path, depth)?,
+                Err(e) => {
+                    self.count_entry()?;
+                    let reason = reason(e);
+                    if solid {
+                        // Later entries depend on this one's data.
+                        return Err(Fail::Container(reason));
+                    }
+                    self.sink.event(Event::EntryFailed {
+                        path: &entry_path,
+                        reason,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One entry already decoded into `spool`: classify it, then skip it,
+    /// hand it to the sink, or walk it in place as a nested container.
+    #[cfg(feature = "rar")]
+    fn entry_file(&mut self, spool: &NamedTempFile, path: &str, depth: u32) -> Result<(), Fail> {
+        self.count_entry()?;
+        let mut file = reopen(spool)?;
+        let head = read_head(&mut file).map_err(Fail::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(Fail::Io)?;
+        match detect(&head) {
+            Kind::Other => {
+                self.sink.event(Event::Skipped { path });
+                Ok(())
+            }
+            Kind::Dicom if is_dicomdir(&head) => {
+                self.sink.event(Event::Skipped { path });
+                Ok(())
+            }
+            kind @ (Kind::Dicom | Kind::Nifti) => {
+                let mut src = Counted::new(file, self.budget, true);
+                self.leaf(path, kind, false, &head, &[], &mut src)
+            }
+            kind => match self.deeper(path, depth) {
+                Some(depth) => self.container(file, spool.path(), kind, path, depth),
+                None => Ok(()),
+            },
+        }
+    }
+
     /// gzip: peek the decompressed head and classify the inner stream. The
     /// decompressed layer keeps the gzip's path: `x.zip.gz!/IM1`.
     fn gzip(&mut self, file: File, path: &str, depth: u32) -> Result<(), Fail> {
@@ -515,6 +850,33 @@ impl Walker<'_> {
             }
         }
     }
+}
+
+/// Reason detail when a decoder library panicked (caught).
+const INTERNAL: &str = "internal decoder error";
+
+/// A fresh handle on a spooled file, at its start.
+fn reopen(spool: &NamedTempFile) -> Result<File, Fail> {
+    let mut file = spool.as_file().try_clone().map_err(Fail::Io)?;
+    file.seek(SeekFrom::Start(0)).map_err(Fail::Io)?;
+    Ok(file)
+}
+
+/// Turns a panic inside a decoder's `read` into an error, so it never
+/// unwinds through the sink.
+struct PanicGuard<R>(R);
+
+impl<R: Read> Read for PanicGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        catch_unwind(AssertUnwindSafe(|| self.0.read(buf)))
+            .unwrap_or_else(|_| Err(io::Error::other(INTERNAL)))
+    }
+}
+
+/// A 7z symlink: Unix mode (high 16 bits, flagged by 0x8000) S_IFLNK.
+fn is_symlink_7z(f: &sevenz_rust2::ArchiveEntry) -> bool {
+    let a = f.windows_attributes;
+    f.has_windows_attributes && a & 0x8000 != 0 && (a >> 16) & 0o170000 == 0o120000
 }
 
 /// Cap on a ZIP central directory (the zip crate holds it all in memory).

@@ -10,6 +10,12 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["rar"]
+# RAR reading through the bundled UnRAR library (freeware licence, not
+# OSI-approved). Turn off for a purely OSI build.
+rar = ["dep:unrar_sys"]
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 flate2 = "1.1.11"
@@ -17,6 +23,13 @@ fs4 = "1.1.0"
 tar = "0.4.46"
 tempfile = "3"
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2", "deflate64"] }
+# Decoders only (LZMA/LZMA2 are built in); 0.20 is the last release for Rust 1.88.
+sevenz-rust2 = { version = "=0.20.2", default-features = false, features = ["bzip2", "deflate"] }
+# Same version sevenz-rust2 uses; decodes compressed 7z headers for the pre-check.
+lzma-rust2 = { version = "0.16", default-features = false, features = ["std"] }
+crc32fast = "1"
+unrar_sys = { version = "=0.5.8", optional = true }
 
 [dev-dependencies]
 sha2 = "0.10"
+sevenz-rust2 = { version = "=0.20.2", default-features = false, features = ["compress", "aes256"] }
