@@ -17,7 +17,6 @@ use axum::routing::{get, post};
 use slicestream_core::SchedulerConfig;
 use slicestream_dimse::StoreScp;
 use slicestream_store::Ingestor;
-use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
@@ -321,58 +320,6 @@ where
     }
 }
 
-/// Counts from [`import_dir`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ImportReport {
-    /// Newly stored (including overwrites under `on_duplicate = "overwrite"`).
-    pub stored: usize,
-    /// Already present.
-    pub duplicate: usize,
-    /// Looked like DICOM but could not be ingested.
-    pub failed: usize,
-    /// Not Part-10 DICOM (no `DICM` at byte 128), left alone.
-    pub skipped: usize,
-}
-
-/// Ingest every Part-10 file in `dir` (and its sub-directories when
-/// `recursive`) through the normal pipeline. Files are processed in path
-/// order; per-file errors are logged and counted, never fatal.
-pub async fn import_dir(ingestor: &Ingestor, dir: &Path, recursive: bool) -> ImportReport {
-    let mut report = ImportReport::default();
-    let mut dirs = vec![dir.to_path_buf()];
-    while let Some(d) = dirs.pop() {
-        let (subdirs, mut files) = list_dir(&d, &mut |_: &Path, _| report.failed += 1).await;
-        if recursive {
-            dirs.extend(subdirs);
-        }
-        files.sort();
-        for path in files {
-            match is_part10(&path).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::debug!(path = %path.display(), "skipping non-DICOM file");
-                    report.skipped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), "cannot read file: {e}");
-                    report.failed += 1;
-                    continue;
-                }
-            }
-            match ingestor.import_file(&path).await {
-                Ok(s) if s.duplicate => report.duplicate += 1,
-                Ok(_) => report.stored += 1,
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), "import failed: {e}");
-                    report.failed += 1;
-                }
-            }
-        }
-    }
-    report
-}
-
 /// Sub-directories and regular files of `dir`. Symlinks to files are
 /// followed; symlinks to directories are not, so recursion cannot loop.
 /// An unreadable directory or entry is logged and passed to `on_error`
@@ -419,20 +366,4 @@ pub(crate) async fn list_dir(
         }
     }
     (dirs, files)
-}
-
-/// Whether the file has a Part-10 preamble: at least 132 bytes with `DICM`
-/// at offset 128.
-async fn is_part10(path: &Path) -> std::io::Result<bool> {
-    let mut f = tokio::fs::File::open(path).await?;
-    let mut head = [0u8; 132];
-    let mut n = 0;
-    while n < head.len() {
-        let read = f.read(&mut head[n..]).await?;
-        if read == 0 {
-            return Ok(false);
-        }
-        n += read;
-    }
-    Ok(&head[128..132] == b"DICM")
 }

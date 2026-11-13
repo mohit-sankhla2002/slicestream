@@ -6,6 +6,7 @@ mod phantom;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dicom_core::{DataElement, VR, dicom_value};
@@ -20,13 +21,41 @@ use dicom_ul::pdu::{PDataValue, PDataValueType};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use slicestream_core::protocol::decode_frame;
+use slicestream_server::archive_ingest::{EntryResult, Progress, process_dir};
 use slicestream_server::config::Config;
-use slicestream_server::{Running, import_dir, start};
-use slicestream_store::{Ingestor, StorageConfig};
+use slicestream_server::{Running, start};
+use slicestream_store::{Ingestor, StorageConfig, UploadCounts};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
+
+struct Quiet;
+
+impl Progress for Quiet {
+    fn entry(&self, _: &EntryResult) {}
+    fn stats(&self, _: u64, _: u64) {}
+}
+
+/// What `slicestream-server import <dir>` does for a folder.
+async fn import_dir(ingestor: &Arc<Ingestor>, dir: &Path, recursive: bool) -> UploadCounts {
+    let id = ingestor
+        .index()
+        .create_upload("import", "in", None)
+        .await
+        .unwrap();
+    let limits = Config::default().archives.limits();
+    process_dir(
+        Arc::clone(ingestor),
+        dir,
+        recursive,
+        id,
+        limits,
+        Arc::new(Quiet),
+    )
+    .await
+    .counts
+}
 
 const SERIES: &str = "2.25.1000000000000000000000000000001";
 const BOUNDARY: &str = "XXe2eXX";
@@ -330,15 +359,15 @@ async fn import_command_counts() {
     .unwrap();
 
     let report = import_dir(&ingestor, &data, false).await;
-    assert_eq!(report.stored, 4);
+    assert_eq!(report.dicom_stored, 4);
     assert_eq!(report.skipped, 1);
-    assert_eq!(report.duplicate, 0);
+    assert_eq!(report.dicom_duplicate, 0);
     assert_eq!(report.failed, 0);
 
     // Importing again: every DICOM file is a duplicate.
     let again = import_dir(&ingestor, &data, false).await;
-    assert_eq!(again.stored, 0);
-    assert_eq!(again.duplicate, 4);
+    assert_eq!(again.dicom_stored, 0);
+    assert_eq!(again.dicom_duplicate, 4);
     assert_eq!(again.skipped, 1);
 }
 
@@ -354,8 +383,8 @@ async fn import_recursive_descends() {
     .await
     .unwrap();
 
-    assert_eq!(import_dir(&ingestor, &data, false).await.stored, 0);
-    assert_eq!(import_dir(&ingestor, &data, true).await.stored, 2);
+    assert_eq!(import_dir(&ingestor, &data, false).await.dicom_stored, 0);
+    assert_eq!(import_dir(&ingestor, &data, true).await.dicom_stored, 2);
 }
 
 fn write(dir: &Path, name: &str, text: &str) -> PathBuf {
@@ -454,7 +483,7 @@ async fn import_counts_unreadable_dir_as_failed() {
         eprintln!("skipping: running with privileges that bypass mode 000");
         return;
     }
-    assert_eq!(report.stored, 2, "{report:?}");
+    assert_eq!(report.dicom_stored, 2, "{report:?}");
     assert_eq!(report.failed, 1, "{report:?}");
 }
 

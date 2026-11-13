@@ -1,7 +1,8 @@
 //! Reference server for slicestream.
 //!
 //! ```sh
-//! slicestream-server import data/phantom          # ingest existing files
+//! slicestream-server import data/phantom          # ingest a folder of files
+//! slicestream-server import scans.zip              # or an archive, NIfTI or DICOM file
 //! slicestream-server --config slicestream.toml   # same as `serve --config ...`
 //! ```
 //!
@@ -13,18 +14,22 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
+use slicestream_server::archive_ingest::{
+    EntryOutcome, EntryResult, Progress, UploadSource, process_dir, process_upload,
+};
 use slicestream_server::config::Config;
-use slicestream_server::{import_dir, start};
+use slicestream_server::start;
 use slicestream_store::{IngestError, Ingestor};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
 #[command(version, about = "DICOM server that streams slices in scroll order")]
 struct Cli {
-    /// TOML configuration file (`import` uses only `[storage]`).
+    /// TOML configuration file (`import` uses `[storage]` and `[archives]`).
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -35,11 +40,13 @@ struct Cli {
 enum Command {
     /// Run the HTTP/WebSocket server and the DIMSE storage SCP (default).
     Serve,
-    /// Ingest existing DICOM files into storage.
+    /// Ingest DICOM, NIfTI and archives (zip, tar, tar.gz, 7z, rar) into
+    /// storage. PATH is a folder or a single file; archives are opened,
+    /// nested ones too, within the `[archives]` limits.
     Import {
-        /// Directory holding Part-10 files.
-        dir: PathBuf,
-        /// Descend into sub-directories.
+        /// Folder or file to ingest.
+        path: PathBuf,
+        /// Descend into sub-directories (folders only).
         #[arg(long)]
         recursive: bool,
     },
@@ -47,12 +54,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
-    tracing_subscriber::fmt::init();
+    // Logs go to stderr; stdout carries command output.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
     let config = Config::load(cli.config.as_deref())?;
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(config).await,
-        Command::Import { dir, recursive } => import(config, dir, recursive).await,
+        Command::Import { path, recursive } => import(config, path, recursive).await,
     }
 }
 
@@ -75,13 +85,29 @@ async fn serve(config: Config) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn import(config: Config, dir: PathBuf, recursive: bool) -> anyhow::Result<ExitCode> {
-    if !dir.is_dir() {
-        bail!("{} is not a directory", dir.display());
+/// Logs failed entries; stdout stays free for the summary.
+struct WarnFailures;
+
+impl Progress for WarnFailures {
+    fn entry(&self, r: &EntryResult) {
+        if r.outcome == EntryOutcome::Failed {
+            tracing::warn!(
+                path = %r.path,
+                "failed: {}",
+                r.reason.as_deref().unwrap_or("unknown error")
+            );
+        }
     }
+
+    fn stats(&self, _entries_seen: u64, _bytes_expanded: u64) {}
+}
+
+async fn import(config: Config, path: PathBuf, recursive: bool) -> anyhow::Result<ExitCode> {
+    let meta = std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
     // `import` owns the storage root like `serve` does, so it cannot run
     // beside a server on the same root.
     let root = config.storage.root.clone();
+    let limits = config.archives.limits();
     let ingestor = match Ingestor::open(config.storage).await {
         Ok(i) => i,
         Err(IngestError::Locked { .. }) => bail!(
@@ -100,12 +126,51 @@ async fn import(config: Config, dir: PathBuf, recursive: bool) -> anyhow::Result
         orphans_removed = report.orphans_removed,
         "storage ready"
     );
-    let r = import_dir(&ingestor, &dir, recursive).await;
-    println!(
-        "stored {} / duplicate {} / failed {} (skipped {} non-DICOM)",
-        r.stored, r.duplicate, r.failed, r.skipped
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
     );
-    Ok(if r.failed > 0 {
+    let upload_id = ingestor
+        .index()
+        .create_upload("import", &name, None)
+        .await
+        .context("recording the upload")?;
+    let progress: Arc<dyn Progress> = Arc::new(WarnFailures);
+    let outcome = if meta.is_dir() {
+        process_dir(ingestor, &path, recursive, upload_id, limits, progress).await
+    } else {
+        let source = UploadSource::Import { root: path.clone() };
+        process_upload(ingestor, path, name, upload_id, source, limits, progress).await
+    };
+
+    for p in &outcome.patients {
+        let images: u64 = p.studies.iter().map(|s| s.instances).sum();
+        println!(
+            "{} {}: {} studies, {} images",
+            p.patient_id,
+            p.patient_name.as_deref().unwrap_or(""),
+            p.studies.len(),
+            images
+        );
+    }
+    let c = &outcome.counts;
+    println!(
+        "stored {} \u{b7} duplicate {} \u{b7} nifti {} (linked {}, unassigned {}) \u{b7} skipped {} \u{b7} failed {}",
+        c.dicom_stored,
+        c.dicom_duplicate,
+        c.nifti_stored + c.nifti_duplicate,
+        outcome.nifti.linked,
+        outcome.nifti.unassigned,
+        c.skipped,
+        c.failed
+    );
+    if outcome.status == "aborted" {
+        println!(
+            "aborted: {}",
+            outcome.reason.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(if c.failed > 0 || outcome.status == "aborted" {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -158,7 +223,7 @@ mod tests {
     #[test]
     fn config_accepted_in_either_position() {
         let expected = Command::Import {
-            dir: PathBuf::from("d"),
+            path: PathBuf::from("d"),
             recursive: false,
         };
         for args in [
