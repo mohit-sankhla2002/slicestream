@@ -50,6 +50,9 @@ pub struct HttpConfig {
     /// 421. Empty: `localhost`, `127.0.0.1`, `[::1]` and the host of `addr`,
     /// each with or without the port of `addr`.
     pub allowed_hosts: Vec<String>,
+    /// Serve `/api/metrics`, `/api/metrics/history` and `/api/console/series`
+    /// and run the background sampler.
+    pub metrics_enabled: bool,
 }
 
 impl Default for HttpConfig {
@@ -61,6 +64,7 @@ impl Default for HttpConfig {
             web_dir: PathBuf::from("web"),
             cors_allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
+            metrics_enabled: true,
         }
     }
 }
@@ -77,6 +81,7 @@ impl std::fmt::Debug for HttpConfig {
             .field("web_dir", &self.web_dir)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_hosts", &self.allowed_hosts)
+            .field("metrics_enabled", &self.metrics_enabled)
             .finish()
     }
 }

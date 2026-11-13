@@ -338,8 +338,12 @@ struct Prev {
 }
 
 /// Starts the sampler: one sample immediately, then one per second until
-/// `shutdown` is cancelled.
-pub fn spawn_sampler(sources: MetricsSources, shutdown: CancellationToken) -> Arc<Metrics> {
+/// `shutdown` is cancelled. The handle finishes once the sampler has stopped
+/// and released its sources (notably the storage lock).
+pub fn spawn_sampler(
+    sources: MetricsSources,
+    shutdown: CancellationToken,
+) -> (Arc<Metrics>, tokio::task::JoinHandle<()>) {
     let metrics = Arc::new(Metrics {
         ring: Mutex::new(Ring::new(HISTORY_LEN)),
         static_info: StaticInfo {
@@ -350,7 +354,7 @@ pub fn spawn_sampler(sources: MetricsSources, shutdown: CancellationToken) -> Ar
         },
     });
     let m = Arc::clone(&metrics);
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(SAMPLE_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let started = Instant::now();
@@ -462,7 +466,7 @@ pub fn spawn_sampler(sources: MetricsSources, shutdown: CancellationToken) -> Ar
             }
         }
     });
-    metrics
+    (metrics, handle)
 }
 
 #[cfg(test)]
@@ -588,7 +592,7 @@ mod tests {
         .await
         .unwrap();
         let shutdown = CancellationToken::new();
-        let m = spawn_sampler(
+        let (m, _handle) = spawn_sampler(
             MetricsSources {
                 ingestor: ing,
                 gauges: Arc::new(Gauges::default()),

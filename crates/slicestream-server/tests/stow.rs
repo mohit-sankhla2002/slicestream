@@ -64,6 +64,8 @@ async fn harness_with(
         scheduler: SchedulerConfig::default(),
         ingestor: Arc::clone(&ingestor),
         http: cfg,
+        metrics: None,
+        gauges: Default::default(),
     });
     Harness {
         router: app(state),
@@ -424,6 +426,8 @@ async fn post_instance_too_large_413() {
             allowed_hosts: vec![HOST.into()],
             ..HttpConfig::default()
         },
+        metrics: None,
+        gauges: Default::default(),
     }));
     let (status, json) = send(
         &router,

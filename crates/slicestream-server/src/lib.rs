@@ -11,6 +11,7 @@ use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderName, HeaderValue, Method};
+use axum::middleware::Next;
 use axum::routing::{get, post};
 use slicestream_core::SchedulerConfig;
 use slicestream_dimse::StoreScp;
@@ -23,9 +24,7 @@ use tower_http::services::ServeDir;
 pub mod catalog;
 pub mod config;
 pub mod hosts;
-// wired in by the console endpoints task
-#[allow(dead_code)]
-pub(crate) mod metrics;
+pub mod metrics;
 pub mod routes;
 pub mod stow;
 pub mod stream;
@@ -38,6 +37,10 @@ pub struct AppState {
     pub ingestor: Arc<Ingestor>,
     pub scheduler: SchedulerConfig,
     pub http: HttpConfig,
+    /// `None` when `metrics_enabled = false`; the console routes are then
+    /// not mounted.
+    pub metrics: Option<Arc<metrics::Metrics>>,
+    pub gauges: Arc<metrics::Gauges>,
 }
 
 /// Build the application router.
@@ -62,14 +65,33 @@ pub fn app(state: Arc<AppState>) -> Router {
         read = read.layer(cors);
     }
 
+    // Console routes reveal process and storage details: never any CORS.
+    let mut console = Router::new();
+    if state.metrics.is_some() {
+        console = console
+            .route("/api/metrics", get(routes::metrics_latest))
+            .route("/api/metrics/history", get(routes::metrics_history))
+            .route("/api/console/series", get(routes::console_series));
+    }
+
     // Every route, including static files, checks Host against DNS rebinding.
     let allowed = Arc::new(hosts::HostAllowList::from_config(&state.http));
+    let gauges = Arc::clone(&state.gauges);
     Router::new()
         .merge(read)
         .merge(ingest)
+        .merge(console)
         .fallback_service(ServeDir::new(&state.http.web_dir))
         .layer(axum::middleware::from_fn(move |req, next| {
             hosts::host_guard(Arc::clone(&allowed), req, next)
+        }))
+        // Outermost: counts every request until its response is returned.
+        .layer(axum::middleware::from_fn(move |req, next: Next| {
+            let gauges = Arc::clone(&gauges);
+            async move {
+                let _guard = metrics::GaugeGuard::enter(&gauges, metrics::Gauge::HttpInFlight);
+                next.run(req).await
+            }
         }))
         .with_state(state)
 }
@@ -126,6 +148,10 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         .with_context(|| format!("binding HTTP on {}", config.http.addr))?;
     let http_addr = listener.local_addr()?;
 
+    let dimse_max = config
+        .dimse
+        .enabled
+        .then_some(config.dimse.max_associations);
     let scp = if config.dimse.enabled {
         let addr = config.dimse.addr;
         Some(
@@ -137,6 +163,7 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         None
     };
     let dimse_addr = scp.as_ref().map(StoreScp::local_addr);
+    let dimse_active = scp.as_ref().map(StoreScp::active_associations);
 
     let report = ingestor.recover().await.context("storage recovery")?;
     tracing::info!(
@@ -152,11 +179,30 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
     // With `addr` port 0, derive the default allowed hosts from the bound port.
     let mut http = config.http;
     http.addr = http_addr;
+    let gauges = Arc::new(metrics::Gauges::default());
+    let (metrics, sampler) = match http.metrics_enabled.then(|| {
+        metrics::spawn_sampler(
+            metrics::MetricsSources {
+                ingestor: Arc::clone(&ingestor),
+                gauges: Arc::clone(&gauges),
+                dimse_active,
+                dimse_max,
+                http_addr,
+                dimse_addr,
+            },
+            shutdown.clone(),
+        )
+    }) {
+        Some((m, h)) => (Some(m), Some(h)),
+        None => (None, None),
+    };
     let state = Arc::new(AppState {
         catalog,
         ingestor,
         scheduler: SchedulerConfig::default(),
         http,
+        metrics,
+        gauges,
     });
     let router = app(state);
 
@@ -205,6 +251,10 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
             (None, Some(t)) => joined("DIMSE", t.await),
             (None, None) => Ok(()),
         };
+        // Let the sampler release the storage lock before reporting stopped.
+        if let Some(h) = sampler {
+            let _ = h.await;
+        }
         http_result.and(dimse_result)
     });
 

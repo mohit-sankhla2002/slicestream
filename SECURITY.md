@@ -28,5 +28,6 @@ slicestream is pre-1.0. Security fixes land on `main` only.
 - slicestream is **not** certified for clinical use.
 - DICOM AE titles are not authentication. Restrict DIMSE with `allowed_peers` and a firewall.
 - Set `http.stow_token` and keep `http.addr` on localhost unless a reverse proxy adds TLS and authentication.
+- `/api/metrics`, `/api/metrics/history` and `/api/console/series` reveal the process id, bind addresses, the storage path and the server load, and list all patient names. They have no token. Set `http.metrics_enabled = false`, or keep the server on localhost.
 
 See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the defaults and limits.

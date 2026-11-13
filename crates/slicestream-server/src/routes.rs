@@ -24,6 +24,39 @@ pub async fn get_series(State(state): State<Arc<AppState>>, Path(uid): Path<Stri
     }
 }
 
+fn no_store(mut res: Response) -> Response {
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+/// `GET /api/metrics`: the latest sample, 503 until the first one exists.
+pub async fn metrics_latest(State(state): State<Arc<AppState>>) -> Response {
+    let res = match state.metrics.as_ref().and_then(|m| m.latest()) {
+        Some(snap) => Json(snap).into_response(),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    no_store(res)
+}
+
+/// `GET /api/metrics/history`: up to 300 samples, oldest first.
+pub async fn metrics_history(State(state): State<Arc<AppState>>) -> Response {
+    let history = state
+        .metrics
+        .as_ref()
+        .map(|m| m.history())
+        .unwrap_or_default();
+    no_store(Json(history).into_response())
+}
+
+/// `GET /api/console/series`: every series with study and patient context.
+pub async fn console_series(State(state): State<Arc<AppState>>) -> Response {
+    match state.ingestor.index().console_series().await {
+        Ok(rows) => no_store(Json(rows).into_response()),
+        Err(e) => internal_error(&anyhow::Error::new(e)),
+    }
+}
+
 /// Log the cause and return a bare 500 (index errors are not for clients).
 pub(crate) fn internal_error(e: &anyhow::Error) -> Response {
     tracing::error!("catalog error: {e:#}");

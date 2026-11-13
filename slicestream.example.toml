@@ -9,6 +9,7 @@ max_request_bytes = 17179869184  # 16 GiB
 # stow_token = "..."
 cors_allowed_origins = []        # e.g. ["https://viewer.example.org"]; empty: no CORS
 allowed_hosts = []               # empty: localhost, 127.0.0.1, [::1], addr's host
+metrics_enabled = true           # GET /api/metrics, /api/metrics/history, /api/console/series
 
 [dimse]
 enabled = true

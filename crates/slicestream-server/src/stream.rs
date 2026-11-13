@@ -30,7 +30,9 @@ pub async fn stream_series(
         Err(e) => return crate::routes::internal_error(&e),
     };
     let scheduler = PrefetchScheduler::new(series.len(), state.scheduler);
+    let gauges = Arc::clone(&state.gauges);
     ws.on_upgrade(move |socket| async move {
+        let _guard = crate::metrics::GaugeGuard::enter(&gauges, crate::metrics::Gauge::WsStreams);
         if let Err(e) = run(socket, series, scheduler).await {
             tracing::debug!("stream closed: {e}");
         }
