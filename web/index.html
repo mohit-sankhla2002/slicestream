@@ -20,22 +20,52 @@
 <main>
   <div class="col">
     <section class="card" id="upload-card">
-      <div class="ch"><h3>Upload</h3><div class="seg"><span class="on">STOW-RS</span><span>Single file</span></div></div>
-      <div class="cb">
-        <div class="empty">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
-          <b>Upload is not wired up yet</b>
-          <small>Drag and drop, folder pick and STOW-RS land in the next build</small>
+      <div class="ch"><h3>Upload</h3>
+        <div class="seg" role="radiogroup" aria-label="Upload mode">
+          <button type="button" role="radio" data-mode="stow" class="on" aria-checked="true" title="POST /dicom-web/studies, one multipart/related request per file">STOW-RS</button>
+          <button type="button" role="radio" data-mode="single" aria-checked="false" title="POST /api/instances with Content-Type: application/dicom">Single file</button>
         </div>
+      </div>
+      <div class="cb">
+        <div class="drop" id="u-drop" role="button" tabindex="0" aria-describedby="u-drop-hint">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-4.5 4.5M12 4l4.5 4.5M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+          <b id="u-drop-title">Drop DICOM files or a folder</b>
+          <small id="u-drop-hint">or click to pick files · <button type="button" class="link" id="u-pick-dir">pick a folder</button> · one file per request</small>
+          <input type="file" id="u-files" multiple hidden>
+          <input type="file" id="u-dir" webkitdirectory multiple hidden>
+        </div>
+        <div class="row">
+          <button type="button" class="btn pri" id="u-start" disabled>Upload</button>
+          <button type="button" class="btn" id="u-clear" disabled>Clear</button>
+          <div class="grow"></div>
+          <form class="token" id="u-token-form" autocomplete="off"><label for="u-token">bearer token</label><input type="password" id="u-token" placeholder="none" autocomplete="off" spellcheck="false"></form>
+        </div>
+        <div class="progress" id="u-progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="u-bar"></i></div>
+        <div class="pmeta"><span id="u-count">no files selected</span><span id="u-rate">—</span></div>
       </div>
     </section>
     <section class="card" id="results-card">
-      <div class="ch"><h3>Ingest results</h3><span class="note">this page</span></div>
-      <div class="empty">
+      <div class="ch"><h3>Ingest results</h3>
+        <div class="counts" id="r-counts">
+          <span class="c-ok"><b id="r-stored">0</b> stored</span>
+          <span class="c-dup"><b id="r-dup">0</b> dup</span>
+          <span class="c-rep" id="r-rep-wrap" hidden><b id="r-rep">0</b> replaced</span>
+          <span class="c-bad"><b id="r-failed">0</b> failed</span>
+        </div>
+      </div>
+      <div class="empty" id="r-empty">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
         <b>No uploads yet</b>
-        <small>Each uploaded file will get a row with its status, SOP UID, size and time</small>
+        <small>Each uploaded file gets a row with its status, SOP UID, size and time</small>
       </div>
+      <div class="results" id="r-wrap" hidden>
+        <table>
+          <colgroup><col class="w-file"><col class="w-tag"><col><col class="w-n w-size"><col class="w-n"></colgroup>
+          <thead><tr><th>File</th><th>Status</th><th>SOP / reason</th><th class="n">Size</th><th class="n">Time</th></tr></thead>
+          <tbody id="r-body"></tbody>
+        </table>
+      </div>
+      <div class="rfoot" id="r-foot" hidden></div>
     </section>
   </div>
 

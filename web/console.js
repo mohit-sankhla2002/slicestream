@@ -1,6 +1,7 @@
 // Console entry: wires the header and panels together.
 import { formatDuration } from "./lib/format.js";
 import { createMetricsPanel, startMetrics } from "./metrics.js";
+import { createUploadPanel } from "./upload.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -16,6 +17,8 @@ function renderHeader(s) {
   $("h-uptime").textContent = `uptime ${formatDuration(s.uptime_secs)}`;
   $("h-addr").textContent = `http ${s.http_addr ?? "—"} · dimse ${s.dimse_addr ?? "off"}`;
 }
+
+createUploadPanel();
 
 const metrics = createMetricsPanel();
 startMetrics({
