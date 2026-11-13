@@ -18,7 +18,8 @@ pub use blob::{BlobHash, FsBlobStore, SpoolError, SpooledBlob, TempBlob};
 pub use config::StorageConfig;
 pub use header::{HeaderError, InstanceHeader, read_header};
 pub use index::{
-    DuplicatePolicy, Index, InstanceRecord, InstanceSummary, SeriesRow, SliceRow, UpsertOutcome,
+    ConsoleSeriesRow, DuplicatePolicy, Index, InstanceRecord, InstanceSummary, SeriesRow, SliceRow,
+    StorageCounts, UpsertOutcome,
 };
 pub use ingest::{
     Expectations, IngestError, IngestFailure, IngestSource, Ingestor, RecoveryReport, Stored,

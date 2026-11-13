@@ -72,6 +72,32 @@ pub struct SeriesRow {
     pub instance_count: i64,
 }
 
+/// Aggregate row counts and distinct-blob totals for the metrics sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct StorageCounts {
+    pub studies: i64,
+    pub series: i64,
+    pub instances: i64,
+    /// Total bytes over distinct blobs (a shared blob counts once).
+    pub objects_bytes: i64,
+    /// Number of distinct blobs.
+    pub objects_count: i64,
+}
+
+/// One series row for the test console.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConsoleSeriesRow {
+    pub series_uid: String,
+    pub study_uid: String,
+    pub patient_name: Option<String>,
+    pub study_date: Option<String>,
+    pub modality: Option<String>,
+    pub series_description: Option<String>,
+    pub instance_count: i64,
+    pub size_bytes: i64,
+    pub updated_at: String,
+}
+
 /// One image instance of a series (rows without `frame_info` are excluded).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SliceRow {
@@ -273,6 +299,62 @@ impl Index {
             .bind(hash.to_hex())
             .fetch_one(&self.pool)
             .await
+    }
+
+    pub async fn storage_counts(&self) -> Result<StorageCounts, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT (SELECT COUNT(*) FROM studies),
+                    (SELECT COUNT(*) FROM series),
+                    (SELECT COUNT(*) FROM instances),
+                    (SELECT COALESCE(SUM(sz), 0) FROM
+                        (SELECT MAX(size_bytes) AS sz FROM instances GROUP BY blob_sha256)),
+                    (SELECT COUNT(*) FROM
+                        (SELECT 1 FROM instances GROUP BY blob_sha256))",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(StorageCounts {
+            studies: row.try_get(0)?,
+            series: row.try_get(1)?,
+            instances: row.try_get(2)?,
+            objects_bytes: row.try_get(3)?,
+            objects_count: row.try_get(4)?,
+        })
+    }
+
+    /// All series with study/patient context and instance aggregates, most
+    /// recently updated first.
+    pub async fn console_series(&self) -> Result<Vec<ConsoleSeriesRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT s.series_instance_uid, st.study_instance_uid, p.patient_name,
+                    st.study_date, s.modality, s.series_description,
+                    COUNT(i.id) AS instance_count,
+                    COALESCE(SUM(i.size_bytes), 0) AS size_bytes,
+                    s.updated_at
+             FROM series s
+             JOIN studies st ON st.id = s.study_fk
+             JOIN patients p ON p.id = st.patient_fk
+             LEFT JOIN instances i ON i.series_fk = s.id
+             GROUP BY s.id
+             ORDER BY s.updated_at DESC, s.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ConsoleSeriesRow {
+                    series_uid: r.try_get(0)?,
+                    study_uid: r.try_get(1)?,
+                    patient_name: r.try_get(2)?,
+                    study_date: r.try_get(3)?,
+                    modality: r.try_get(4)?,
+                    series_description: r.try_get(5)?,
+                    instance_count: r.try_get(6)?,
+                    size_bytes: r.try_get(7)?,
+                    updated_at: r.try_get(8)?,
+                })
+            })
+            .collect()
     }
 
     pub async fn list_series(&self) -> Result<Vec<SeriesRow>, sqlx::Error> {

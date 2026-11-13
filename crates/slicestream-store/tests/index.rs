@@ -5,7 +5,8 @@ mod phantom;
 use std::sync::Arc;
 
 use slicestream_store::{
-    BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, UpsertOutcome, read_header,
+    BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, StorageCounts, UpsertOutcome,
+    read_header,
 };
 
 fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
@@ -158,4 +159,60 @@ async fn reopen_keeps_data() {
             .blob,
         r.blob
     );
+}
+
+async fn seeded_index(dir: &std::path::Path) -> (Index, Vec<InstanceHeader>) {
+    let idx = Index::open(&dir.join("index.db")).await.unwrap();
+    let mut hs = phantom_headers(&dir.join("p"), 3);
+    hs[2].series_instance_uid = format!("{}.99", hs[0].series_instance_uid);
+    for (i, (h, size)) in hs.iter().zip([100, 200, 300]).enumerate() {
+        let mut r = record(h.clone(), i as u8 + 1);
+        r.size_bytes = size;
+        idx.upsert_instance(&r, DuplicatePolicy::Keep)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+    (idx, hs)
+}
+
+#[tokio::test]
+async fn storage_counts_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = Index::open(&dir.path().join("index.db")).await.unwrap();
+    assert_eq!(
+        idx.storage_counts().await.unwrap(),
+        StorageCounts::default()
+    );
+}
+
+#[tokio::test]
+async fn storage_counts_after_inserts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, _) = seeded_index(dir.path()).await;
+    assert_eq!(
+        idx.storage_counts().await.unwrap(),
+        StorageCounts {
+            studies: 1,
+            series: 2,
+            instances: 3,
+            objects_bytes: 600,
+            objects_count: 3,
+        }
+    );
+}
+
+#[tokio::test]
+async fn console_series_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, hs) = seeded_index(dir.path()).await;
+    let rows = idx.console_series().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].series_uid, hs[2].series_instance_uid);
+    let a = &rows[1];
+    assert_eq!(a.series_uid, hs[0].series_instance_uid);
+    assert_eq!(a.instance_count, 2);
+    assert_eq!(a.size_bytes, 300);
+    assert_eq!(a.patient_name, hs[0].patient_name);
+    assert_eq!(a.study_date, hs[0].study_date);
 }
