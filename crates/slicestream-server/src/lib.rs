@@ -23,6 +23,9 @@ use tower_http::services::ServeDir;
 pub mod catalog;
 pub mod config;
 pub mod hosts;
+// wired in by the console endpoints task
+#[allow(dead_code)]
+pub(crate) mod metrics;
 pub mod routes;
 pub mod stow;
 pub mod stream;
