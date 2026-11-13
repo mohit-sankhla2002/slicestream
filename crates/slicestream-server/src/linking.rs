@@ -4,7 +4,8 @@
 //! (`all.zip!/a.zip!/dir/x.nii.gz`), folder imports use `/`. The scopes of a
 //! path are its ancestor prefixes, nearest first: the prefix up to and
 //! including each `/` (which also covers each `!/`), then the empty prefix
-//! (the whole upload).
+//! (the whole upload). Only the nearest [`MAX_SCOPE_DEPTH`] prefixes of a
+//! path take part, so a deeply nested path costs a bounded amount of work.
 
 use std::collections::HashMap;
 
@@ -31,13 +32,29 @@ impl Scope {
         self.many_patients |= patient != self.patient;
         self.many_studies |= study != self.study;
     }
+
+    fn merge(&mut self, other: &Scope) {
+        self.add(other.patient, other.study);
+        self.many_patients |= other.many_patients;
+        self.many_studies |= other.many_studies;
+    }
 }
 
-/// Ancestor prefixes of `path`, nearest first, ending with `""`.
+/// Ancestor prefixes considered per path (besides the whole upload).
+const MAX_SCOPE_DEPTH: usize = 64;
+
+/// Ancestor prefixes of `path`, nearest first (at most
+/// [`MAX_SCOPE_DEPTH`]), ending with `""`.
 fn scopes(path: &str) -> impl Iterator<Item = &str> {
     path.rmatch_indices('/')
+        .take(MAX_SCOPE_DEPTH)
         .map(move |(i, _)| &path[..=i])
         .chain(std::iter::once(""))
+}
+
+/// The directory of `path`: its nearest scope.
+fn dir(path: &str) -> &str {
+    path.rfind('/').map_or("", |i| &path[..=i])
 }
 
 /// Link each NIfTI `(id, path)` using the stored/duplicate DICOM of the same
@@ -51,13 +68,25 @@ pub fn link(
     nifti: &[(i64, String)],
     dicom: &[(String, i64, i64)],
 ) -> Vec<(i64, Option<i64>, Option<i64>)> {
-    let mut by_scope: HashMap<&str, Scope> = HashMap::new();
+    if nifti.is_empty() {
+        return Vec::new();
+    }
+    // Many DICOM share a directory: aggregate per directory first, so each
+    // distinct directory's ancestors are visited once.
+    let mut by_dir: HashMap<&str, Scope> = HashMap::new();
     for (path, patient, study) in dicom {
-        for prefix in scopes(path) {
+        by_dir
+            .entry(dir(path))
+            .and_modify(|s| s.add(*patient, *study))
+            .or_insert_with(|| Scope::new(*patient, *study));
+    }
+    let mut by_scope: HashMap<&str, Scope> = HashMap::new();
+    for (d, scope) in &by_dir {
+        for prefix in scopes(d) {
             by_scope
                 .entry(prefix)
-                .and_modify(|s| s.add(*patient, *study))
-                .or_insert_with(|| Scope::new(*patient, *study));
+                .and_modify(|s| s.merge(scope))
+                .or_insert(*scope);
         }
     }
     nifti
@@ -152,6 +181,43 @@ mod tests {
             link(&[n(10, "x.nii")], &[d("IM1", 3, 30)]),
             vec![(10, Some(3), Some(30))]
         );
+    }
+
+    #[test]
+    fn link_no_nifti_is_empty() {
+        let dicom = [d("u.zip!/IM1", 1, 10)];
+        assert!(link(&[], &dicom).is_empty());
+    }
+
+    #[test]
+    fn link_merges_mixed_directories() {
+        // One directory already mixed: its parent must be mixed too.
+        let dicom = [
+            d("u.zip!/a/b/IM1", 1, 10),
+            d("u.zip!/a/b/IM2", 2, 20),
+            d("u.zip!/a/c/IM1", 1, 10),
+        ];
+        assert_eq!(
+            link(&[n(1, "u.zip!/a/x.nii")], &dicom),
+            vec![(1, None, None)]
+        );
+        assert_eq!(
+            link(&[n(2, "u.zip!/a/c/x.nii")], &dicom),
+            vec![(2, Some(1), Some(10))]
+        );
+    }
+
+    #[test]
+    fn link_huge_deep_paths_bounded() {
+        // 1 MiB of `a/` per path: ~512k ancestors each if unbounded.
+        let deep = "a/".repeat(512 * 1024);
+        let dicom: Vec<_> = (0..8).map(|i| d(&format!("{deep}IM{i}"), 1, 10)).collect();
+        let start = std::time::Instant::now();
+        let got = link(&[n(1, &format!("{deep}seg.nii")), n(2, "top.nii")], &dicom);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // Same directory links; the whole upload holds one patient too.
+        assert_eq!(got, vec![(1, Some(1), Some(10)), (2, Some(1), Some(10))]);
+        assert_eq!(scopes(&deep).count(), MAX_SCOPE_DEPTH + 1);
     }
 
     #[test]

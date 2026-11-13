@@ -164,7 +164,8 @@ pub fn walk_file_continue(
         tmp_dir,
         sink,
     };
-    let res = w.top(path, display_name);
+    let display_name = capped(display_name, MAX_PATH_BYTES);
+    let res = w.top(path, &display_name);
     let stats = WalkStats {
         entries_seen: budget.entries(),
         bytes_expanded: budget.bytes(),
@@ -428,7 +429,7 @@ impl Walker<'_> {
                     .unwrap_or_else(|_| String::from_utf8_lossy(meta.name_raw()).into_owned());
                 (name, meta.encrypted())
             };
-            let entry_path = format!("{path}!/{name}");
+            let entry_path = entry_path(path, &name);
             let res = if is_encrypted {
                 self.count_entry()?;
                 Err(Fail::Container("encrypted archive".into()))
@@ -533,7 +534,9 @@ impl Walker<'_> {
                 Some(n) => n,
                 None => entry.path_bytes().into_owned(),
             };
-            let entry_path = format!("{path}!/{}", String::from_utf8_lossy(&name_bytes));
+            // Decode only what can be reported (a pax path may be 1 MiB).
+            let shown = &name_bytes[..name_bytes.len().min(MAX_NAME_BYTES + 4)];
+            let entry_path = entry_path(path, &String::from_utf8_lossy(shown));
             if et.is_gnu_sparse() {
                 // Raw iteration does not consume extended sparse header
                 // blocks; skipping by entry size would desynchronise.
@@ -550,7 +553,13 @@ impl Walker<'_> {
             if !(et.is_file() || et.is_contiguous()) {
                 continue;
             }
-            let mut src = Counted::new(entry, self.budget, count_entries);
+            // The tar crate reads entry data through `io::Take`, which ends
+            // quietly at a truncated archive's EOF: insist on `size` bytes.
+            let exact = Exact {
+                inner: entry,
+                remaining: size,
+            };
+            let mut src = Counted::new(exact, self.budget, count_entries);
             self.entry(&mut src, &entry_path, depth)?;
         }
         Ok(())
@@ -651,7 +660,7 @@ impl Walker<'_> {
                 dec.for_each_entries(&mut |entry, r| {
                     current = Some(started);
                     started += 1;
-                    let entry_path = format!("{path}!/{}", entry.name);
+                    let entry_path = entry_path(path, &entry.name);
                     let mut s = Counted::new(PanicGuard(r), budget, true);
                     // Decoder panics are turned into read errors by
                     // `PanicGuard`; a panic caught here comes from the sink
@@ -782,7 +791,7 @@ impl Walker<'_> {
         // Count decoded bytes that are thrown away.
         let mut count_only = |d: &[u8]| budget.add_bytes(d.len() as u64).is_ok();
         while let Some(h) = ar.read_header().map_err(fail)? {
-            let entry_path = format!("{path}!/{}", h.name);
+            let entry_path = entry_path(path, &h.name);
             if !h.is_file() || h.encrypted() {
                 if h.is_file() {
                     self.count_entry()?;
@@ -910,6 +919,33 @@ impl Walker<'_> {
     }
 }
 
+/// Longest entry name reported (bytes, before the `…` marker).
+pub const MAX_NAME_BYTES: usize = 1024;
+/// Longest reported path, including the marker.
+pub const MAX_PATH_BYTES: usize = 4096;
+const ELLIPSIS: &str = "…";
+
+/// `s` if it fits in `max` bytes, else its longest prefix (on a char
+/// boundary) that leaves room for `…`, followed by `…`.
+fn capped(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return s.into();
+    }
+    let mut end = max.saturating_sub(ELLIPSIS.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{ELLIPSIS}", &s[..end]).into()
+}
+
+/// The reported path of entry `name` inside `parent`: `<parent>!/<name>`,
+/// with the name capped at [`MAX_NAME_BYTES`] and the whole at
+/// [`MAX_PATH_BYTES`] (entry names are untrusted and may be huge).
+fn entry_path(parent: &str, name: &str) -> String {
+    let name = capped(name, MAX_NAME_BYTES + ELLIPSIS.len());
+    capped(&format!("{parent}!/{name}"), MAX_PATH_BYTES).into_owned()
+}
+
 /// Reason detail when a decoder library panicked (caught).
 const INTERNAL: &str = "internal decoder error";
 
@@ -928,6 +964,31 @@ impl<R: Read> Read for PanicGuard<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         catch_unwind(AssertUnwindSafe(|| self.0.read(buf)))
             .unwrap_or_else(|_| Err(io::Error::other(INTERNAL)))
+    }
+}
+
+/// Yields exactly `remaining` bytes of `inner`, failing with
+/// `UnexpectedEof` if `inner` ends first.
+struct Exact<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = usize::try_from(self.remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let n = self.inner.read(&mut buf[..max])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated tar entry",
+            ));
+        }
+        self.remaining -= n as u64;
+        Ok(n)
     }
 }
 
@@ -1084,6 +1145,21 @@ mod tests {
         assert_eq!(cd_of(&z3).entries, 1);
 
         assert_eq!(cd_of(b"not a zip"), CentralDirectory::default());
+    }
+
+    #[test]
+    fn entry_paths_capped() {
+        assert_eq!(entry_path("a.zip", "x/y"), "a.zip!/x/y");
+        let long = "é".repeat(5000);
+        let p = entry_path("a.zip", &long);
+        assert!(p.ends_with(ELLIPSIS));
+        assert!(p.len() <= "a.zip!/".len() + MAX_NAME_BYTES + ELLIPSIS.len());
+        let parent = "p".repeat(MAX_PATH_BYTES);
+        let p = entry_path(&parent, &long);
+        assert!(p.len() <= MAX_PATH_BYTES && p.ends_with(ELLIPSIS));
+        assert_eq!(capped("abc", 3), "abc");
+        assert_eq!(capped("abcd", 3), ELLIPSIS);
+        assert_eq!(capped("abcde", 4), "a…");
     }
 
     #[test]

@@ -16,4 +16,7 @@ mod walk;
 
 pub use detect::{Kind, SNIFF_LEN, detect};
 pub use nifti::{NiftiError, NiftiHeader, parse_nifti_header};
-pub use walk::{Event, Leaf, Limits, Sink, WalkError, WalkStats, walk_file, walk_file_continue};
+pub use walk::{
+    Event, Leaf, Limits, MAX_NAME_BYTES, MAX_PATH_BYTES, Sink, WalkError, WalkStats, walk_file,
+    walk_file_continue,
+};

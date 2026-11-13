@@ -3,7 +3,8 @@ mod support;
 use std::io;
 
 use slicestream_archive::{
-    Event, Kind, Leaf, Limits, Sink, WalkError, WalkStats, walk_file, walk_file_continue,
+    Event, Kind, Leaf, Limits, MAX_NAME_BYTES, MAX_PATH_BYTES, Sink, WalkError, WalkStats,
+    walk_file, walk_file_continue,
 };
 use support::*;
 
@@ -693,4 +694,70 @@ fn continued_walk_shares_the_budget() {
     assert_eq!(stats.entries_seen, 4);
     assert_eq!(stats.bytes_expanded, 10 + 2 * d.len() as u64);
     assert_eq!(rec.progress.first().map(|p| p.0), Some(3));
+}
+
+#[test]
+fn huge_pax_path_is_capped() {
+    // A pax `path` of ~1 MiB (just under the metadata cap).
+    let name = format!("{}IM1", "a/".repeat(512 * 1024 - 64));
+    let a = dicom("A");
+    let t = tar(&[TarItem::PaxFile(&name, &a), TarItem::File("IM2", &a)]);
+    let (r, rec, e) = run(&gz(&t), "x.tgz", &Limits::default());
+    r.unwrap();
+    assert_eq!(rec.leaves.len(), 2);
+    let paths = rec.paths();
+    let long = paths
+        .iter()
+        .find(|p| p.ends_with('…'))
+        .expect("capped path");
+    assert!(long.len() <= MAX_PATH_BYTES, "{}", long.len());
+    assert!(long.len() <= "x.tgz!/".len() + MAX_NAME_BYTES + '…'.len_utf8());
+    assert!(long.starts_with("x.tgz!/a/a/"));
+    assert!(paths.contains(&"x.tgz!/IM2"));
+    assert_tmp_empty(&e.tmp);
+
+    // A huge top-level display name is capped too.
+    let display = "n".repeat(10_000);
+    let (r, rec, _e) = run(&dicom("T"), &display, &Limits::default());
+    r.unwrap();
+    assert!(rec.leaves[0].path.len() <= MAX_PATH_BYTES);
+}
+
+#[test]
+fn truncated_plain_tar_stores_nothing() {
+    let mut big = dicom("BIG");
+    big.resize(100 * 1024, 7);
+    let t = tar(&[TarItem::File("IM1", &big)]);
+    let cut = &t[..512 + 50_000];
+    let (r, rec, e) = run(cut, "cut.tar", &Limits::default());
+    r.unwrap();
+    assert!(rec.leaves.is_empty(), "{:?}", rec.paths());
+    assert_eq!(rec.failed.len(), 1, "{:?}", rec.failed);
+    assert_eq!(rec.failed[0].0, "cut.tar");
+    assert!(rec.failed[0].1.contains("truncated"), "{}", rec.failed[0].1);
+    assert_tmp_empty(&e.tmp);
+
+    // Inside a zip: that tar fails, siblings are kept.
+    let z = zip(&[("cut.tar", cut), ("IM", &dicom("ok"))]);
+    let (r, rec, e) = run(&z, "o.zip", &Limits::default());
+    r.unwrap();
+    assert_eq!(rec.paths(), vec!["o.zip!/IM"]);
+    assert_eq!(rec.failed.len(), 1);
+    assert_eq!(rec.failed[0].0, "o.zip!/cut.tar");
+    assert_tmp_empty(&e.tmp);
+
+    // gzip-wrapped: a complete gzip of the truncated tar also fails.
+    let (r, rec, e) = run(&gz(cut), "cut.tgz", &Limits::default());
+    r.unwrap();
+    assert!(rec.leaves.is_empty());
+    assert_eq!(rec.failed.len(), 1);
+    assert_eq!(rec.failed[0].0, "cut.tgz");
+    assert_tmp_empty(&e.tmp);
+
+    // And a truncated gzip stream of the whole tar.
+    let g = gz(&t);
+    let (r, rec, _e) = run(&g[..g.len() / 2], "half.tgz", &Limits::default());
+    r.unwrap();
+    assert!(rec.leaves.is_empty());
+    assert_eq!(rec.failed.len(), 1);
 }

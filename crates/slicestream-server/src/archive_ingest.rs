@@ -538,18 +538,40 @@ impl Collect {
     /// Link this upload's NIfTI; returns the summary. A volume that was
     /// already stored (duplicate) is only re-linked when a patient is found,
     /// so an earlier link is never cleared.
-    async fn link(&self) -> NiftiSummary {
+    ///
+    /// Path matching runs on a blocking thread; it is skipped entirely when
+    /// the upload has no NIfTI.
+    async fn link(&mut self) -> NiftiSummary {
+        let mut summary = NiftiSummary::default();
+        if self.nifti.is_empty() {
+            return summary;
+        }
         let index = self.ingestor.index();
         let pairs: Vec<(i64, String)> = self
             .nifti
             .iter()
             .map(|(id, p, _)| (*id, p.clone()))
             .collect();
-        let mut summary = NiftiSummary::default();
-        for ((id, patient, study), (_, _, duplicate)) in linking::link(&pairs, &self.dicom)
-            .into_iter()
-            .zip(&self.nifti)
-        {
+        // Not needed after linking (the summary uses `studies`).
+        let dicom = std::mem::take(&mut self.dicom);
+        let links = match tokio::task::spawn_blocking(move || linking::link(&pairs, &dicom)).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!(upload_id = self.upload_id, error = %e, "NIfTI linking failed");
+                Vec::new()
+            }
+        };
+        // On failure every volume counts as unassigned (or kept, if it was
+        // a duplicate already linked).
+        let links = if links.len() == self.nifti.len() {
+            links
+        } else {
+            self.nifti
+                .iter()
+                .map(|(id, _, _)| (*id, None, None))
+                .collect()
+        };
+        for ((id, patient, study), (_, _, duplicate)) in links.into_iter().zip(&self.nifti) {
             let linked = if patient.is_some() {
                 if let Err(e) = index.link_nifti(id, patient, study).await {
                     tracing::error!(nifti_id = id, error = %e, "cannot link NIfTI volume");
