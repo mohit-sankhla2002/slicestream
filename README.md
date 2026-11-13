@@ -2,10 +2,12 @@
 
 **A fast, memory-safe DICOM server in Rust that streams slices to the browser in the order the user scrolls through them.**
 
-> Status: early (v0.1). The streaming core works end to end with a demo viewer.
+> Status: early (v0.1). The streaming core works end to end, with a browser test console.
 > Instances can be stored over STOW-RS, a single-file upload or DIMSE C-STORE.
 > Query/retrieve and the full DICOMweb read path are on the [roadmap](docs/ARCHITECTURE.md#roadmap).
 > Not for clinical use.
+
+![The slicestream test console after uploading a 120-slice phantom](docs/images/console.png)
 
 ## Why this project
 
@@ -58,7 +60,16 @@ for now.
   and a WebSocket stream that changes its send order on every scroll event.
   It also accepts STOW-RS uploads, and runs the DIMSE SCP. The series list
   comes from the storage index, so new instances are streamable at once.
-- `web/`: a dependency-free demo viewer (mouse wheel or arrow keys).
+- `web/`: a dependency-free browser test console, served by the server itself:
+  - **Upload**: drop files or a folder and send them one request each, over
+    STOW-RS or as single files, with an optional bearer token.
+  - **Ingest results**: a stored / duplicate / failed line per file, with the
+    reason for each failure.
+  - **Process**: live CPU, memory, disk, ingest latency and connection counts
+    for the server process, with the last five minutes as charts.
+  - **Stored series**: every series in storage, updated as instances arrive.
+  - **Viewer**: click a series to scroll through it (mouse wheel or arrow keys)
+    over the streaming WebSocket.
 
 On a local synthetic series of 120 slices at 256×256, the first frame arrives in
 about 26 ms. Frames then come in this order: the cursor slice, the slices ahead
@@ -80,7 +91,8 @@ cargo run -p slicestream-server -- import data/phantom
 # 3. Serve it (HTTP on 127.0.0.1:8080, DIMSE C-STORE on port 11112)
 cargo run -p slicestream-server -- serve
 
-# 4. Open http://127.0.0.1:8080 and scroll
+# 4. Open http://127.0.0.1:8080: the console shows the stored series, live
+#    server metrics and an upload panel. Click the series and scroll.
 ```
 
 `import <DIR>` reads Part-10 files from a folder (`--recursive` descends into
@@ -115,7 +127,7 @@ If `[http] stow_token` is set, the three POST endpoints need
 `Authorization: Bearer <token>`. They never have CORS headers, so web pages on
 other origins cannot upload. The read endpoints send CORS headers only for the
 origins in `[http] cors_allowed_origins` (empty by default: no CORS), and the
-WebSocket stream refuses other cross-origin pages with 403. The demo viewer is
+WebSocket stream refuses other cross-origin pages with 403. The test console is
 same-origin and needs neither.
 
 Every request must carry an allowed `Host` header, or it gets 421 Misdirected
@@ -140,7 +152,7 @@ crates/slicestream-store    ingest pipeline, blob store and SQLite index
 crates/slicestream-dimse    DIMSE C-STORE / C-ECHO storage SCP
 crates/slicestream-server   reference HTTP + WebSocket server (axum/tokio)
 slicestream.example.toml    configuration with every default
-web/                        demo viewer
+web/                        browser test console (upload, metrics, series, viewer)
 docs/ARCHITECTURE.md        target architecture and roadmap
 docs/PROTOCOL.md            language-neutral wire protocol spec
 ```

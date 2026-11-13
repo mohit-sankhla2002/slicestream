@@ -79,7 +79,7 @@ Two levels, so teams can adopt step by step:
 ## Roadmap
 
 **M0 — Streaming core (done).** Folder index, frame extraction, scheduler,
-WebSocket stream, demo viewer, CI.
+WebSocket stream, console viewer, CI.
 
 **M1 — Standard DICOMweb read path.** QIDO-RS (studies, series, instances),
 WADO-RS metadata, frames, bulk data, and `multipart/related`. Run as a
@@ -95,7 +95,7 @@ done, so modalities and other PACS can push to the server. C-FIND, C-MOVE and
 C-GET through `dicom-ul`, so they can also query it, are still open.
 
 **M4 — Progressive codecs.** Transcode to HTJ2K RPCL at ingest or on demand.
-Stream byte ranges progressively. Add a WASM decoder for the demo viewer.
+Stream byte ranges progressively. Add a WASM decoder for the console viewer.
 
 **M5 — Integrations.** `@slicestream/cornerstone-loader` with a React hook,
 OpenAPI and generated clients, C ABI, Python bindings, webhooks.
@@ -110,7 +110,7 @@ benchmarks against Orthanc and dcm4chee.
 - Frames go out as fast as TCP accepts them. There is no client credit or
   acknowledgement, so priority changes take effect only after the socket
   buffer drains.
-- The demo viewer renders only native (uncompressed) grayscale.
+- The console viewer renders only native (uncompressed) grayscale.
 - Storage is the local filesystem only, and the series list is rebuilt from
   the index on demand. There is no QIDO-RS/WADO-RS yet.
 - One process owns a storage root. `serve` and `import` take an exclusive
