@@ -7,6 +7,7 @@ mod header;
 mod index;
 mod ingest;
 mod part10;
+mod stats;
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -24,3 +25,4 @@ pub use ingest::{
     StoredEvent, is_storage_sop_class,
 };
 pub use part10::{IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, write_part10_prefix};
+pub use stats::IngestStats;

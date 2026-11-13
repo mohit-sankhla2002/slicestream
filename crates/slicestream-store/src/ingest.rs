@@ -312,6 +312,7 @@ struct Shared {
     index: Index,
     on_duplicate: DuplicatePolicy,
     events: broadcast::Sender<StoredEvent>,
+    stats: crate::stats::Stats,
     /// Serializes commit → upsert → cleanup per SOP Instance UID (striped).
     /// Identical bytes imply the same SOP Instance UID, so every operation
     /// that can create, reference or delete a given blob is serialized here;
@@ -474,6 +475,7 @@ impl Ingestor {
             index,
             on_duplicate: cfg.on_duplicate,
             events,
+            stats: Default::default(),
             locks,
             _root_lock: root_lock,
             #[cfg(test)]
@@ -518,6 +520,31 @@ impl Ingestor {
     /// broadcast runs in a spawned task that completes (holding the per-UID
     /// lock throughout) even if this future is dropped.
     pub async fn ingest(
+        &self,
+        spooled: SpooledBlob,
+        source: IngestSource,
+        expect: Expectations,
+    ) -> Result<Stored, IngestFailure> {
+        let start = std::time::Instant::now();
+        let len = spooled.len;
+        let result = self.ingest_inner(spooled, source, expect).await;
+        match &result {
+            Ok(stored) => {
+                self.shared
+                    .stats
+                    .record_success(stored.duplicate, len, start.elapsed());
+            }
+            Err(_) => self.shared.stats.record_failure(),
+        }
+        result
+    }
+
+    /// Snapshot of the ingest counters and 60 s latency percentiles.
+    pub fn stats(&self) -> crate::stats::IngestStats {
+        self.shared.stats.snapshot()
+    }
+
+    async fn ingest_inner(
         &self,
         spooled: SpooledBlob,
         source: IngestSource,

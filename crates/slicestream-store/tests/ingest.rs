@@ -428,3 +428,25 @@ async fn second_open_on_same_root_fails_until_first_is_dropped() {
     let again = Ingestor::open(config(&root)).await.unwrap();
     drop(again);
 }
+
+#[tokio::test]
+async fn stats_count_each_outcome_once() {
+    let d = tempfile::tempdir().unwrap();
+    let file = phantom_file(&d.path().join("src"));
+    let file_len = std::fs::metadata(&file).unwrap().len();
+    let bad = d.path().join("bad.dcm");
+    std::fs::write(&bad, b"not a dicom file").unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store")))
+        .await
+        .unwrap();
+    assert_eq!(ing.stats(), Default::default());
+
+    ing.import_file(&file).await.unwrap();
+    assert!(ing.import_file(&file).await.unwrap().duplicate);
+    assert!(ing.import_file(&bad).await.is_err());
+
+    let s = ing.stats();
+    assert_eq!((s.stored, s.duplicate, s.failed), (1, 1, 1));
+    assert_eq!(s.bytes, 2 * file_len);
+    assert!(s.latency_p50_ms.is_some());
+}
