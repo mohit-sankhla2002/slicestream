@@ -537,7 +537,8 @@ impl Collect {
 
     /// Link this upload's NIfTI; returns the summary. A volume that was
     /// already stored (duplicate) is only re-linked when a patient is found,
-    /// so an earlier link is never cleared.
+    /// so an earlier link is never cleared; when that is its current patient
+    /// and no single study is found, its current study is kept.
     ///
     /// Path matching runs on a blocking thread; it is skipped entirely when
     /// the upload has no NIfTI.
@@ -573,6 +574,16 @@ impl Collect {
         };
         for ((id, patient, study), (_, _, duplicate)) in links.into_iter().zip(&self.nifti) {
             let linked = if patient.is_some() {
+                // A duplicate already linked to this patient keeps its
+                // study when this upload cannot pin one down.
+                let study = if *duplicate && study.is_none() {
+                    match index.nifti_volume(id).await {
+                        Ok(Some(row)) if row.patient_fk == patient => row.study_fk,
+                        _ => None,
+                    }
+                } else {
+                    study
+                };
                 if let Err(e) = index.link_nifti(id, patient, study).await {
                     tracing::error!(nifti_id = id, error = %e, "cannot link NIfTI volume");
                 }

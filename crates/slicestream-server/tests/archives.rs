@@ -316,6 +316,37 @@ async fn duplicates_count_for_linking() {
 }
 
 #[tokio::test]
+async fn duplicate_nifti_keeps_study_of_same_patient() {
+    let e = env().await;
+    let seg = gz(&nifti(4));
+    let first = zip(&[("IM1", &dicom(1, 1, 1, 1)), ("seg.nii.gz", &seg)]);
+    let (out, _) = e.upload("first.zip", &first, Limits::default()).await;
+    assert_eq!(out.nifti.linked, 1);
+    let (p, s) = e.links(&sop(1, 1, 1, 1)).await;
+    assert_eq!(e.nifti_rows(1).await[0].1, Some(p));
+    assert_eq!(e.nifti_rows(1).await[0].2, Some(s));
+
+    // Same patient, two studies: the new link has no study.
+    let second = zip(&[
+        ("IM1", &dicom(1, 1, 1, 1)),
+        ("IM2", &dicom(1, 2, 1, 1)),
+        ("seg.nii.gz", &seg),
+    ]);
+    let (out, _) = e.upload("second.zip", &second, Limits::default()).await;
+    assert_eq!(out.counts.nifti_duplicate, 1);
+    assert_eq!(out.nifti.linked, 1);
+    let row = &e.nifti_rows(1).await[0];
+    assert_eq!((row.1, row.2), (Some(p), Some(s)));
+
+    // A different patient replaces the link (study included).
+    let third = zip(&[("IM1", &dicom(2, 1, 1, 1)), ("seg.nii.gz", &seg)]);
+    e.upload("third.zip", &third, Limits::default()).await;
+    let (p2, s2) = e.links(&sop(2, 1, 1, 1)).await;
+    let row = &e.nifti_rows(1).await[0];
+    assert_eq!((row.1, row.2), (Some(p2), Some(s2)));
+}
+
+#[tokio::test]
 async fn encrypted_and_truncated_fail_alone() {
     let e = env().await;
     let enc = mark_encrypted(zip(&[("IM9", &dicom(9, 1, 1, 1))]));

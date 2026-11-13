@@ -108,8 +108,12 @@ pub struct ArchivesConfig {
     /// Jobs processed at once; further uploads wait in a queue of
     /// `4 × max_concurrent_jobs` (queued and running).
     pub max_concurrent_jobs: usize,
-    /// Finished jobs kept in memory for `GET /api/archives/{job}`.
+    /// Finished jobs kept in memory for `GET /api/archives/{job}` (at
+    /// least 1).
     pub job_retention: usize,
+    /// Seconds an upload body may go without delivering data before it is
+    /// refused (408) and its queue place released (at least 1).
+    pub body_idle_timeout_secs: u64,
 }
 
 impl Default for ArchivesConfig {
@@ -122,6 +126,7 @@ impl Default for ArchivesConfig {
             min_free_bytes: 2_147_483_648,
             max_concurrent_jobs: 2,
             job_retention: 50,
+            body_idle_timeout_secs: 60,
         }
     }
 }

@@ -377,3 +377,105 @@ async fn x_filename_sanitized() {
     assert_eq!(finished(&srv, &job).await["name"], "upload");
     srv.stop().await;
 }
+
+#[tokio::test]
+async fn job_retention_zero_keeps_one() {
+    let srv = Server::start(|c| c.archives.job_retention = 0).await;
+    let job = submit(&srv, &[], &nifti()).await;
+    assert_eq!(finished(&srv, &job).await["status"], "done");
+    let r = request(srv.addr(), "GET", &format!("/api/archives/{job}"), &[], b"").await;
+    assert_eq!(r.status, 200);
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn post_bare_dicom_one_entry_job() {
+    let srv = Server::start(|_| {}).await;
+    let dcm = std::fs::read(&srv.phantom[0]).unwrap();
+    let job = submit(&srv, &[("x-filename", "slice.dcm")], &dcm).await;
+    let v = finished(&srv, &job).await;
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(v["counts"]["dicom_stored"], 1, "{v}");
+    assert_eq!(v["counts"]["failed"], 0, "{v}");
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{v}");
+    assert_eq!(entries[0]["path"], "slice.dcm");
+    assert_eq!(entries[0]["kind"], "dicom");
+    assert_eq!(entries[0]["outcome"], "stored");
+    assert_eq!(tmp_files(&srv.store), 0);
+    srv.stop().await;
+}
+
+/// Send `head` and `body`, then keep the connection open without sending
+/// more; returns the response (read until the server closes).
+async fn stalled(addr: SocketAddr, head: &str, body: &[u8]) -> Reply {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), s.read_to_end(&mut buf))
+        .await
+        .expect("server answers a stalled body")
+        .unwrap();
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head");
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    Reply {
+        status,
+        head,
+        body: buf[split + 4..].to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn stalled_body_408_releases_slot() {
+    let srv = Server::start(|c| {
+        c.archives.body_idle_timeout_secs = 1;
+        // Queue cap 4.
+        c.archives.max_concurrent_jobs = 1;
+    })
+    .await;
+    let addr = srv.addr();
+    let head = format!(
+        "POST /api/archives HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+    );
+    let start = Instant::now();
+    let body = nifti();
+    let replies = futures_util::future::join_all((0..4).map(|_| stalled(addr, &head, &body))).await;
+    for r in &replies {
+        assert_eq!(r.status, 408, "{}", String::from_utf8_lossy(&r.body));
+        assert_eq!(r.json()["error"], "request body timed out");
+    }
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert_eq!(tmp_files(&srv.store), 0);
+    // All four places were released.
+    let job = submit(&srv, &[], &nifti()).await;
+    assert_eq!(finished(&srv, &job).await["status"], "done");
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn chunked_body_low_disk_507() {
+    let srv = Server::start(|c| c.archives.min_free_bytes = u64::MAX).await;
+    let addr = srv.addr();
+    let body = nifti();
+    let mut req = format!(
+        "POST /api/archives HTTP/1.1\r\nHost: {addr}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(&body);
+    req.extend_from_slice(b"\r\n0\r\n\r\n");
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(&req).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 507"), "{text}");
+    assert!(text.contains("not enough free space"), "{text}");
+    assert_eq!(tmp_files(&srv.store), 0);
+    srv.stop().await;
+}

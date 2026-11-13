@@ -34,6 +34,8 @@ use crate::stow::{authorized, remote_addr, unauthorized};
 pub const MAX_JOB_ENTRIES: usize = 10_000;
 /// Longest stored upload name, in characters.
 const MAX_NAME_CHARS: usize = 255;
+/// Free space is re-checked each time this many body bytes are spooled.
+const FREE_SPACE_CHECK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The archive job manager (one per server).
 pub struct ArchiveJobs {
@@ -257,7 +259,7 @@ impl ArchiveJobs {
     fn finished(&self, id: String) {
         let mut inner = self.lock();
         inner.finished.push_back(id);
-        while inner.finished.len() > self.cfg.job_retention {
+        while inner.finished.len() > self.cfg.job_retention.max(1) {
             if let Some(old) = inner.finished.pop_front() {
                 inner.jobs.remove(&old);
             }
@@ -269,6 +271,11 @@ impl ArchiveJobs {
     pub async fn wait(&self, grace: Duration) -> bool {
         self.tasks.close();
         tokio::time::timeout(grace, self.tasks.wait()).await.is_ok()
+    }
+
+    /// How long the upload body may stall between chunks.
+    fn body_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.cfg.body_idle_timeout_secs.max(1))
     }
 
     /// Whether the storage volume has room for `len` more bytes plus the
@@ -396,7 +403,7 @@ pub async fn post_archive(
         return error(StatusCode::SERVICE_UNAVAILABLE, "too many archive jobs");
     };
 
-    let spooled = match spool(&state.ingestor, body, max).await {
+    let spooled = match spool(jobs, &state.ingestor, body, max).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -434,7 +441,17 @@ pub async fn post_archive(
 }
 
 /// Stream `body` into a spool file in `tmp/` of at most `max` bytes.
-async fn spool(ingestor: &Ingestor, body: Body, max: u64) -> Result<SpooledBlob, Response> {
+///
+/// A body that delivers nothing for `body_idle_timeout_secs` gets 408; free
+/// space is checked at the first chunk and every
+/// [`FREE_SPACE_CHECK_BYTES`] after (507 below `min_free_bytes`), which also
+/// covers bodies without `Content-Length`. Any error removes the spool file.
+async fn spool(
+    jobs: &ArchiveJobs,
+    ingestor: &Ingestor,
+    body: Body,
+    max: u64,
+) -> Result<SpooledBlob, Response> {
     let storage_error = |e: &dyn std::fmt::Display| {
         tracing::error!(error = %e, "archive spool failed");
         error(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
@@ -444,8 +461,15 @@ async fn spool(ingestor: &Ingestor, body: Body, max: u64) -> Result<SpooledBlob,
         .blobs()
         .create_temp(max)
         .map_err(|e| storage_error(&e))?;
+    let idle = jobs.body_idle_timeout();
+    let mut written = 0u64;
+    let mut next_check = 0u64;
     let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let Ok(next) = tokio::time::timeout(idle, stream.next()).await else {
+            return Err(error(StatusCode::REQUEST_TIMEOUT, "request body timed out"));
+        };
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| {
             error(
                 StatusCode::BAD_REQUEST,
@@ -458,6 +482,16 @@ async fn spool(ingestor: &Ingestor, body: Body, max: u64) -> Result<SpooledBlob,
                 return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
             }
             Err(e) => return Err(storage_error(&e)),
+        }
+        written = written.saturating_add(chunk.len() as u64);
+        if written >= next_check {
+            if !jobs.room_for(0) {
+                return Err(error(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "not enough free space",
+                ));
+            }
+            next_check = written.saturating_add(FREE_SPACE_CHECK_BYTES);
         }
     }
     temp.finish().await.map_err(|e| storage_error(&e))
