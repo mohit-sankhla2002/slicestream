@@ -22,25 +22,40 @@ export function startMetrics({ onSample, onStatus, onHistory }) {
   let timer = 0;
 
   async function poll() {
+    let snap = null;
     try {
-      const snap = await getJson("/api/metrics");
-      if (stopped) return;
-      onStatus?.("live");
-      onSample?.(snap);
+      snap = await getJson("/api/metrics");
     } catch {
-      if (!stopped) onStatus?.("offline");
+      // Network error, timeout or non-2xx: the server is unreachable or not ready.
     }
-    if (!stopped) timer = setTimeout(poll, POLL_MS);
+    if (stopped) return;
+    onStatus?.(snap ? "live" : "offline");
+    if (snap) {
+      try {
+        onSample?.(snap);
+      } catch (err) {
+        console.error("metrics render failed", err);
+      }
+    }
+    timer = setTimeout(poll, POLL_MS);
   }
 
   (async () => {
+    let hist = null;
     try {
-      const hist = await getJson("/api/metrics/history");
-      if (!stopped && Array.isArray(hist)) onHistory?.(hist);
+      hist = await getJson("/api/metrics/history");
     } catch {
       // No history (server starting or metrics off): live polling still fills the charts.
     }
-    if (!stopped) poll();
+    if (stopped) return;
+    if (Array.isArray(hist)) {
+      try {
+        onHistory?.(hist);
+      } catch (err) {
+        console.error("metrics history render failed", err);
+      }
+    }
+    poll();
   })();
 
   return () => {
