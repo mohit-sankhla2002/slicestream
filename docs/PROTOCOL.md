@@ -3,7 +3,7 @@
 This spec is language-neutral. A client in any language can follow it to
 consume the stream. The Rust reference implementation is in
 `crates/slicestream-core/src/protocol.rs`. The JavaScript reference is in
-`web/client.js`.
+`web/viewer.js` (frame decoding in `web/lib/viewer-core.js`).
 
 ## Connection
 

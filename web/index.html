@@ -113,19 +113,39 @@
 
   <div class="bottom">
     <section class="card" id="series-card">
-      <div class="ch"><h3>Stored series</h3><span class="note">updates on ingest</span></div>
-      <div class="empty">
+      <div class="ch"><h3>Stored series</h3><span class="note" id="s-note">updates on ingest</span></div>
+      <div class="empty" id="s-empty">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M10 10v10"/></svg>
-        <b>Series list is not wired up yet</b>
-        <small>Stored studies and series will appear here; click one to open it</small>
+        <b id="s-empty-title">Loading series…</b>
+        <small id="s-empty-hint">Stored series appear here; click one to open it in the viewer</small>
+      </div>
+      <div class="series" id="s-wrap" hidden>
+        <table>
+          <colgroup><col class="w-pat"><col class="w-date"><col><col class="w-n"><col class="w-n"></colgroup>
+          <thead><tr><th>Patient</th><th>Study</th><th>Series</th><th class="n">Slices</th><th class="n">Size</th></tr></thead>
+          <tbody id="s-body"></tbody>
+        </table>
       </div>
     </section>
     <section class="card" id="viewer-card">
-      <div class="ch"><h3>Viewer</h3><span class="note">no series selected</span></div>
-      <div class="empty tall">
+      <div class="ch"><h3 id="v-title">Viewer</h3><span class="note" id="v-note">no series selected</span></div>
+      <div class="empty tall" id="v-empty">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/></svg>
         <b>Select a series to view it</b>
         <small>Frames stream over WebSocket; scroll with the wheel or arrow keys</small>
+      </div>
+      <div class="viewer" id="v-wrap" hidden>
+        <div class="img" id="v-img" tabindex="0" role="img" aria-label="Series viewer, use the mouse wheel or arrow keys to change slice">
+          <canvas id="v-canvas" width="1" height="1"></canvas>
+          <span class="ov tl" id="v-slice">slice — / —</span>
+          <span class="ov tr" id="v-wl">W — L —</span>
+          <span class="ov bl">wheel / ↑↓ to scroll</span>
+          <div class="msg" id="v-msg" hidden></div>
+        </div>
+        <div class="scrub" id="v-scrub" title="cached slices; click or drag to jump">
+          <canvas id="v-cache" width="1" height="1"></canvas>
+          <em id="v-cur"></em>
+        </div>
       </div>
     </section>
   </div>

@@ -16,7 +16,7 @@ cargo test --all
 - Keep `slicestream-core` free of async runtimes and network code. Transport
   belongs in server or binding crates.
 - Changes to the wire protocol must update `docs/PROTOCOL.md` and both reference
-  implementations (Rust and `web/client.js`).
+  implementations (Rust and `web/viewer.js` with `web/lib/viewer-core.js`).
 - Every bug fix needs a test.
 
 By contributing, you agree that your work is dual-licensed under MIT and

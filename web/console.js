@@ -1,7 +1,9 @@
 // Console entry: wires the header and panels together.
 import { formatDuration } from "./lib/format.js";
 import { createMetricsPanel, startMetrics } from "./metrics.js";
+import { startSeriesTable } from "./seriestable.js";
 import { createUploadPanel } from "./upload.js";
+import { openViewer } from "./viewer.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -19,6 +21,7 @@ function renderHeader(s) {
 }
 
 createUploadPanel();
+startSeriesTable({ onSelect: openViewer });
 
 const metrics = createMetricsPanel();
 startMetrics({
