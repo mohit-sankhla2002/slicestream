@@ -66,6 +66,55 @@ pub fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     w.finish().unwrap().into_inner()
 }
 
+/// ZIP with stored (uncompressed) entries, so content bytes appear verbatim.
+pub fn zip_stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut w = ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in entries {
+        w.start_file(*name, opts).unwrap();
+        w.write_all(data).unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+/// Flip a byte of the first occurrence of `needle` (corrupts stored data).
+pub fn corrupt(mut z: Vec<u8>, needle: &[u8]) -> Vec<u8> {
+    let i = z.windows(needle.len()).position(|w| w == needle).unwrap();
+    z[i + needle.len() - 1] ^= 0xFF;
+    z
+}
+
+/// Set the encrypted flag on the local and central headers of entry `name`.
+pub fn mark_entry_encrypted(mut z: Vec<u8>, name: &str) -> Vec<u8> {
+    let n = name.as_bytes();
+    let mut i = 0;
+    while i + 46 + n.len() <= z.len() {
+        if &z[i..i + 4] == b"PK\x03\x04" && &z[i + 30..i + 30 + n.len()] == n {
+            z[i + 6] |= 1;
+        } else if &z[i..i + 4] == b"PK\x01\x02" && &z[i + 46..i + 46 + n.len()] == n {
+            z[i + 8] |= 1;
+        }
+        i += 1;
+    }
+    z
+}
+
+/// Overwrite the end-of-central-directory record's directory size field.
+pub fn set_cd_size(mut z: Vec<u8>, size: u32) -> Vec<u8> {
+    let i = z.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    z[i + 12..i + 16].copy_from_slice(&size.to_le_bytes());
+    z
+}
+
+/// A raw tar header block plus `extra` bytes, then the end-of-archive marker.
+pub fn tar_raw_header(h: &tar::Header, extra: &[u8]) -> Vec<u8> {
+    let mut v = h.as_bytes().to_vec();
+    v.extend_from_slice(extra);
+    let pad = (512 - v.len() % 512) % 512;
+    v.extend(std::iter::repeat_n(0u8, pad + 1024));
+    v
+}
+
 /// Set the "encrypted" general-purpose flag on every local and central header.
 pub fn mark_encrypted(mut z: Vec<u8>) -> Vec<u8> {
     let mut i = 0;
@@ -82,6 +131,8 @@ pub fn mark_encrypted(mut z: Vec<u8>) -> Vec<u8> {
 
 pub enum TarItem<'a> {
     File(&'a str, &'a [u8]),
+    /// File preceded by a pax header carrying `path`.
+    PaxFile(&'a str, &'a [u8]),
     Dir(&'a str),
     Symlink(&'a str, &'a str),
 }
@@ -97,6 +148,16 @@ pub fn tar(items: &[TarItem<'_>]) -> Vec<u8> {
                 h.set_mode(0o644);
                 h.set_cksum();
                 b.append_data(&mut h, name, *data).unwrap();
+            }
+            TarItem::PaxFile(name, data) => {
+                b.append_pax_extensions([("path", name.as_bytes())])
+                    .unwrap();
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_path("short-ignored").unwrap();
+                h.set_cksum();
+                b.append(&h, *data).unwrap();
             }
             TarItem::Dir(name) => {
                 h.set_entry_type(tar::EntryType::Directory);

@@ -59,13 +59,22 @@ pub struct Leaf<'a> {
 pub enum Event<'a> {
     /// A container could not be read; its siblings are still walked.
     ContainerFailed { path: &'a str, reason: String },
-    /// An entry that is neither a container, DICOM nor NIfTI (or a DICOMDIR).
+    /// One entry of a random-access container (ZIP) could not be read
+    /// (bad local header, CRC mismatch, unsupported method, encrypted); the
+    /// rest of the container is still walked.
+    EntryFailed { path: &'a str, reason: String },
+    /// An entry that is neither a container, DICOM nor NIfTI (or a DICOMDIR,
+    /// or a GNU sparse tar entry).
     Skipped { path: &'a str },
 }
 
 pub trait Sink {
     /// Called for DICOM and NIfTI leaves only. An `Err` that is not caused by
     /// the leaf reader stops the walk with `WalkError::Io`.
+    ///
+    /// If `leaf.reader` returns an error (broken input or a limit abort), the
+    /// sink must discard whatever it wrote for this leaf: the bytes are
+    /// incomplete. The walker reports the failure itself.
     fn leaf(&mut self, leaf: Leaf<'_>) -> io::Result<()>;
     fn event(&mut self, ev: Event<'_>);
 }
@@ -260,23 +269,34 @@ impl Walker<'_> {
                 Ok(())
             }
             kind @ (Kind::Dicom | Kind::Nifti) => self.leaf(path, kind, false, &head, &head, src),
-            kind => {
-                let max = self.budget.limits().max_depth;
-                let depth = depth.saturating_add(1);
-                if depth > max {
-                    self.sink.event(Event::ContainerFailed {
-                        path,
-                        reason: format!("too deeply nested (limit {max})"),
-                    });
-                    return Ok(());
-                }
-                let spool = self.spool(&head, src)?;
-                let mut file = spool.as_file().try_clone().map_err(Fail::Io)?;
-                file.seek(SeekFrom::Start(0)).map_err(Fail::Io)?;
-                self.container(file, kind, path, depth)
-                // `spool` is dropped (and deleted) here.
-            }
+            kind => self.nested(kind, &head, src, path, depth),
         }
+    }
+
+    /// A container read from a stream (`head` already read from `src`):
+    /// check depth, spool to a temp file in `tmp_dir`, walk it at depth+1.
+    fn nested<R: Read>(
+        &mut self,
+        kind: Kind,
+        head: &[u8],
+        src: &mut Counted<'_, R>,
+        path: &str,
+        depth: u32,
+    ) -> Result<(), Fail> {
+        let max = self.budget.limits().max_depth;
+        let depth = depth.saturating_add(1);
+        if depth > max {
+            self.sink.event(Event::ContainerFailed {
+                path,
+                reason: format!("too deeply nested (limit {max})"),
+            });
+            return Ok(());
+        }
+        let spool = self.spool(head, src)?;
+        let mut file = spool.as_file().try_clone().map_err(Fail::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(Fail::Io)?;
+        self.container(file, kind, path, depth)
+        // `spool` is dropped (and deleted) here.
     }
 
     /// Copy `head` + the rest of `src` to a temp file in `tmp_dir`. The bytes
@@ -295,49 +315,81 @@ impl Walker<'_> {
     }
 
     fn zip(&mut self, file: File, path: &str, depth: u32) -> Result<(), Fail> {
-        // The zip crate keeps metadata for every central-directory entry in
-        // memory, so refuse an archive that declares more entries than the
-        // budget has left before letting it parse them.
-        let declared = zip_declared_entries(&file).map_err(Fail::Io)?;
+        // The zip crate keeps metadata for every central-directory record in
+        // memory: refuse an archive whose directory is too big, or that
+        // declares more entries than the budget has left, before it parses.
+        let cd = zip_central_directory(&file).map_err(Fail::Io)?;
+        if cd.bytes > MAX_ZIP_CENTRAL_DIRECTORY {
+            return Err(Fail::Container(cannot_read("central directory too large")));
+        }
         let limits = self.budget.limits();
-        if declared > limits.max_entries.saturating_sub(self.budget.entries()) {
+        if cd.entries > limits.max_entries.saturating_sub(self.budget.entries()) {
             return Err(Fail::Abort(self.budget.abort_entries()));
         }
         let mut ar = zip::ZipArchive::new(BufReader::new(file))
             .map_err(|e| Fail::Container(cannot_read(e)))?;
-        // Refuse an archive with any encrypted entry before emitting anything.
+        // Every file encrypted: the archive is. Some encrypted: those entries.
+        let mut files = 0usize;
+        let mut encrypted = 0usize;
         for i in 0..ar.len() {
             let meta = ar
                 .by_index_data(i)
                 .map_err(|e| Fail::Container(cannot_read(e)))?;
-            if meta.encrypted() {
-                return Err(Fail::Container("encrypted archive".into()));
+            if !(meta.is_dir() || meta.is_symlink()) {
+                files += 1;
+                encrypted += usize::from(meta.encrypted());
             }
         }
+        if files > 0 && encrypted == files {
+            return Err(Fail::Container("encrypted archive".into()));
+        }
         for i in 0..ar.len() {
-            let name = {
+            let (name, is_encrypted) = {
                 let meta = ar
                     .by_index_data(i)
                     .map_err(|e| Fail::Container(cannot_read(e)))?;
                 if meta.is_dir() || meta.is_symlink() {
                     continue;
                 }
-                meta.name()
-                    .map_err(|e| Fail::Container(cannot_read(e)))?
-                    .into_owned()
+                let name = meta
+                    .name()
+                    .map(|n| n.into_owned())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(meta.name_raw()).into_owned());
+                (name, meta.encrypted())
             };
             let entry_path = format!("{path}!/{name}");
-            let zf = ar
-                .by_index(i)
-                .map_err(|e| Fail::Container(cannot_read(e)))?;
-            let mut src = Counted::new(zf, self.budget, true);
-            self.entry(&mut src, &entry_path, depth)?;
+            let res = if is_encrypted {
+                self.count_entry()?;
+                Err(Fail::Container("encrypted archive".into()))
+            } else {
+                match ar.by_index(i) {
+                    Ok(zf) => {
+                        let mut src = Counted::new(zf, self.budget, true);
+                        self.entry(&mut src, &entry_path, depth)
+                    }
+                    Err(e) => {
+                        self.count_entry()?;
+                        Err(Fail::Container(cannot_read(e)))
+                    }
+                }
+            };
+            // Random access: one bad entry fails only itself.
+            match res {
+                Err(Fail::Container(reason)) => self.sink.event(Event::EntryFailed {
+                    path: &entry_path,
+                    reason,
+                }),
+                other => other?,
+            }
         }
         Ok(())
     }
 
     /// Walk a tar stream. `count_entries`: charge entry reads to the budget
     /// (false when `r` is already a counted decoder, to avoid double counting).
+    ///
+    /// Iterates raw headers so that GNU long-name/long-link and pax headers,
+    /// which the tar crate would read whole into memory, are size-capped here.
     fn tar<R: Read>(
         &mut self,
         r: R,
@@ -346,25 +398,88 @@ impl Walker<'_> {
         count_entries: bool,
     ) -> Result<(), Fail> {
         let mut ar = tar::Archive::new(r);
-        let entries = ar.entries().map_err(|e| self.read_fail(e))?;
+        let entries = ar.entries().map_err(|e| self.read_fail(e))?.raw(true);
+        let mut long_name: Option<Vec<u8>> = None;
+        let mut pax_path: Option<Vec<u8>> = None;
+        let mut pax_size: Option<u64> = None;
         for item in entries {
-            let entry = item.map_err(|e| self.read_fail(e))?;
+            let mut entry = item.map_err(|e| self.read_fail(e))?;
             let et = entry.header().entry_type();
-            // Only plain files. Links, devices and directories are ignored;
-            // GNU sparse entries too, since their expansion would not pass
-            // through a counted decoder.
+            // Raw size as stored (the tar crate skips data by this); `size()`
+            // would report a sparse file's expanded size instead.
+            let size = entry.header().entry_size().map_err(|e| self.read_fail(e))?;
+            if et.is_gnu_longname()
+                || et.is_gnu_longlink()
+                || et.is_pax_local_extensions()
+                || et.is_pax_global_extensions()
+            {
+                if size > MAX_TAR_META {
+                    return Err(Fail::Container(cannot_read(
+                        "oversized tar metadata header",
+                    )));
+                }
+                let mut data = Vec::new();
+                (&mut entry)
+                    .take(size)
+                    .read_to_end(&mut data)
+                    .map_err(|e| self.read_fail(e))?;
+                if et.is_gnu_longname() {
+                    while data.last() == Some(&0) {
+                        data.pop();
+                    }
+                    long_name = Some(data);
+                } else if et.is_pax_local_extensions() {
+                    for ext in tar::PaxExtensions::new(&data) {
+                        let ext = ext.map_err(|e| self.read_fail(e))?;
+                        match ext.key_bytes() {
+                            b"path" => pax_path = Some(ext.value_bytes().to_vec()),
+                            b"size" => {
+                                let v = ext
+                                    .value()
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .ok_or_else(|| Fail::Container(cannot_read("bad pax size")))?;
+                                pax_size = Some(v);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                continue;
+            }
+            // Raw iteration skips entry data by the header size; a pax size
+            // override would desynchronise the stream, so refuse it.
+            if let Some(ps) = pax_size.take()
+                && ps != size
+            {
+                return Err(Fail::Container(cannot_read(
+                    "unsupported pax size override",
+                )));
+            }
+            let pax = pax_path.take();
+            let long = long_name.take();
+            let name_bytes = match pax.or(long) {
+                Some(n) => n,
+                None => entry.path_bytes().into_owned(),
+            };
+            let entry_path = format!("{path}!/{}", String::from_utf8_lossy(&name_bytes));
+            if et.is_gnu_sparse() {
+                self.count_entry()?;
+                self.sink.event(Event::Skipped { path: &entry_path });
+                continue;
+            }
+            // Only plain files; links, devices and directories are ignored.
             if !(et.is_file() || et.is_contiguous()) {
                 continue;
             }
-            let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
-            let entry_path = format!("{path}!/{name}");
             let mut src = Counted::new(entry, self.budget, count_entries);
             self.entry(&mut src, &entry_path, depth)?;
         }
         Ok(())
     }
 
-    /// gzip: peek the decompressed head and classify the inner stream.
+    /// gzip: peek the decompressed head and classify the inner stream. The
+    /// decompressed layer keeps the gzip's path: `x.zip.gz!/IM1`.
     fn gzip(&mut self, file: File, path: &str, depth: u32) -> Result<(), Fail> {
         let budget = self.budget;
         let mut dec = Counted::new(MultiGzDecoder::new(BufReader::new(&file)), budget, true);
@@ -384,7 +499,10 @@ impl Walker<'_> {
             Kind::Dicom if !is_dicomdir(&head) => {
                 self.leaf(path, Kind::Dicom, false, &head, &head, &mut dec)
             }
-            _ => {
+            kind @ (Kind::Zip | Kind::SevenZ | Kind::Rar | Kind::Gzip) => {
+                self.nested(kind, &head, &mut dec, path, depth)
+            }
+            Kind::Dicom | Kind::Other => {
                 self.sink.event(Event::Skipped { path });
                 Ok(())
             }
@@ -392,10 +510,24 @@ impl Walker<'_> {
     }
 }
 
-/// The largest entry count declared by any end-of-central-directory record
-/// (ZIP64 included) in the last 64 KiB + 22 bytes of the file; 0 if none.
-/// Every candidate is considered, so a decoy record cannot hide a bigger one.
-fn zip_declared_entries(mut file: &File) -> io::Result<u64> {
+/// Cap on a ZIP central directory (the zip crate holds it all in memory).
+const MAX_ZIP_CENTRAL_DIRECTORY: u64 = 256 * 1024 * 1024;
+/// Cap on a tar GNU long-name/long-link or pax header's data.
+const MAX_TAR_META: u64 = 1024 * 1024;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CentralDirectory {
+    /// Largest declared entry count.
+    entries: u64,
+    /// Largest of the declared directory sizes and the real span from the
+    /// declared directory offset to its end record.
+    bytes: u64,
+}
+
+/// Look at every end-of-central-directory record (ZIP64 included) in the
+/// last 64 KiB + 22 bytes, so a decoy record cannot hide a bigger one, and
+/// report the worst case. All zeros if there is none.
+fn zip_central_directory(mut file: &File) -> io::Result<CentralDirectory> {
     const EOCD: &[u8] = b"PK\x05\x06";
     const LOC64: &[u8] = b"PK\x06\x07";
     const EOCD64: &[u8] = b"PK\x06\x06";
@@ -404,19 +536,21 @@ fn zip_declared_entries(mut file: &File) -> io::Result<u64> {
     file.seek(SeekFrom::Start(start))?;
     let mut tail = Vec::new();
     file.take(len - start).read_to_end(&mut tail)?;
-    let u16_at = |b: &[u8], o: usize| b.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]]));
-    let u64_at = |b: &[u8], o: usize| {
-        b.get(o..o + 8)
-            .and_then(|x| x.try_into().ok())
-            .map(u64::from_le_bytes)
+    let le = |b: &[u8], o: usize, n: usize| -> u64 {
+        b.get(o..o + n)
+            .map(|x| x.iter().rev().fold(0u64, |a, &v| (a << 8) | u64::from(v)))
+            .unwrap_or(0)
     };
-    let mut max = 0u64;
+    let mut cd = CentralDirectory::default();
     for i in 0..tail.len().saturating_sub(21) {
         if tail.get(i..i + 4) != Some(EOCD) {
             continue;
         }
-        let n = u16_at(&tail, i + 10).unwrap_or(0);
-        max = max.max(u64::from(n));
+        let pos = start + i as u64;
+        cd.entries = cd.entries.max(le(&tail, i + 10, 2));
+        let size = le(&tail, i + 12, 4);
+        let offset = le(&tail, i + 16, 4);
+        cd.bytes = cd.bytes.max(size).max(pos.saturating_sub(offset));
         // ZIP64 locator sits right before the EOCD and points at the record.
         let Some(loc) = i.checked_sub(20) else {
             continue;
@@ -424,9 +558,7 @@ fn zip_declared_entries(mut file: &File) -> io::Result<u64> {
         if tail.get(loc..loc + 4) != Some(LOC64) {
             continue;
         }
-        let Some(off) = u64_at(&tail, loc + 8) else {
-            continue;
-        };
+        let off = le(&tail, loc + 8, 8);
         if off.saturating_add(56) > len {
             continue;
         }
@@ -434,11 +566,14 @@ fn zip_declared_entries(mut file: &File) -> io::Result<u64> {
         file.seek(SeekFrom::Start(off))?;
         file.read_exact(&mut rec)?;
         if rec.get(0..4) == Some(EOCD64) {
-            max = max.max(u64_at(&rec, 32).unwrap_or(0));
+            cd.entries = cd.entries.max(le(&rec, 32, 8));
+            let size = le(&rec, 40, 8);
+            let offset = le(&rec, 48, 8);
+            cd.bytes = cd.bytes.max(size).max(off.saturating_sub(offset));
         }
     }
     file.seek(SeekFrom::Start(0))?;
-    Ok(max)
+    Ok(cd)
 }
 
 /// Read up to `SNIFF_LEN` bytes (fewer only at end of stream).
@@ -470,6 +605,47 @@ fn is_dicomdir(head: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn small_zip() -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        w.start_file("a", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        w.write_all(b"hello").unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    fn cd_of(bytes: &[u8]) -> CentralDirectory {
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(bytes).unwrap();
+        zip_central_directory(&f).unwrap()
+    }
+
+    #[test]
+    fn central_directory_bounds() {
+        let z = small_zip();
+        let eocd = z.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+        let declared = u32::from_le_bytes(z[eocd + 12..eocd + 16].try_into().unwrap());
+        let cd = cd_of(&z);
+        assert_eq!(cd.entries, 1);
+        assert_eq!(cd.bytes, u64::from(declared));
+
+        // under-declared size: the real span from the offset still counts
+        let mut z2 = z.clone();
+        z2[eocd + 12..eocd + 16].copy_from_slice(&0u32.to_le_bytes());
+        z2[eocd + 16..eocd + 20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(cd_of(&z2).bytes, eocd as u64);
+
+        // a decoy record at the end cannot hide a bigger one before it
+        let mut z3 = z.clone();
+        let mut decoy = z[eocd..eocd + 22].to_vec();
+        decoy[10..12].copy_from_slice(&0u16.to_le_bytes());
+        decoy[12..16].copy_from_slice(&0u32.to_le_bytes());
+        z3.extend_from_slice(&decoy);
+        assert_eq!(cd_of(&z3).entries, 1);
+
+        assert_eq!(cd_of(b"not a zip"), CentralDirectory::default());
+    }
 
     #[test]
     fn dicomdir_uid_must_end() {

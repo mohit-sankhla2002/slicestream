@@ -20,6 +20,7 @@ struct Rec {
 struct Recorder {
     leaves: Vec<Rec>,
     failed: Vec<(String, String)>,
+    entry_failed: Vec<(String, String)>,
     skipped: Vec<String>,
 }
 
@@ -48,6 +49,9 @@ impl Sink for Recorder {
         match ev {
             Event::ContainerFailed { path, reason } => {
                 self.failed.push((path.to_string(), reason));
+            }
+            Event::EntryFailed { path, reason } => {
+                self.entry_failed.push((path.to_string(), reason));
             }
             Event::Skipped { path } => self.skipped.push(path.to_string()),
         }
@@ -542,5 +546,135 @@ fn disk_guard_aborts() {
         other => panic!("expected abort, got {other:?}"),
     }
     assert!(rec.leaves.is_empty());
+    assert_tmp_empty(&e.tmp);
+}
+
+#[test]
+fn tar_oversized_metadata_header_fails_container() {
+    let mut h = tar::Header::new_gnu();
+    h.set_path("././@LongLink").unwrap();
+    h.set_entry_type(tar::EntryType::GNULongName);
+    h.set_size(20 * 1024 * 1024 * 1024);
+    h.set_mode(0o644);
+    h.set_cksum();
+    let tgz = gz(&tar_raw_header(&h, &[0u8; 4096]));
+    let z = zip(&[("evil.tgz", &tgz), ("IM", &dicom("1"))]);
+    let (r, rec, e) = run(&z, "o.zip", &Limits::default());
+    r.unwrap();
+    assert_eq!(
+        rec.failed,
+        vec![(
+            "o.zip!/evil.tgz".to_string(),
+            "cannot read archive: oversized tar metadata header".to_string()
+        )]
+    );
+    assert_eq!(rec.paths(), vec!["o.zip!/IM"]);
+    assert_tmp_empty(&e.tmp);
+}
+
+#[test]
+fn tar_long_names_and_pax_paths() {
+    let long = format!("{}/IM1", "d".repeat(150));
+    let a = dicom("A");
+    let b = dicom("B");
+    let t = tar(&[
+        TarItem::File(&long, &a),
+        TarItem::PaxFile("pax/name/IM2", &b),
+    ]);
+    let (r, rec, _e) = run(&gz(&t), "x.tgz", &Limits::default());
+    r.unwrap();
+    assert_eq!(rec.leaf(&format!("x.tgz!/{long}")).sha, sha(&a));
+    assert_eq!(rec.leaf("x.tgz!/pax/name/IM2").sha, sha(&b));
+    assert_eq!(rec.leaves.len(), 2);
+}
+
+#[test]
+fn tar_sparse_entry_is_skipped() {
+    let mut h = tar::Header::new_gnu();
+    h.set_path("sparse").unwrap();
+    h.set_entry_type(tar::EntryType::GNUSparse);
+    h.set_size(0);
+    h.as_gnu_mut().unwrap().set_real_size(1 << 40);
+    h.set_mode(0o644);
+    h.set_cksum();
+    let (r, rec, _e) = run(&tar_raw_header(&h, &[]), "s.tar", &Limits::default());
+    assert!(rec.failed.is_empty(), "{:?} {:?}", rec.failed, rec.skipped);
+    assert_eq!(r.unwrap().entries_seen, 1);
+    assert_eq!(rec.skipped, vec!["s.tar!/sparse"]);
+}
+
+#[test]
+fn zip_central_directory_too_large_fails_container() {
+    let big = set_cd_size(zip(&[("IM", &dicom("1"))]), 300 * 1024 * 1024);
+    let outer = zip(&[("big.zip", &big), ("IM2", &dicom("2"))]);
+    let (r, rec, e) = run(&outer, "o.zip", &Limits::default());
+    r.unwrap();
+    assert_eq!(
+        rec.failed,
+        vec![(
+            "o.zip!/big.zip".to_string(),
+            "cannot read archive: central directory too large".to_string()
+        )]
+    );
+    assert_eq!(rec.paths(), vec!["o.zip!/IM2"]);
+    assert_tmp_empty(&e.tmp);
+}
+
+#[test]
+fn zip_bad_entry_fails_alone() {
+    let z = corrupt(
+        zip_stored(&[
+            ("IM1", &dicom("ONE")),
+            ("IM2", &dicom("CORRUPTED")),
+            ("IM3", &dicom("THREE")),
+        ]),
+        b"CORRUPTED",
+    );
+    let (r, rec, e) = run(&z, "o.zip", &Limits::default());
+    let stats = r.unwrap();
+    assert_eq!(rec.paths(), vec!["o.zip!/IM1", "o.zip!/IM3"]);
+    assert_eq!(rec.entry_failed.len(), 1, "{:?}", rec.entry_failed);
+    assert_eq!(rec.entry_failed[0].0, "o.zip!/IM2");
+    assert!(rec.entry_failed[0].1.starts_with("cannot read archive: "));
+    assert!(rec.failed.is_empty());
+    assert_eq!(stats.entries_seen, 3);
+    assert_tmp_empty(&e.tmp);
+
+    // one encrypted entry among plain ones fails only itself
+    let z = mark_entry_encrypted(zip(&[("A", &dicom("a")), ("B", &dicom("b"))]), "B");
+    let (r, rec, _e) = run(&z, "p.zip", &Limits::default());
+    r.unwrap();
+    assert_eq!(rec.paths(), vec!["p.zip!/A"]);
+    assert_eq!(
+        rec.entry_failed,
+        vec![("p.zip!/B".to_string(), "encrypted archive".to_string())]
+    );
+    assert!(rec.failed.is_empty());
+}
+
+#[test]
+fn gzip_of_zip_is_walked() {
+    let d = dicom("1");
+    let zgz = gz(&zip(&[("IM1", &d)]));
+    let (r, rec, e) = run(&zgz, "x.zip.gz", &Limits::default());
+    r.unwrap();
+    assert_eq!(rec.paths(), vec!["x.zip.gz!/IM1"]);
+    assert_eq!(rec.leaf("x.zip.gz!/IM1").sha, sha(&d));
+    assert_tmp_empty(&e.tmp);
+
+    // the decompressed layer counts as a nesting level
+    let limits = Limits {
+        max_depth: 0,
+        ..Limits::default()
+    };
+    let (r, rec, e) = run(&zgz, "x.zip.gz", &limits);
+    r.unwrap();
+    assert_eq!(
+        rec.failed,
+        vec![(
+            "x.zip.gz".to_string(),
+            "too deeply nested (limit 0)".to_string()
+        )]
+    );
     assert_tmp_empty(&e.tmp);
 }
