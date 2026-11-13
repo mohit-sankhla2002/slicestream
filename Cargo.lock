@@ -2239,6 +2239,7 @@ dependencies = [
  "http-body-util",
  "mime",
  "multer",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "slicestream-archive",
@@ -2739,6 +2740,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

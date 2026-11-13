@@ -1,10 +1,12 @@
-//! Server configuration: one TOML file with `[storage]`, `[http]` and `[dimse]`.
+//! Server configuration: one TOML file with `[storage]`, `[http]`,
+//! `[dimse]` and `[archives]`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use slicestream_archive::Limits;
 use slicestream_dimse::ScpConfig;
 use slicestream_store::StorageConfig;
 
@@ -16,6 +18,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub http: HttpConfig,
     pub dimse: ScpConfig,
+    pub archives: ArchivesConfig,
 }
 
 impl Config {
@@ -83,5 +86,54 @@ impl std::fmt::Debug for HttpConfig {
             .field("allowed_hosts", &self.allowed_hosts)
             .field("metrics_enabled", &self.metrics_enabled)
             .finish()
+    }
+}
+
+/// Archive / NIfTI uploads (`POST /api/archives`). Every field has a
+/// default, so `[archives]` may be empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArchivesConfig {
+    /// Mount `POST /api/archives` and `GET /api/archives/{job}`.
+    pub enabled: bool,
+    /// Nesting levels allowed below the uploaded file.
+    pub max_depth: u32,
+    /// Files seen across one whole upload.
+    pub max_entries: u64,
+    /// Decompressed bytes written to `tmp/` per upload.
+    pub max_expanded_bytes: u64,
+    /// Free space to keep on the storage volume: uploads are refused (507)
+    /// or aborted below it.
+    pub min_free_bytes: u64,
+    /// Jobs processed at once; further uploads wait in a queue of
+    /// `4 × max_concurrent_jobs` (queued and running).
+    pub max_concurrent_jobs: usize,
+    /// Finished jobs kept in memory for `GET /api/archives/{job}`.
+    pub job_retention: usize,
+}
+
+impl Default for ArchivesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: 4,
+            max_entries: 200_000,
+            max_expanded_bytes: 68_719_476_736,
+            min_free_bytes: 2_147_483_648,
+            max_concurrent_jobs: 2,
+            job_retention: 50,
+        }
+    }
+}
+
+impl ArchivesConfig {
+    /// The walker limits for one upload.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            max_depth: self.max_depth,
+            max_entries: self.max_entries,
+            max_expanded_bytes: self.max_expanded_bytes,
+            min_free_bytes: self.min_free_bytes,
+        }
     }
 }

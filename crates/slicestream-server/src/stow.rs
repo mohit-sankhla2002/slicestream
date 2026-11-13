@@ -106,7 +106,7 @@ pub async fn stow_study(
     stow_inner(&state, Some(study), remote_addr(&ext), &headers, body).await
 }
 
-fn remote_addr(ext: &Extensions) -> Option<SocketAddr> {
+pub(crate) fn remote_addr(ext: &Extensions) -> Option<SocketAddr> {
     ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0)
 }
 
@@ -282,7 +282,7 @@ fn base_url(http: &HttpConfig, headers: &HeaderMap) -> String {
 }
 
 /// Whether the request carries the configured bearer token (if any).
-fn authorized(http: &HttpConfig, headers: &HeaderMap) -> bool {
+pub(crate) fn authorized(http: &HttpConfig, headers: &HeaderMap) -> bool {
     let Some(expected) = &http.stow_token else {
         return true;
     };
@@ -302,7 +302,7 @@ fn authorized(http: &HttpConfig, headers: &HeaderMap) -> bool {
     token.trim().as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
-fn unauthorized() -> Response {
+pub(crate) fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],

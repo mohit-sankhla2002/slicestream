@@ -10,7 +10,8 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::handler::HandlerWithoutStateExt;
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::routing::{get, post};
 use slicestream_core::SchedulerConfig;
@@ -22,6 +23,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
 pub mod archive_ingest;
+pub mod archive_jobs;
 pub mod catalog;
 pub mod config;
 pub mod hosts;
@@ -43,6 +45,9 @@ pub struct AppState {
     /// not mounted.
     pub metrics: Option<Arc<metrics::Metrics>>,
     pub gauges: Arc<metrics::Gauges>,
+    /// `None` when `[archives] enabled = false`; the archive routes are
+    /// then not mounted.
+    pub archives: Option<Arc<archive_jobs::ArchiveJobs>>,
 }
 
 /// Build the application router.
@@ -76,6 +81,15 @@ pub fn app(state: Arc<AppState>) -> Router {
             .route("/api/console/series", get(routes::console_series));
     }
 
+    // Archive uploads and job reports (which reveal patient names): no CORS.
+    let mut archives = Router::new();
+    if state.archives.is_some() {
+        archives = archives
+            .route("/api/archives", post(archive_jobs::post_archive))
+            .route("/api/archives/{job}", get(archive_jobs::get_archive))
+            .layer(DefaultBodyLimit::disable());
+    }
+
     // Every route, including static files, checks Host against DNS rebinding.
     let allowed = Arc::new(hosts::HostAllowList::from_config(&state.http));
     let gauges = Arc::clone(&state.gauges);
@@ -83,7 +97,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .merge(read)
         .merge(ingest)
         .merge(console)
-        .fallback_service(ServeDir::new(&state.http.web_dir))
+        .merge(archives)
+        // Static files answer GET/HEAD only; any other method on a path no
+        // route claims is 404, so an unmounted API route reads as absent.
+        .fallback_service(
+            ServeDir::new(&state.http.web_dir)
+                .call_fallback_on_method_not_allowed(true)
+                .fallback(not_found.into_service()),
+        )
         .layer(axum::middleware::from_fn(move |req, next| {
             hosts::host_guard(Arc::clone(&allowed), req, next)
         }))
@@ -96,6 +117,10 @@ pub fn app(state: Arc<AppState>) -> Router {
             }
         }))
         .with_state(state)
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 /// CORS for exactly `origins`; `None` when the list is empty.
@@ -172,6 +197,7 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         root = %root.display(),
         tmp_removed = report.tmp_removed,
         orphans_removed = report.orphans_removed,
+        uploads_aborted = report.uploads_aborted,
         "storage ready"
     );
 
@@ -198,6 +224,14 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         Some((m, h)) => (Some(m), Some(h)),
         None => (None, None),
     };
+    let archives = config.archives.enabled.then(|| {
+        archive_jobs::ArchiveJobs::new(
+            Arc::clone(&ingestor),
+            config.archives.clone(),
+            shutdown.clone(),
+        )
+    });
+    let jobs = archives.clone();
     let state = Arc::new(AppState {
         catalog,
         ingestor,
@@ -205,6 +239,7 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         http,
         metrics,
         gauges,
+        archives,
     });
     let router = app(state);
 
@@ -253,6 +288,13 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
             (None, Some(t)) => joined("DIMSE", t.await),
             (None, None) => Ok(()),
         };
+        // Running archive jobs stop at their next entry; queued ones abort.
+        if let Some(jobs) = jobs {
+            if !jobs.wait(HTTP_SHUTDOWN_GRACE).await {
+                tracing::warn!("archive jobs still running after the grace period");
+            }
+            drop(jobs);
+        }
         // Let the sampler release the storage lock before reporting stopped.
         if let Some(h) = sampler {
             let _ = h.await;

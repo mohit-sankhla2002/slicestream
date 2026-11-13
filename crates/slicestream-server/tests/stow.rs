@@ -66,6 +66,7 @@ async fn harness_with(
         http: cfg,
         metrics: None,
         gauges: Default::default(),
+        archives: None,
     });
     Harness {
         router: app(state),
@@ -428,6 +429,7 @@ async fn post_instance_too_large_413() {
         },
         metrics: None,
         gauges: Default::default(),
+        archives: None,
     }));
     let (status, json) = send(
         &router,

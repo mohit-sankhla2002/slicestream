@@ -23,3 +23,17 @@ read_timeout_secs = 60
 write_timeout_secs = 60
 handshake_timeout_secs = 30      # TCP accept -> association established
 idle_timeout_secs = 300          # abort when no DIMSE command arrives
+
+# Archive and NIfTI uploads: POST /api/archives (ZIP, 7z, RAR, tar, tar.gz,
+# .nii/.nii.gz or a single DICOM file), progress at GET /api/archives/{job}.
+# Same token as STOW ([http] stow_token); the body is capped by
+# [http] max_request_bytes. Exceeding max_entries or max_expanded_bytes
+# aborts the upload (items already stored stay stored).
+[archives]
+enabled = true                      # false: both archive routes are not mounted
+max_depth = 4                       # nesting levels below the uploaded file
+max_entries = 200000                # files seen across the whole upload
+max_expanded_bytes = 68719476736    # 64 GiB of decompressed data per upload
+min_free_bytes = 2147483648         # keep 2 GiB free: refuse (507) or abort below it
+max_concurrent_jobs = 2             # further uploads wait (queue cap: 4x this)
+job_retention = 50                  # finished jobs kept in memory for the API

@@ -22,6 +22,7 @@ use slicestream_store::{
     Expectations, IngestError, IngestSource, Ingestor, NiftiMeta, SpooledBlob, UploadCounts,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::linking;
 
@@ -85,6 +86,28 @@ pub trait Progress: Send + Sync {
     /// Walker totals so far: after each counted entry (bytes lag by up to
     /// one entry) and exactly after each walked file, also on abort.
     fn stats(&self, entries_seen: u64, bytes_expanded: u64);
+    /// The server's shutdown token, if any. Once it is cancelled the upload
+    /// stops at the next entry and ends `aborted` with reason
+    /// [`SHUTDOWN_REASON`]; entries already stored stay stored.
+    fn shutdown(&self) -> Option<CancellationToken> {
+        None
+    }
+}
+
+/// Abort reason of an upload stopped by [`Progress::shutdown`].
+pub const SHUTDOWN_REASON: &str = "server shutting down";
+
+/// Add one entry result to `counts` (as the `uploads` row counts it).
+pub fn count(counts: &mut UploadCounts, r: &EntryResult) {
+    let c = counts;
+    match (r.outcome, r.kind) {
+        (EntryOutcome::Stored | EntryOutcome::Replaced, "nifti") => c.nifti_stored += 1,
+        (EntryOutcome::Stored | EntryOutcome::Replaced, _) => c.dicom_stored += 1,
+        (EntryOutcome::Duplicate, "nifti") => c.nifti_duplicate += 1,
+        (EntryOutcome::Duplicate, _) => c.dicom_duplicate += 1,
+        (EntryOutcome::Skipped, _) => c.skipped += 1,
+        (EntryOutcome::Failed, _) => c.failed += 1,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -409,15 +432,7 @@ struct Collect {
 
 impl Collect {
     fn record(&mut self, r: EntryResult) {
-        let c = &mut self.counts;
-        match (r.outcome, r.kind) {
-            (EntryOutcome::Stored | EntryOutcome::Replaced, "nifti") => c.nifti_stored += 1,
-            (EntryOutcome::Stored | EntryOutcome::Replaced, _) => c.dicom_stored += 1,
-            (EntryOutcome::Duplicate, "nifti") => c.nifti_duplicate += 1,
-            (EntryOutcome::Duplicate, _) => c.dicom_duplicate += 1,
-            (EntryOutcome::Skipped, _) => c.skipped += 1,
-            (EntryOutcome::Failed, _) => c.failed += 1,
-        }
+        count(&mut self.counts, &r);
         self.progress.entry(&r);
     }
 
@@ -603,6 +618,8 @@ where
     F: FnOnce(&mut ChannelSink) -> Result<(), WalkError> + Send + 'static,
 {
     let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+    // A token nobody cancels stands in when there is no shutdown token.
+    let shutdown = progress.shutdown().unwrap_or_default();
     let mut sink = ChannelSink {
         ingestor: Arc::clone(&ingestor),
         tx,
@@ -627,11 +644,28 @@ where
     for r in pre {
         c.record(r);
     }
-    while let Some(item) = rx.recv().await {
-        c.handle(item).await;
+    let mut stopped = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled(), if !stopped => {
+                // The walker's next send fails, which ends its walk.
+                stopped = true;
+                rx.close();
+            }
+            item = rx.recv() => match item {
+                // After shutdown, spooled leaves still queued are dropped
+                // (their spool files with them); results and totals are kept.
+                Some(item @ (Item::Done(_) | Item::Stats(..))) => c.handle(item).await,
+                Some(item) if !stopped => c.handle(item).await,
+                Some(_) => {}
+                None => break,
+            },
+        }
     }
 
     let (status, reason) = match walker.await {
+        Ok(_) if stopped => ("aborted", Some(SHUTDOWN_REASON.to_owned())),
         Ok(Ok(())) => ("done", None),
         Ok(Err(WalkError::Aborted(r))) => ("aborted", Some(r)),
         Ok(Err(e @ WalkError::Io(_))) => {
@@ -741,6 +775,81 @@ mod tests {
         .unwrap();
         assert!(err.is_err());
         // The spooled blob was dropped with the failed send.
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
+            0
+        );
+    }
+
+    struct Cancelled(CancellationToken);
+    impl Progress for Cancelled {
+        fn entry(&self, _: &EntryResult) {}
+        fn stats(&self, _: u64, _: u64) {}
+        fn shutdown(&self) -> Option<CancellationToken> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_walk_at_next_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = Ingestor::open(StorageConfig {
+            root: dir.path().to_path_buf(),
+            ..StorageConfig::default()
+        })
+        .await
+        .unwrap();
+        let id = ingestor
+            .index()
+            .create_upload("http_archive", "x", None)
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let progress = Arc::new(Cancelled(token.clone()));
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let walk = tokio::spawn(run(
+            Arc::clone(&ingestor),
+            id,
+            progress,
+            Vec::new(),
+            move |sink| {
+                // An endless walk: only a failed send ends it.
+                let mut n = 0u64;
+                loop {
+                    let mut data: &[u8] = &[1u8; 64];
+                    let spooled = sink.ingestor.spool_sync(&mut data).unwrap();
+                    let item = Item::Dicom {
+                        path: format!("e{n}"),
+                        source: IngestSource::Http { remote: None },
+                        spooled,
+                    };
+                    if sink.send(item).is_err() {
+                        return Ok(());
+                    }
+                    n += 1;
+                    let _ = sent_tx.send(n);
+                }
+            },
+        ));
+        // Let a few entries through, then shut down.
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..3 {
+                sent_rx.recv().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        token.cancel();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), walk)
+            .await
+            .expect("walk stops")
+            .unwrap();
+        assert_eq!(out.status, "aborted");
+        assert_eq!(out.reason.as_deref(), Some(SHUTDOWN_REASON));
+        assert!(out.counts.failed >= 1, "{:?}", out.counts);
+        let row = ingestor.index().upload(id).await.unwrap().unwrap();
+        assert_eq!(row.status, "aborted");
+        // Queued spools were removed.
         assert_eq!(
             std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
             0
