@@ -29,11 +29,11 @@ use slicestream_core::series::slice_position;
 pub const MAX_VALUE_BYTES: u32 = 64 * 1024;
 
 /// Sequences nested deeper than this are rejected as unparseable.
-const MAX_SEQUENCE_DEPTH: usize = 32;
+pub(crate) const MAX_SEQUENCE_DEPTH: usize = 32;
 
 /// Top-level attributes read into memory. Must cover every tag used by
 /// [`read_header`], [`FrameInfo::from_dataset`] and [`slice_position`].
-const NEEDED: &[Tag] = &[
+pub(crate) const NEEDED: &[Tag] = &[
     tags::SPECIFIC_CHARACTER_SET,
     tags::SOP_CLASS_UID,
     tags::SOP_INSTANCE_UID,
@@ -65,9 +65,9 @@ const NEEDED: &[Tag] = &[
 ];
 
 /// The highest tag in [`NEEDED`]; parsing stops after it.
-const LAST_NEEDED: Tag = tags::RESCALE_SLOPE;
+pub(crate) const LAST_NEEDED: Tag = tags::RESCALE_SLOPE;
 
-const ITEM_DELIMITER: Tag = Tag(0xFFFE, 0xE00D);
+pub(crate) const ITEM_DELIMITER: Tag = Tag(0xFFFE, 0xE00D);
 
 /// Attributes extracted from an instance header for validation and indexing.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +90,14 @@ pub struct InstanceHeader {
     pub slice_position: Option<f64>,
     /// `None` for non-image objects (SR, PR, ...).
     pub frame_info: Option<FrameInfo>,
+    // Read only by the instance scan; `read_header` leaves them `None`.
+    pub study_time: Option<String>,
+    pub study_id: Option<String>,
+    pub referring_physician_name: Option<String>,
+    pub patient_birth_date: Option<String>,
+    pub patient_sex: Option<String>,
+    pub performed_procedure_step_start_date: Option<String>,
+    pub performed_procedure_step_start_time: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +108,7 @@ pub enum HeaderError {
     Missing(&'static str),
 }
 
-fn unparseable(e: impl std::fmt::Display) -> HeaderError {
+pub(crate) fn unparseable(e: impl std::fmt::Display) -> HeaderError {
     HeaderError::Unparseable(e.to_string())
 }
 
@@ -124,7 +132,35 @@ pub fn read_header(path: &Path) -> Result<InstanceHeader, HeaderError> {
 pub(crate) fn read_header_with_stats(
     path: &Path,
 ) -> Result<(InstanceHeader, ReadStats), HeaderError> {
+    let source = open_data_set(path)?;
+    let mut walker = Walker {
+        decoder: source.decoder,
+        stats: ReadStats::default(),
+    };
+    let obj = walker.read_top_level()?;
+    let mut stats = walker.stats;
+    stats.bytes_read = source.bytes_read.get();
+    Ok((header_from(&obj, source.transfer_syntax)?, stats))
+}
+
+/// A Part-10 file opened for decoding, positioned at its first data set element.
+pub(crate) struct DataSetSource {
+    pub decoder: DynStatefulDecoder<Box<dyn Read>>,
+    pub transfer_syntax: String,
+    /// False when the data set is deflated: decoder positions are then not
+    /// file offsets.
+    pub offsets_valid: bool,
+    /// File size, when the file system reports it.
+    pub file_len: Option<u64>,
+    /// Bytes pulled from the file so far (including read-ahead buffering).
+    pub bytes_read: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+/// Open `path`, read its preamble and file meta group, and set up a decoder
+/// whose `position()` is a file offset (for non-deflated data sets).
+pub(crate) fn open_data_set(path: &Path) -> Result<DataSetSource, HeaderError> {
     let file = File::open(path).map_err(unparseable)?;
+    let file_len = file.metadata().ok().map(|m| m.len());
     let counter = CountingReader {
         inner: file,
         count: Default::default(),
@@ -139,56 +175,73 @@ pub(crate) fn read_header_with_stats(
         src.consume(128);
     }
     let meta = FileMetaTable::from_reader(&mut src).map_err(unparseable)?;
+    // The meta group was read exactly; whatever the BufReader still holds
+    // belongs to the data set.
+    let dataset_start = bytes_read.get() - src.buffer().len() as u64;
     let transfer_syntax = meta.transfer_syntax().to_string();
     let ts = TransferSyntaxRegistry
         .get(&transfer_syntax)
         .ok_or_else(|| unparseable(format!("unknown transfer syntax {transfer_syntax}")))?;
-    let reader: Box<dyn Read> = match ts.codec() {
-        Codec::Dataset(Some(adapter)) => adapter.adapt_reader(Box::new(src)),
+    let (reader, offsets_valid): (Box<dyn Read>, bool) = match ts.codec() {
+        Codec::Dataset(Some(adapter)) => (adapter.adapt_reader(Box::new(src)), false),
         Codec::Dataset(None) => {
             return Err(unparseable(format!(
                 "unsupported transfer syntax {transfer_syntax}"
             )));
         }
-        Codec::None | Codec::EncapsulatedPixelData(..) => Box::new(src),
+        Codec::None | Codec::EncapsulatedPixelData(..) => (Box::new(src), true),
     };
-    let decoder = DynStatefulDecoder::new_with_ts(reader, ts, 0).map_err(unparseable)?;
-    let mut walker = Walker {
+    let decoder =
+        DynStatefulDecoder::new_with_ts(reader, ts, dataset_start).map_err(unparseable)?;
+    Ok(DataSetSource {
         decoder,
-        stats: ReadStats::default(),
-    };
-    let obj = walker.read_top_level()?;
-    let mut stats = walker.stats;
-    stats.bytes_read = bytes_read.get();
+        transfer_syntax,
+        offsets_valid,
+        file_len,
+        bytes_read,
+    })
+}
 
-    let req = |tag, name: &'static str| get_str(&obj, tag).ok_or(HeaderError::Missing(name));
+/// Build the header from the collected top-level attributes. The scan-only
+/// fields are left `None`.
+pub(crate) fn header_from(
+    obj: &InMemDicomObject,
+    transfer_syntax: String,
+) -> Result<InstanceHeader, HeaderError> {
+    let req = |tag, name: &'static str| get_str(obj, tag).ok_or(HeaderError::Missing(name));
     let sop_class_uid = req(tags::SOP_CLASS_UID, "SOPClassUID")?;
     let sop_instance_uid = req(tags::SOP_INSTANCE_UID, "SOPInstanceUID")?;
     let study_instance_uid = req(tags::STUDY_INSTANCE_UID, "StudyInstanceUID")?;
     let series_instance_uid = req(tags::SERIES_INSTANCE_UID, "SeriesInstanceUID")?;
-    let number_of_frames = get_i64(&obj, tags::NUMBER_OF_FRAMES)
+    let number_of_frames = get_i64(obj, tags::NUMBER_OF_FRAMES)
         .unwrap_or(1)
         .clamp(1, i64::from(u32::MAX)) as u32;
-    let header = InstanceHeader {
+    Ok(InstanceHeader {
         sop_class_uid,
         sop_instance_uid,
         study_instance_uid,
         series_instance_uid,
-        patient_id: get_str(&obj, tags::PATIENT_ID),
-        patient_name: get_str(&obj, tags::PATIENT_NAME),
-        study_date: get_str(&obj, tags::STUDY_DATE),
-        study_description: get_str(&obj, tags::STUDY_DESCRIPTION),
-        accession_number: get_str(&obj, tags::ACCESSION_NUMBER),
-        modality: get_str(&obj, tags::MODALITY),
-        series_number: get_i64(&obj, tags::SERIES_NUMBER),
-        series_description: get_str(&obj, tags::SERIES_DESCRIPTION),
-        instance_number: get_i64(&obj, tags::INSTANCE_NUMBER),
+        patient_id: get_str(obj, tags::PATIENT_ID),
+        patient_name: get_str(obj, tags::PATIENT_NAME),
+        study_date: get_str(obj, tags::STUDY_DATE),
+        study_description: get_str(obj, tags::STUDY_DESCRIPTION),
+        accession_number: get_str(obj, tags::ACCESSION_NUMBER),
+        modality: get_str(obj, tags::MODALITY),
+        series_number: get_i64(obj, tags::SERIES_NUMBER),
+        series_description: get_str(obj, tags::SERIES_DESCRIPTION),
+        instance_number: get_i64(obj, tags::INSTANCE_NUMBER),
         number_of_frames,
-        slice_position: slice_position(&obj),
-        frame_info: FrameInfo::from_dataset(&obj, &transfer_syntax).ok(),
+        slice_position: slice_position(obj),
+        frame_info: FrameInfo::from_dataset(obj, &transfer_syntax).ok(),
         transfer_syntax,
-    };
-    Ok((header, stats))
+        study_time: None,
+        study_id: None,
+        referring_physician_name: None,
+        patient_birth_date: None,
+        patient_sex: None,
+        performed_procedure_step_start_date: None,
+        performed_procedure_step_start_time: None,
+    })
 }
 
 /// Counts bytes pulled from the underlying file.
@@ -205,9 +258,9 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-struct Walker<D> {
-    decoder: D,
-    stats: ReadStats,
+pub(crate) struct Walker<D> {
+    pub decoder: D,
+    pub stats: ReadStats,
 }
 
 impl<D: StatefulDecode> Walker<D> {
@@ -247,7 +300,7 @@ impl<D: StatefulDecode> Walker<D> {
         Ok(obj)
     }
 
-    fn skip(&mut self, len: u32) -> Result<(), HeaderError> {
+    pub(crate) fn skip(&mut self, len: u32) -> Result<(), HeaderError> {
         self.decoder.skip_bytes(len).map_err(unparseable)?;
         self.stats.skipped_bytes += u64::from(len);
         Ok(())
@@ -255,7 +308,7 @@ impl<D: StatefulDecode> Walker<D> {
 
     /// Skip a sequence (or undefined-length element, which dicom-rs also
     /// reads as a sequence) whose header has just been decoded.
-    fn skip_sequence(&mut self, len: Length, depth: usize) -> Result<(), HeaderError> {
+    pub(crate) fn skip_sequence(&mut self, len: Length, depth: usize) -> Result<(), HeaderError> {
         if depth > MAX_SEQUENCE_DEPTH {
             return Err(unparseable("sequences nested too deeply"));
         }
@@ -292,12 +345,12 @@ impl<D: StatefulDecode> Walker<D> {
     }
 }
 
-fn is_sequence(header: &DataElementHeader) -> bool {
+pub(crate) fn is_sequence(header: &DataElementHeader) -> bool {
     header.vr() == VR::SQ || header.len.is_undefined()
 }
 
 /// Whether decoding a header failed because the data ended before its tag.
-fn is_eof_at_tag(e: &DecodeError) -> bool {
+pub(crate) fn is_eof_at_tag(e: &DecodeError) -> bool {
     matches!(
         e,
         DecodeError::DecodeElementHeader {
@@ -427,6 +480,13 @@ mod tests {
             slice_position: slice_position(&obj),
             frame_info: FrameInfo::from_dataset(&obj, &ts).ok(),
             transfer_syntax: ts,
+            study_time: None,
+            study_id: None,
+            referring_physician_name: None,
+            patient_birth_date: None,
+            patient_sex: None,
+            performed_procedure_step_start_date: None,
+            performed_procedure_step_start_time: None,
         }
     }
 

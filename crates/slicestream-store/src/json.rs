@@ -10,20 +10,30 @@ use dicom_core::{PrimitiveValue, Tag, VR};
 /// Largest magnitude a JSON number may carry without losing integer precision.
 const MAX_SAFE_INT: i128 = 1 << 53;
 
-// Narrow allow: the scanner in the next task is the first caller.
-#[allow(dead_code)]
 pub(crate) struct DicomJsonWriter {
     buf: Vec<u8>,
-    /// One entry per open object or array: true while nothing was written in it.
-    first: Vec<bool>,
+    /// One entry per open object or sequence, innermost last.
+    open: Vec<Level>,
 }
 
-#[allow(dead_code)]
+struct Level {
+    /// True while nothing was written in this level.
+    first: bool,
+    /// Text that closes this level.
+    close: &'static [u8],
+}
+
+impl Level {
+    fn new(close: &'static [u8]) -> Self {
+        Self { first: true, close }
+    }
+}
+
 impl DicomJsonWriter {
     pub(crate) fn new() -> Self {
         Self {
             buf: vec![b'{'],
-            first: vec![true],
+            open: vec![Level::new(b"}")],
         }
     }
 
@@ -32,10 +42,19 @@ impl DicomJsonWriter {
         self.buf.len()
     }
 
-    /// Close the top-level object and return the JSON text.
+    /// Drop the text written so far and return its length. Later output
+    /// still continues the same document.
+    pub(crate) fn discard(&mut self) -> usize {
+        let n = self.buf.len();
+        self.buf.clear();
+        n
+    }
+
+    /// Close every open level and return the JSON text. A writer stopped
+    /// inside a sequence or item still yields valid JSON.
     pub(crate) fn finish(mut self) -> Vec<u8> {
-        while self.first.pop().is_some() {
-            self.buf.push(b'}');
+        while let Some(level) = self.open.pop() {
+            self.buf.extend_from_slice(level.close);
         }
         self.buf
     }
@@ -73,31 +92,35 @@ impl DicomJsonWriter {
     pub(crate) fn begin_sequence(&mut self, tag: Tag) {
         self.key(tag);
         self.buf.extend_from_slice(b"{\"vr\":\"SQ\",\"Value\":[");
-        self.first.push(true);
+        self.open.push(Level::new(b"]}"));
     }
 
     pub(crate) fn begin_item(&mut self) {
         self.comma();
         self.buf.push(b'{');
-        self.first.push(true);
+        self.open.push(Level::new(b"}"));
     }
 
     pub(crate) fn end_item(&mut self) {
-        self.first.pop();
-        self.buf.push(b'}');
+        self.close();
     }
 
     pub(crate) fn end_sequence(&mut self) {
-        self.first.pop();
-        self.buf.extend_from_slice(b"]}");
+        self.close();
+    }
+
+    fn close(&mut self) {
+        if let Some(level) = self.open.pop() {
+            self.buf.extend_from_slice(level.close);
+        }
     }
 
     fn comma(&mut self) {
-        if let Some(first) = self.first.last_mut() {
-            if !*first {
+        if let Some(level) = self.open.last_mut() {
+            if !level.first {
                 self.buf.push(b',');
             }
-            *first = false;
+            level.first = false;
         }
     }
 
@@ -457,6 +480,32 @@ mod tests {
             ]})
         );
         assert_eq!(v["00200013"]["Value"], json!([3]));
+    }
+
+    #[test]
+    fn finish_closes_open_levels() {
+        // Stop inside an item inside a sequence.
+        let mut w = DicomJsonWriter::new();
+        w.element(Tag(0x0008, 0x0060), VR::CS, &PrimitiveValue::from("CT"));
+        w.begin_sequence(Tag(0x0008, 0x1140));
+        w.begin_item();
+        w.element(Tag(0x0008, 0x1150), VR::UI, &PrimitiveValue::from("1.2.3"));
+        let v: Value = serde_json::from_slice(&w.finish()).expect("valid json");
+        assert_eq!(
+            v["00081140"],
+            json!({"vr":"SQ","Value":[{"00081150":{"vr":"UI","Value":["1.2.3"]}}]})
+        );
+
+        // Stop right after opening a nested sequence.
+        let mut w = DicomJsonWriter::new();
+        w.begin_sequence(Tag(0x0008, 0x1140));
+        w.begin_item();
+        w.begin_sequence(Tag(0x0040, 0xA730));
+        let v: Value = serde_json::from_slice(&w.finish()).expect("valid json");
+        assert_eq!(
+            v["00081140"],
+            json!({"vr":"SQ","Value":[{"0040A730":{"vr":"SQ","Value":[]}}]})
+        );
     }
 
     #[test]
