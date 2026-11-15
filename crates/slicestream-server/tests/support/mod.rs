@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use dicom_core::value::PixelFragmentSequence;
 use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
@@ -125,6 +126,135 @@ pub fn study_uid(patient: u32, study: u32) -> String {
 /// Series Instance UID of the [`dicom`] fixtures.
 pub fn series_uid(patient: u32, study: u32, series: u32) -> String {
     format!("2.25.9{patient}0{study}.{series}")
+}
+
+/// Study and series of the image fixtures below ([`image`]).
+pub const IMAGE_STUDY: &str = "2.25.400000000000000000000000000001";
+pub const IMAGE_SERIES: &str = "2.25.400000000000000000000000000002";
+
+/// SOP Instance UID `n` of the image fixtures.
+pub fn image_sop(n: u32) -> String {
+    format!("2.25.40000000000000000000000000{n:04}")
+}
+
+/// Image attributes of a monochrome multi-frame instance in [`IMAGE_SERIES`],
+/// without Pixel Data. `bits` is Bits Allocated.
+pub fn image(sop: &str, frames: u32, rows: u16, cols: u16, bits: u16) -> InMemDicomObject {
+    let us = |tag, v: u16| DataElement::new(tag, VR::US, PrimitiveValue::from(v));
+    let s = |v: &str| PrimitiveValue::from(v);
+    InMemDicomObject::from_element_iter([
+        DataElement::new(
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            s(uids::MULTI_FRAME_GRAYSCALE_WORD_SECONDARY_CAPTURE_IMAGE_STORAGE),
+        ),
+        DataElement::new(tags::SOP_INSTANCE_UID, VR::UI, s(sop)),
+        DataElement::new(tags::MODALITY, VR::CS, s("OT")),
+        DataElement::new(tags::PATIENT_ID, VR::LO, s("FRAMES1")),
+        DataElement::new(tags::STUDY_INSTANCE_UID, VR::UI, s(IMAGE_STUDY)),
+        DataElement::new(tags::SERIES_INSTANCE_UID, VR::UI, s(IMAGE_SERIES)),
+        DataElement::new(tags::INSTANCE_NUMBER, VR::IS, s("1")),
+        us(tags::SAMPLES_PER_PIXEL, 1),
+        DataElement::new(tags::PHOTOMETRIC_INTERPRETATION, VR::CS, s("MONOCHROME2")),
+        DataElement::new(tags::NUMBER_OF_FRAMES, VR::IS, s(&frames.to_string())),
+        us(tags::ROWS, rows),
+        us(tags::COLUMNS, cols),
+        us(tags::BITS_ALLOCATED, bits),
+        us(tags::BITS_STORED, bits),
+        us(tags::HIGH_BIT, bits - 1),
+        us(tags::PIXEL_REPRESENTATION, 0),
+    ])
+}
+
+/// `obj` as a Part-10 file in transfer syntax `ts`.
+pub fn part10(obj: InMemDicomObject, ts: &str) -> Vec<u8> {
+    // The SOP Class and Instance UIDs of the meta group come from `obj`.
+    let file = obj
+        .with_meta(FileMetaTableBuilder::new().transfer_syntax(ts))
+        .unwrap();
+    let mut out = Vec::new();
+    file.write_all(&mut out).unwrap();
+    out
+}
+
+/// Deterministic pixel bytes: every frame differs from the others.
+pub fn pixel_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 + i / 13) as u8).collect()
+}
+
+/// Native Explicit VR Little Endian multi-frame image with `pixels`.
+pub fn native_image(
+    sop: &str,
+    frames: u32,
+    rows: u16,
+    cols: u16,
+    bits: u16,
+    pixels: Vec<u8>,
+) -> Vec<u8> {
+    let mut obj = image(sop, frames, rows, cols, bits);
+    let vr = if bits > 8 { VR::OW } else { VR::OB };
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        vr,
+        PrimitiveValue::from(pixels),
+    ));
+    part10(obj, uids::EXPLICIT_VR_LITTLE_ENDIAN)
+}
+
+/// Encapsulated 16x16 8-bit image: `frames[k]` holds the fragments of frame
+/// `k`. `bot` fills the Basic Offset Table.
+pub fn encapsulated_image(sop: &str, frames: &[Vec<Vec<u8>>], bot: bool, ts: &str) -> Vec<u8> {
+    let mut obj = image(sop, frames.len() as u32, 16, 16, 8);
+    let mut table = Vec::new();
+    let mut at = 0u32;
+    for frame in frames {
+        table.push(at);
+        at += frame.iter().map(|f| 8 + f.len() as u32).sum::<u32>();
+    }
+    if !bot {
+        table.clear();
+    }
+    let fragments: Vec<Vec<u8>> = frames.iter().flatten().cloned().collect();
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OB,
+        PixelFragmentSequence::new(table, fragments),
+    ));
+    part10(obj, ts)
+}
+
+/// Split a `multipart/related` body into (part content type, part body).
+pub fn parts(r: &Reply) -> Vec<(String, Vec<u8>)> {
+    let ct = r.header("content-type").unwrap();
+    assert!(ct.starts_with("multipart/related"), "{ct}");
+    let boundary = ct.split("boundary=").nth(1).unwrap().trim_matches('"');
+    let delim = format!("--{boundary}");
+    let body = &r.body;
+    let find = |from: usize, pat: &[u8]| {
+        body[from..]
+            .windows(pat.len())
+            .position(|w| w == pat)
+            .map(|p| p + from)
+    };
+    let mut out = Vec::new();
+    let mut pos = find(0, delim.as_bytes()).unwrap();
+    loop {
+        let after = pos + delim.len();
+        if body[after..].starts_with(b"--") {
+            break;
+        }
+        let head_end = find(after, b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&body[after..head_end]).into_owned();
+        let part_type = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Type: "))
+            .unwrap()
+            .to_owned();
+        let next = find(head_end + 4, format!("\r\n{delim}").as_bytes()).unwrap();
+        out.push((part_type, body[head_end + 4..next].to_vec()));
+        pos = next + 2;
+    }
+    out
 }
 
 /// The full server (`start`) on an ephemeral port with a temp storage root

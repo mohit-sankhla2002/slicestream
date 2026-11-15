@@ -14,6 +14,8 @@ use slicestream_store::{BlobKind, Ingestor, SeriesRow};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::error::RecvError;
 
+const EXPLICIT_BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
+
 struct Entry {
     /// Instance count of the index row this entry was built from.
     instance_count: i64,
@@ -97,14 +99,26 @@ impl SeriesCatalog {
         let mut slices = Vec::new();
         for r in rows {
             let path = blobs.path_of(&r.blob, BlobKind::Dicom);
+            // With a frame table, frames are read with `pread` instead of a
+            // whole-file parse. Big-endian data keeps the parse: it returns
+            // native-endian words where `pread` returns stored bytes, and
+            // the bytes sent must not change.
+            let table = r
+                .frames
+                .as_ref()
+                .filter(|_| r.frame_info.transfer_syntax != EXPLICIT_BIG_ENDIAN);
             for frame in 0..r.number_of_frames {
-                slices.push(SliceRef::new(
+                let slice = SliceRef::new(
                     path.clone(),
                     frame,
                     r.frame_info.clone(),
                     r.slice_position,
                     r.instance_number,
-                ));
+                );
+                slices.push(match table.and_then(|t| t.location(frame)) {
+                    Some(loc) => slice.with_location(loc),
+                    None => slice,
+                });
             }
         }
         if slices.is_empty() {

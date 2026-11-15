@@ -231,6 +231,108 @@ BulkDataURIs.
 - Modalities in Study matches one modality per query. A study matches when
   any of its series has it. A wildcard on this key matches nothing.
 
+### WADO-RS
+
+| Method and path | Returns |
+|---|---|
+| `GET /dicom-web/studies/{study}` | Every instance of the study |
+| `GET /dicom-web/studies/{study}/series/{series}` | Every instance of the series |
+| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}` | One instance |
+| `GET /dicom-web/studies/{study}/metadata` | DICOM JSON of every instance of the study |
+| `GET /dicom-web/studies/{study}/series/{series}/metadata` | DICOM JSON of every instance of the series |
+| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}/metadata` | DICOM JSON of one instance |
+| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}/frames/{list}` | Frames of one instance |
+| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}/bulk/{path}` | One bulk data value of one instance |
+
+**Instances.** The response is `multipart/related; type="application/dicom"`,
+one part per instance, each part the stored file byte for byte. A part's
+`Content-Type` is `application/dicom; transfer-syntax=<stored syntax>`. An
+`Accept` of exactly `application/dicom` (no `multipart/related`) gets the file
+itself, and is only possible when the request names one instance; for more it
+gets 406. Bodies are streamed in 1 MiB reads and are never compressed.
+
+**Transfer syntax.** The server does not transcode: it sends every instance
+in the transfer syntax it was stored with. This is the same as Orthanc. A
+request for a specific `transfer-syntax` is answered only when every instance
+in the response is stored in it; otherwise 406. `transfer-syntax=*` and no
+`transfer-syntax` accept whatever is stored.
+
+**Metadata.** The response is `application/dicom+json`: a JSON array with one
+object per instance, in storage order. It is streamed, and gzip or Brotli
+compressed when `Accept-Encoding` allows it. Group 0002 is not included.
+Pixel Data, Float Pixel Data, Double Float Pixel Data, binary values of VR
+OB, OD, OF, OL, OV, OW or UN longer than 1,024 bytes, and any other value
+longer than 64 KiB carry a `BulkDataURI` instead of a value. Smaller binary
+values are inline as base64 `InlineBinary`. The `BulkDataURI` is an absolute
+URL that starts with `[http] public_url` when it is set, otherwise with
+`http://<Host header>`. An instance whose metadata
+would exceed 64 MiB has none, and gets 500.
+
+Instances stored before metadata scanning existed are scanned on the first
+request, and in the background after startup.
+
+**Frames.** `{list}` holds 1-based frame numbers, comma-separated, for
+example `3,1,3`. Each is digits only; at most 4,096 numbers. The response is
+`multipart/related`, one part per listed frame, in the order listed: a number
+listed twice gives two parts. The response's `type` parameter is the media
+type of the parts.
+
+| `Accept` asks for | Served |
+|---|---|
+| `application/octet-stream` (no transfer syntax) | Uncompressed little-endian pixels. Native little-endian data as stored. Big-endian data byte-swapped (Bits Allocated 16 or 32). Encapsulated data gives 406. Parts are `application/octet-stream; transfer-syntax=1.2.840.10008.1.2.1`. |
+| `application/octet-stream; transfer-syntax=*` | As stored. Each part's `Content-Type` carries `transfer-syntax=<stored UID>`. |
+| `application/octet-stream; transfer-syntax=<UID>` | As stored if the UID matches, else 406. |
+| `image/jpeg`, `image/jls`, `image/jp2`, `image/jphc`, `image/jxl`, `image/dicom-rle` (with or without a transfer syntax) | As stored if the stored transfer syntax belongs to that media type (and matches the requested one, if given), else 406. |
+| `*/*`, or no `Accept` | As stored: the image media type of the stored transfer syntax, or `application/octet-stream` for native data. |
+
+`Accept` may list several choices, with q-values. The `type` parameter works
+with and without quotes. A bare media type (not wrapped in
+`multipart/related`) gets the frame itself as the body, and only when the
+request names one frame; for more it gets 406.
+
+Frames are read at the file offsets recorded when the instance was stored.
+Two kinds of instance have none and are read by parsing the whole file,
+which is slower: instances stored before scanning existed (until the
+background scan reaches them) and deflated instances. A deflated instance's
+frames come out inflated, so they are served as Explicit VR Little Endian
+(`transfer-syntax=1.2.840.10008.1.2.1`), also for `transfer-syntax=*`.
+
+**Bulk data.** `{path}` is the end of a `BulkDataURI` from the metadata: a
+tag (`00091001`), or a path through sequence items (`00480105/0/00282000`,
+items counted from 0). The response is `multipart/related;
+type="application/octet-stream"` with one part holding the value. An
+`Accept` of a bare `application/octet-stream` gets the value itself. Values
+are sent as stored, read in 1 MiB pieces: little-endian, or big-endian for
+an Explicit VR Big Endian instance. The part's `Content-Type` names that
+byte order (`transfer-syntax=1.2.840.10008.1.2.1` or `1.2.840.10008.1.2.2`).
+
+Pixel Data (`7FE00010`) is served like the frames resource with every frame
+listed: one part per frame, with the same media types and rules.
+
+A path that is not a bulk value of the instance gets 404. For an instance
+with no recorded offsets (deflated, or not scanned yet), the file is parsed
+and the value of the element at that path is sent.
+
+| HTTP status | Meaning |
+|---|---|
+| 200 | Instances, metadata, frames or bulk data found |
+| 400 | A malformed frame list: not digits, an empty item, or more than 4,096 numbers |
+| 404 | Unknown study, series or instance, or a series that is not in that study. Also: a frame number of 0 or above Number of Frames; frames of an object that is not an image; frames or Pixel Data of an image without Pixel Data (`no pixel data`); a bulk data path the instance does not have. |
+| 406 | No acceptable media type or transfer syntax (also a bare media type for several instances or frames) |
+| 500 | An instance has no metadata (for example its object is over 64 MiB). Frames that cannot be located: encapsulated pixel data with no usable offset table (`frame boundaries unknown`), or pixel data shorter than its frames (`pixel data truncated`, `pixel data too short`). A stored file that cannot be read. The plain-text body says why. |
+
+A stored file that cannot be read after the response has started ends the
+body early; the client sees a broken stream.
+
+**Deviations.**
+
+- Bulk data values other than Pixel Data are not converted: a big-endian
+  instance's values are sent big-endian, even when no transfer syntax was
+  asked for. PS3.18's default for bulk data is Explicit VR Little Endian.
+- Frames of a deflated instance are labelled Explicit VR Little Endian, not
+  the stored Deflated Explicit VR Little Endian: the data set is inflated to
+  read them.
+
 ## Limits and defaults
 
 | Setting | Default |
@@ -339,51 +441,3 @@ through STOW-RS, `POST /api/instances` or C-STORE.
 server (default and Implicit VR Little Endian transfer syntaxes, duplicate
 detection, and rejection of a wrong called AE title). CI runs it as the
 `interop` job.
-
-### WADO-RS
-
-| Method and path | Returns |
-|---|---|
-| `GET /dicom-web/studies/{study}` | Every instance of the study |
-| `GET /dicom-web/studies/{study}/series/{series}` | Every instance of the series |
-| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}` | One instance |
-| `GET /dicom-web/studies/{study}/metadata` | DICOM JSON of every instance of the study |
-| `GET /dicom-web/studies/{study}/series/{series}/metadata` | DICOM JSON of every instance of the series |
-| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}/metadata` | DICOM JSON of one instance |
-
-**Instances.** The response is `multipart/related; type="application/dicom"`,
-one part per instance, each part the stored file byte for byte. A part's
-`Content-Type` is `application/dicom; transfer-syntax=<stored syntax>`. An
-`Accept` of exactly `application/dicom` (no `multipart/related`) gets the file
-itself, and is only possible when the request names one instance; for more it
-gets 406. Bodies are streamed in 1 MiB reads and are never compressed.
-
-**Transfer syntax.** The server does not transcode: it sends every instance
-in the transfer syntax it was stored with. This is the same as Orthanc. A
-request for a specific `transfer-syntax` is answered only when every instance
-in the response is stored in it; otherwise 406. `transfer-syntax=*` and no
-`transfer-syntax` accept whatever is stored.
-
-**Metadata.** The response is `application/dicom+json`: a JSON array with one
-object per instance, in storage order. It is streamed, and gzip or Brotli
-compressed when `Accept-Encoding` allows it. Group 0002 is not included.
-Pixel Data, Float Pixel Data, Double Float Pixel Data, binary values of VR
-OB, OD, OF, OL, OV, OW or UN longer than 1,024 bytes, and any other value
-longer than 64 KiB carry a `BulkDataURI` instead of a value. Smaller binary
-values are inline as base64 `InlineBinary`. The `BulkDataURI` is an absolute
-URL that starts with `[http] public_url` when it is set, otherwise with
-`http://<Host header>`. An instance whose metadata
-would exceed 64 MiB has none, and gets 500.
-
-Instances stored before metadata scanning existed are scanned on the first
-request, and in the background after startup.
-
-| HTTP status | Meaning |
-|---|---|
-| 200 | Instances or metadata found |
-| 404 | Unknown study, series or instance, or a series that is not in that study |
-| 406 | No acceptable media type or transfer syntax (also bare `application/dicom` for several instances) |
-| 500 | An instance has no metadata (for example its object is over 64 MiB); the body says why |
-
-A stored file that cannot be read after the response has started ends the
-body early; the client sees a broken stream.

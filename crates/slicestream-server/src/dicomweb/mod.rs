@@ -1,6 +1,6 @@
-//! DICOMweb read routes (PS3.18): QIDO-RS search and WADO-RS metadata and
-//! instance retrieve. Mounted on the read
-//! router when `[dicomweb] enabled = true`, so they share its CORS policy.
+//! DICOMweb read routes (PS3.18): QIDO-RS search and WADO-RS metadata,
+//! instance, frame and bulk data retrieve. Mounted on the read router when
+//! `[dicomweb] enabled = true`, so they share its CORS policy.
 
 use std::sync::Arc;
 
@@ -16,6 +16,8 @@ use tower_http::compression::{CompressionLayer, CompressionLevel};
 use crate::AppState;
 use crate::config::HttpConfig;
 
+mod bulk;
+mod frames;
 mod metadata;
 pub mod qido;
 mod qido_json;
@@ -55,6 +57,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/dicom-web/studies/{study}/series/{series}/instances/{instance}",
             get(retrieve::instance),
+        )
+        .route(
+            "/dicom-web/studies/{study}/series/{series}/instances/{instance}/frames/{list}",
+            get(frames::frames),
+        )
+        .route(
+            "/dicom-web/studies/{study}/series/{series}/instances/{instance}/bulk/{*path}",
+            get(bulk::bulk),
         )
         // JSON compresses well; pixel data and multipart bodies do not.
         .layer(
@@ -121,6 +131,17 @@ pub(crate) async fn find(
             &anyhow::Error::new(e),
         ))),
     }
+}
+
+/// The instance with these UIDs, or the 404 / 500 response to send.
+pub(crate) async fn find_instance(
+    state: &AppState,
+    study: String,
+    series: String,
+    sop: String,
+) -> Result<InstanceRef, Box<Response>> {
+    let mut found = find(state, &Scope::Instance(study, series, sop)).await?;
+    Ok(found.swap_remove(0))
 }
 
 /// A plain-text response (errors).

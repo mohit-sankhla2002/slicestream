@@ -21,6 +21,7 @@ slicestream-archive = { path = "../slicestream-archive", version = "0.1.0", defa
 slicestream-core = { path = "../slicestream-core", version = "0.1.0" }
 slicestream-dicomweb = { path = "../slicestream-dicomweb", version = "0.1.0" }
 dicom-core = "0.10.1"
+dicom-object = "0.10.1"
 slicestream-store = { path = "../slicestream-store", version = "0.1.0" }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
@@ -45,7 +46,6 @@ slicestream-dimse = { version = "0.1.0", path = "../slicestream-dimse" }
 
 [dev-dependencies]
 dicom-dictionary-std = "0.10.1"
-dicom-object = "0.10.1"
 dicom-transfer-syntax-registry = "0.10.1"
 flate2 = "1.1.11"
 tar = "0.4.46"

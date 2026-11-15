@@ -60,40 +60,6 @@ fn sops(rows: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// Split a `multipart/related` body into (part content type, part body).
-fn parts(r: &Reply) -> Vec<(String, Vec<u8>)> {
-    let ct = r.header("content-type").unwrap();
-    assert!(ct.starts_with("multipart/related"), "{ct}");
-    let boundary = ct.split("boundary=").nth(1).unwrap().trim_matches('"');
-    let delim = format!("--{boundary}");
-    let body = &r.body;
-    let find = |from: usize, pat: &[u8]| {
-        body[from..]
-            .windows(pat.len())
-            .position(|w| w == pat)
-            .map(|p| p + from)
-    };
-    let mut out = Vec::new();
-    let mut pos = find(0, delim.as_bytes()).unwrap();
-    loop {
-        let after = pos + delim.len();
-        if body[after..].starts_with(b"--") {
-            break;
-        }
-        let head_end = find(after, b"\r\n\r\n").unwrap();
-        let head = String::from_utf8_lossy(&body[after..head_end]).into_owned();
-        let part_type = head
-            .lines()
-            .find_map(|l| l.strip_prefix("Content-Type: "))
-            .unwrap()
-            .to_owned();
-        let next = find(head_end + 4, format!("\r\n{delim}").as_bytes()).unwrap();
-        out.push((part_type, body[head_end + 4..next].to_vec()));
-        pos = next + 2;
-    }
-    out
-}
-
 /// Sizes of the HTTP/1.1 chunks of a `Connection: close` GET response.
 async fn chunk_sizes(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Vec<usize> {
     let mut head = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
