@@ -540,14 +540,33 @@ async fn unscanned_frames_fall_back() {
 async fn overwrite_then_frames_new_bytes() {
     let srv = TestServer::start(|c| c.storage.on_duplicate = DuplicatePolicy::Overwrite).await;
     let sop = image_sop(1);
-    let first = native_image(&sop, 2, 4, 4, 8, pixel_bytes(32));
-    let second = native_image(&sop, 2, 4, 4, 8, (0..32).rev().collect());
-    srv.stow(std::slice::from_ref(&first)).await;
-    let r = get(&srv, &frames_path(&sop, "2"), OCTET).await;
-    assert_eq!(bodies(&r), [old_frames(&first)[1].clone()]);
-    srv.stow(std::slice::from_ref(&second)).await;
-    let r = get(&srv, &frames_path(&sop, "2"), OCTET).await;
-    assert_eq!(bodies(&r), [old_frames(&second)[1].clone()]);
+    // The replacement has a longer private value and more frames, so its
+    // values sit at other offsets than the first file's.
+    let file = |value: Vec<u8>, frames: u32, pixels: Vec<u8>| {
+        let mut obj = image(&sop, frames, 4, 4, 8);
+        obj.put(DataElement::new(
+            dicom_core::Tag(0x0009, 0x1001),
+            VR::OB,
+            PrimitiveValue::from(value),
+        ));
+        obj.put(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OB,
+            PrimitiveValue::from(pixels),
+        ));
+        part10(obj, EXPLICIT_LE)
+    };
+    let first = file(vec![1; 2000], 2, pixel_bytes(32));
+    let second = file(vec![2; 3002], 3, (0..48).rev().collect());
+    for (bytes, value) in [(&first, vec![1u8; 2000]), (&second, vec![2u8; 3002])] {
+        srv.stow(std::slice::from_ref(bytes)).await;
+        let r = get(&srv, &frames_path(&sop, "2"), OCTET).await;
+        assert_eq!(bodies(&r), [old_frames(bytes)[1].clone()]);
+        let r = get(&srv, &bulk_path(&sop, "7FE00010"), OCTET).await;
+        assert_eq!(bodies(&r), old_frames(bytes));
+        let r = get(&srv, &bulk_path(&sop, PRIVATE_BULK), OCTET).await;
+        assert_eq!(bodies(&r), [value]);
+    }
     srv.stop().await;
 }
 

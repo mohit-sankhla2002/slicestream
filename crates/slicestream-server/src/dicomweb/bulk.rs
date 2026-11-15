@@ -21,9 +21,8 @@ use slicestream_dicomweb::{FrameSource, Multipart, negotiate_frames};
 use slicestream_store::BlobKind;
 
 use super::frames::{self, EXPLICIT_BE, EXPLICIT_LE, Wanted};
-use super::{accept_ranges, find_instance, plain};
+use super::{accept_ranges, find_instance_data, plain};
 use crate::AppState;
-use crate::routes::internal_error;
 
 /// Path of the top-level Pixel Data element.
 const PIXEL_DATA: &str = "7FE00010";
@@ -35,28 +34,26 @@ pub async fn bulk(
     Path((study, series, sop, path)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let inst = match find_instance(&state, study, series, sop).await {
-        Ok(i) => i,
+    // `data` belongs to `inst.blob`, so its offsets fit the file read below.
+    let (inst, data) = match find_instance_data(&state, study, series, sop).await {
+        Ok(found) => found,
         Err(r) => return *r,
     };
     if path == PIXEL_DATA {
-        return frames::respond(&state, &inst, Wanted::All, &headers).await;
+        return frames::respond(&state, &inst, data, Wanted::All, &headers).await;
     }
     let file = state.ingestor.blobs().path_of(&inst.blob, BlobKind::Dicom);
     let big_endian = inst.transfer_syntax == EXPLICIT_BE;
-    let value = match state.ingestor.index().stored_data(inst.id).await {
-        Err(e) => return internal_error(&anyhow::Error::new(e)),
-        Ok(Some(data)) if data.offsets_valid => {
-            match data.bulk.into_iter().find(|b| b.path == path) {
-                Some(b) => match open_range(file, b.offset, b.len).await {
-                    Ok(v) => v,
-                    Err(r) => return *r,
-                },
-                None => return no_value(),
-            }
-        }
+    let value = match data {
+        Some(data) if data.offsets_valid => match data.bulk.into_iter().find(|b| b.path == path) {
+            Some(b) => match open_range(file, b.offset, b.len).await {
+                Ok(v) => v,
+                Err(r) => return *r,
+            },
+            None => return no_value(),
+        },
         // Deflated (no file offsets, so no bulk list) or not scanned yet.
-        Ok(_) => {
+        _ => {
             let Some((items, tag)) = parse_path(&path) else {
                 return no_value();
             };

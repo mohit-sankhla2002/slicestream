@@ -16,11 +16,10 @@ use futures_util::{Stream, stream};
 use slicestream_core::frame::{read_frame_at, read_frame_bytes, swap_to_little_endian};
 use slicestream_core::{Error as FrameError, FrameInfo};
 use slicestream_dicomweb::{FrameSource, Multipart, negotiate_frames};
-use slicestream_store::{BlobKind, FrameTable, InstanceRef};
+use slicestream_store::{BlobKind, FrameTable, InstanceRef, StoredData};
 
-use super::{accept_ranges, find_instance, plain};
+use super::{accept_ranges, find_instance_data, plain};
 use crate::AppState;
-use crate::routes::internal_error;
 
 /// Most frame numbers one request may list.
 const MAX_LISTED: usize = 4096;
@@ -46,11 +45,11 @@ pub async fn frames(
             );
         }
     };
-    let inst = match find_instance(&state, study, series, sop).await {
-        Ok(i) => i,
+    let (inst, data) = match find_instance_data(&state, study, series, sop).await {
+        Ok(found) => found,
         Err(r) => return *r,
     };
-    respond(&state, &inst, Wanted::List(numbers), &headers).await
+    respond(&state, &inst, data, Wanted::List(numbers), &headers).await
 }
 
 /// `{list}`: comma-separated decimal numbers (digits only), at most
@@ -83,9 +82,11 @@ enum Source {
 }
 
 /// Serve the `wanted` frames of `inst`, negotiated against `headers`.
+/// `data` is what the scan stored for `inst.blob` (`None`: not scanned).
 pub(super) async fn respond(
     state: &Arc<AppState>,
     inst: &InstanceRef,
+    data: Option<StoredData>,
     wanted: Wanted,
     headers: &HeaderMap,
 ) -> Response {
@@ -106,7 +107,7 @@ pub(super) async fn respond(
         }
         Wanted::All => (Box::new(1..=total), total as usize),
     };
-    let source = match frame_source(state, inst).await {
+    let source = match frame_source(data) {
         Ok(s) => s,
         Err(r) => return *r,
     };
@@ -168,10 +169,9 @@ pub(super) async fn respond(
 
 /// The frame table when the scan recorded one; a whole-file parse when it
 /// recorded no file offsets (deflated) or has not run yet.
-async fn frame_source(state: &AppState, inst: &InstanceRef) -> Result<Source, Box<Response>> {
-    match state.ingestor.index().stored_data(inst.id).await {
-        Err(e) => Err(Box::new(internal_error(&anyhow::Error::new(e)))),
-        Ok(Some(data)) if data.offsets_valid => match (data.frames, data.problem) {
+fn frame_source(data: Option<StoredData>) -> Result<Source, Box<Response>> {
+    match data {
+        Some(data) if data.offsets_valid => match (data.frames, data.problem) {
             (Some(table), _) => Ok(Source::Table(table)),
             (None, Some(problem)) => {
                 Err(Box::new(plain(StatusCode::INTERNAL_SERVER_ERROR, problem)))
@@ -181,7 +181,7 @@ async fn frame_source(state: &AppState, inst: &InstanceRef) -> Result<Source, Bo
                 "no pixel data".into(),
             ))),
         },
-        Ok(_) => Ok(Source::Parse),
+        _ => Ok(Source::Parse),
     }
 }
 

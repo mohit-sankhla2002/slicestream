@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use slicestream_store::{
     BlobHash, DuplicatePolicy, FrameTable, Index, InstanceData, InstanceHeader, InstanceRecord,
-    MetadataState, NiftiMeta, SCAN_VERSION, Scope, StorageCounts, StudyInfo, UploadCounts,
-    UpsertOutcome, fold_name, read_header, scan_instance,
+    MetadataState, NiftiMeta, SCAN_VERSION, Scope, StorageCounts, StoredDataState, StudyInfo,
+    UploadCounts, UpsertOutcome, fold_name, read_header, scan_instance,
 };
 
 fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
@@ -751,6 +751,57 @@ async fn metadata_batch_states() {
         )
     );
     assert!(idx.metadata_batch(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stored_data_for_checks_the_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let a = scanned_record(&support::native(&dir.path().join("a"), 2, 4, 4, 8), 1);
+    let b = scanned_record(&support::native(&dir.path().join("b"), 3, 4, 4, 8), 2);
+    idx.upsert_instance(&a, DuplicatePolicy::Overwrite)
+        .await
+        .unwrap();
+    let id = idx
+        .find_instances(&Scope::Study(support::STUDY_UID.into()))
+        .await
+        .unwrap()[0]
+        .id;
+    let StoredDataState::Ready(data) = idx.stored_data_for(id, &a.blob).await.unwrap() else {
+        panic!("blob a is current and scanned");
+    };
+    assert_eq!(data.frames, a.data.frames);
+
+    // After an overwrite, a reader still holding blob a gets nothing.
+    idx.upsert_instance(&b, DuplicatePolicy::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(
+        idx.stored_data_for(id, &a.blob).await.unwrap(),
+        StoredDataState::Replaced
+    );
+    let StoredDataState::Ready(data) = idx.stored_data_for(id, &b.blob).await.unwrap() else {
+        panic!("blob b is current and scanned");
+    };
+    assert_eq!(data.frames, b.data.frames);
+
+    // Unscanned, and unknown ids.
+    let c = record(b.header.clone(), 3);
+    idx.upsert_instance(&c, DuplicatePolicy::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(
+        idx.stored_data_for(id, &c.blob).await.unwrap(),
+        StoredDataState::Unscanned
+    );
+    assert_eq!(
+        idx.stored_data_for(id, &b.blob).await.unwrap(),
+        StoredDataState::Replaced
+    );
+    assert_eq!(
+        idx.stored_data_for(id + 100, &c.blob).await.unwrap(),
+        StoredDataState::Replaced
+    );
 }
 
 #[tokio::test]

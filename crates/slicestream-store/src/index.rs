@@ -91,6 +91,17 @@ pub struct StoredData {
     pub problem: Option<String>,
 }
 
+/// [`StoredData`] of an instance as of one blob, from [`Index::stored_data_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredDataState {
+    /// Scanned: what the scan stored for that blob.
+    Ready(StoredData),
+    /// Still that blob, not scanned yet.
+    Unscanned,
+    /// The instance is gone, or an overwrite pointed it at another blob.
+    Replaced,
+}
+
 /// What to do when a SOP Instance UID is already indexed with a different blob.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -980,8 +991,35 @@ impl Index {
     /// instance is unknown or not scanned yet; a failed scan gives an empty
     /// result carrying the problem.
     pub async fn stored_data(&self, id: i64) -> Result<Option<StoredData>, sqlx::Error> {
+        Ok(self.stored_row(id).await?.and_then(|(_, data)| data))
+    }
+
+    /// [`Index::stored_data`] of instance `id`, but only while the instance
+    /// still points at `blob`. An overwrite replaces the blob and the stored
+    /// data together, so offsets read here always belong to `blob`'s file.
+    pub async fn stored_data_for(
+        &self,
+        id: i64,
+        blob: &BlobHash,
+    ) -> Result<StoredDataState, sqlx::Error> {
+        Ok(match self.stored_row(id).await? {
+            Some((current, data)) if current == *blob => match data {
+                Some(d) => StoredDataState::Ready(d),
+                None => StoredDataState::Unscanned,
+            },
+            _ => StoredDataState::Replaced,
+        })
+    }
+
+    /// The blob of instance `id` and its stored data (`None` when not
+    /// scanned yet), read in one statement. `None` for an unknown id.
+    async fn stored_row(
+        &self,
+        id: i64,
+    ) -> Result<Option<(BlobHash, Option<StoredData>)>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT i.scan_version, i.scan_problem, d.frames, d.bulk, d.offsets_valid
+            "SELECT i.blob_sha256, i.scan_version, i.scan_problem, d.frames, d.bulk,
+                    d.offsets_valid
              FROM instances i
              LEFT JOIN instance_data d ON d.instance_fk = i.id
              WHERE i.id = ?1",
@@ -990,27 +1028,29 @@ impl Index {
         .fetch_optional(&self.pool)
         .await?;
         let Some(r) = row else { return Ok(None) };
-        let version: i64 = r.try_get(0)?;
+        let blob = parse_hash(r.try_get(0)?)?;
+        let version: i64 = r.try_get(1)?;
         if version < SCAN_VERSION {
-            return Ok(None);
+            return Ok(Some((blob, None)));
         }
-        let frames = match r.try_get::<Option<&[u8]>, _>(2)? {
+        let frames = match r.try_get::<Option<&[u8]>, _>(3)? {
             Some(b) => Some(
                 FrameTable::decode(b).ok_or_else(|| decode_err("invalid frame table".into()))?,
             ),
             None => None,
         };
-        let bulk = match r.try_get::<Option<&str>, _>(3)? {
+        let bulk = match r.try_get::<Option<&str>, _>(4)? {
             Some(b) => serde_json::from_str(b)
                 .map_err(|e| decode_err(format!("invalid bulk JSON: {e}")))?,
             None => Vec::new(),
         };
-        Ok(Some(StoredData {
+        let data = StoredData {
             frames,
             bulk,
-            offsets_valid: r.try_get::<Option<bool>, _>(4)?.unwrap_or(false),
-            problem: r.try_get(1)?,
-        }))
+            offsets_valid: r.try_get::<Option<bool>, _>(5)?.unwrap_or(false),
+            problem: r.try_get(2)?,
+        };
+        Ok(Some((blob, Some(data))))
     }
 
     /// Up to `limit` instances not scanned at [`SCAN_VERSION`] yet, in id

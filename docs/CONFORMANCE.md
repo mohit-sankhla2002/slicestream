@@ -320,6 +320,7 @@ and the value of the element at that path is sent.
 | 404 | Unknown study, series or instance, or a series that is not in that study. Also: a frame number of 0 or above Number of Frames; frames of an object that is not an image; frames or Pixel Data of an image without Pixel Data (`no pixel data`); a bulk data path the instance does not have. |
 | 406 | No acceptable media type or transfer syntax (also a bare media type for several instances or frames) |
 | 500 | An instance has no metadata (for example its object is over 64 MiB). Frames that cannot be located: encapsulated pixel data with no usable offset table (`frame boundaries unknown`), or pixel data shorter than its frames (`pixel data truncated`, `pixel data too short`). A stored file that cannot be read. The plain-text body says why. |
+| 503 | Frames or bulk data of an instance that was overwritten twice while the request read it. Try again. |
 
 A stored file that cannot be read after the response has started ends the
 body early; the client sees a broken stream.

@@ -9,7 +9,7 @@ use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, Version, header
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use slicestream_dicomweb::{MediaRange, parse_accept};
-use slicestream_store::{InstanceRef, Scope};
+use slicestream_store::{InstanceRef, Scope, StoredData, StoredDataState};
 use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 
@@ -133,15 +133,39 @@ pub(crate) async fn find(
     }
 }
 
-/// The instance with these UIDs, or the 404 / 500 response to send.
-pub(crate) async fn find_instance(
+/// The instance with these UIDs and what the scan stored for its current
+/// blob (`None`: not scanned yet), or the response to send. Both come from
+/// the same blob: when an overwrite lands between the two reads, the
+/// instance is looked up again, once; if it changes again, 503.
+pub(crate) async fn find_instance_data(
     state: &AppState,
     study: String,
     series: String,
     sop: String,
-) -> Result<InstanceRef, Box<Response>> {
-    let mut found = find(state, &Scope::Instance(study, series, sop)).await?;
-    Ok(found.swap_remove(0))
+) -> Result<(InstanceRef, Option<StoredData>), Box<Response>> {
+    let scope = Scope::Instance(study, series, sop);
+    for _ in 0..2 {
+        let inst = find(state, &scope).await?.swap_remove(0);
+        let stored = state
+            .ingestor
+            .index()
+            .stored_data_for(inst.id, &inst.blob)
+            .await;
+        match stored {
+            Ok(StoredDataState::Ready(data)) => return Ok((inst, Some(data))),
+            Ok(StoredDataState::Unscanned) => return Ok((inst, None)),
+            Ok(StoredDataState::Replaced) => continue,
+            Err(e) => {
+                return Err(Box::new(crate::routes::internal_error(
+                    &anyhow::Error::new(e),
+                )));
+            }
+        }
+    }
+    Err(Box::new(plain(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the instance was replaced while it was being read; try again".into(),
+    )))
 }
 
 /// A plain-text response (errors).
