@@ -57,12 +57,28 @@ impl Multipart {
     }
 }
 
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
 const KEY: &[u8] = b"\"BulkDataURI\":\"";
 
 /// Copies `json` into `out`, inserting `prefix` right after each
-/// `"BulkDataURI":"`. A literal key inside a string value is always escaped
-/// in JSON, so it cannot match here.
+/// `"BulkDataURI":"`. The prefix is JSON-escaped once, so any characters in it
+/// stay inside the string. A literal key inside a string value is always
+/// escaped in JSON, so it cannot match here.
 pub fn splice_bulk_uris(json: &[u8], prefix: &str, out: &mut Vec<u8>) {
+    let escaped = json_escape(prefix);
+    let prefix = escaped.as_str();
     out.reserve(json.len());
     let mut rest = json;
     while let Some(pos) = rest.windows(KEY.len()).position(|w| w == KEY) {
@@ -117,5 +133,16 @@ mod tests {
             String::from_utf8(out).unwrap(),
             r#"{"7FE00010":{"vr":"OW","BulkDataURI":"http://h/i/bulk/7FE00010"},"x":"BulkDataURI","y":{"BulkDataURI":"http://h/i/bulk/a/0/b"}}"#
         );
+    }
+
+    #[test]
+    fn splice_escapes_prefix() {
+        let json = br#"{"a":{"BulkDataURI":"bulk/x"}}"#;
+        let prefix = "http://x\"y\\z\n/";
+        let mut out = Vec::new();
+        splice_bulk_uris(json, prefix, &mut out);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["a"]["BulkDataURI"], format!("{prefix}bulk/x"));
+        assert_eq!(v.as_object().unwrap().len(), 1);
     }
 }

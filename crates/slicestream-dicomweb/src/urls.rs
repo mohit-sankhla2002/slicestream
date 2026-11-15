@@ -3,7 +3,8 @@
 /// The server's public base URL, without a trailing slash.
 ///
 /// Uses `public_url` when set. Otherwise uses the `Host` header, if it is
-/// non-empty and made only of visible ASCII. Otherwise uses `fallback_host`.
+/// non-empty, made only of visible ASCII, and free of `\"`, `\\` and `/`
+/// (URLs are spliced into JSON). Otherwise uses `fallback_host`.
 pub fn base_url(public_url: Option<&str>, host: Option<&str>, fallback_host: &str) -> String {
     if let Some(p) = public_url {
         let p = p.trim_end_matches('/');
@@ -12,7 +13,11 @@ pub fn base_url(public_url: Option<&str>, host: Option<&str>, fallback_host: &st
         }
     }
     let host = host
-        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_graphic()))
+        .filter(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\' | b'/'))
+        })
         .unwrap_or(fallback_host);
     format!("http://{host}")
 }
@@ -50,6 +55,13 @@ mod tests {
         assert_eq!(base_url(None, Some(""), "fb:1"), "http://fb:1");
         assert_eq!(base_url(None, Some("a b"), "fb:1"), "http://fb:1");
         assert_eq!(base_url(None, None, "fb:1"), "http://fb:1");
+    }
+
+    #[test]
+    fn base_url_rejects_unsafe_host() {
+        for h in ["x\"y", "x\\y", "x/y", "x\",\"k\":\"v", "a b", "a\tb"] {
+            assert_eq!(base_url(None, Some(h), "fb:1"), "http://fb:1", "{h}");
+        }
     }
 
     #[test]
