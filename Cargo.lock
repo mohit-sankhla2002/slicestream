@@ -2208,9 +2208,11 @@ dependencies = [
 name = "slicestream-dicomweb"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dicom-core",
  "dicom-dictionary-std",
  "percent-encoding",
+ "rand 0.9.5",
 ]
 
 [[package]]
