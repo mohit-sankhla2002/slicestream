@@ -21,6 +21,7 @@ pub struct SliceRef {
     pub info: FrameInfo,
     position: Option<f64>,
     instance_number: Option<i64>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     location: Option<FrameLocation>,
 }
 
