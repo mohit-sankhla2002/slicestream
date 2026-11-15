@@ -22,6 +22,6 @@ pub mod attrs {
 }
 
 pub use error::{Error, Result};
-pub use frame::{Frame, FrameInfo};
+pub use frame::{Frame, FrameInfo, FrameLocation};
 pub use scheduler::{PrefetchScheduler, SchedulerConfig};
 pub use series::{Series, SliceRef};

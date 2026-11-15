@@ -7,7 +7,9 @@ use dicom_dictionary_std::tags;
 use dicom_object::OpenFileOptions;
 use serde::Serialize;
 
-use crate::frame::{get_f64s, get_i64, get_str, read_frame_bytes};
+#[cfg(unix)]
+use crate::frame::read_frame_at;
+use crate::frame::{FrameLocation, get_f64s, get_i64, get_str, read_frame_bytes};
 use crate::{Error, Frame, FrameInfo, Result};
 
 /// Where one slice of the stack lives on disk.
@@ -19,6 +21,7 @@ pub struct SliceRef {
     pub info: FrameInfo,
     position: Option<f64>,
     instance_number: Option<i64>,
+    location: Option<FrameLocation>,
 }
 
 /// An ordered stack of slices belonging to one SeriesInstanceUID.
@@ -59,7 +62,14 @@ impl SliceRef {
             info,
             position,
             instance_number,
+            location: None,
         }
+    }
+
+    /// Record where the frame's bytes live so reads skip the DICOM parse.
+    pub fn with_location(mut self, loc: FrameLocation) -> SliceRef {
+        self.location = Some(loc);
+        self
     }
 
     fn sort_key(&self) -> (f64, i64, u32) {
@@ -172,6 +182,12 @@ impl Series {
     /// Load one frame's bytes. Blocking — call from `spawn_blocking` in async code.
     pub fn load_frame(&self, index: usize) -> Result<Frame> {
         let slice = self.slice(index)?;
+        #[cfg(unix)]
+        let data = match &slice.location {
+            Some(loc) => read_frame_at(&slice.path, loc)?,
+            None => read_frame_bytes(&slice.path, slice.frame, &slice.info)?,
+        };
+        #[cfg(not(unix))]
         let data = read_frame_bytes(&slice.path, slice.frame, &slice.info)?;
         Ok(Frame {
             index,
