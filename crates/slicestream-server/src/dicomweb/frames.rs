@@ -214,6 +214,14 @@ fn read_failed(reader: &FrameReader, e: &FrameError) -> Response {
     }
 }
 
+/// The error for a frame read whose task failed (panicked). The panic
+/// message may name paths: it is logged, and the response says only that
+/// the read failed.
+fn join_failed(e: tokio::task::JoinError) -> FrameError {
+    tracing::error!("frame read task failed: {e}");
+    FrameError::Unsupported("frame read failed".into())
+}
+
 /// Reads the frames of one instance in the byte order the plan asks for.
 struct FrameReader {
     path: PathBuf,
@@ -231,7 +239,7 @@ impl FrameReader {
         let me = Arc::clone(self);
         tokio::task::spawn_blocking(move || me.read_blocking(number))
             .await
-            .unwrap_or_else(|e| Err(FrameError::Unsupported(format!("frame read failed: {e}"))))
+            .unwrap_or_else(|e| Err(join_failed(e)))
     }
 
     fn read_blocking(&self, number: u32) -> Result<Bytes, FrameError> {
@@ -339,6 +347,39 @@ mod tests {
         assert_eq!(parse_list(&max).map(|v| v.len()), Some(MAX_LISTED));
         let over = vec!["1"; MAX_LISTED + 1].join(",");
         assert_eq!(parse_list(&over), None);
+    }
+
+    /// A panicking read answers 500 with a fixed text; the panic message
+    /// (which may name paths) is only logged.
+    #[tokio::test]
+    async fn failed_read_task_text_is_generic() {
+        let e = tokio::task::spawn_blocking(|| panic!("secret /srv/objects/ab/cd"))
+            .await
+            .unwrap_err();
+        let reader = FrameReader {
+            path: PathBuf::from("/srv/objects/ab/cd"),
+            source: Source::Parse,
+            info: FrameInfo {
+                rows: 1,
+                columns: 1,
+                bits_allocated: 8,
+                bits_stored: 8,
+                samples_per_pixel: 1,
+                pixel_representation: 0,
+                photometric_interpretation: "MONOCHROME2".into(),
+                transfer_syntax: EXPLICIT_LE.into(),
+                rescale_slope: 1.0,
+                rescale_intercept: 0.0,
+                window_center: None,
+                window_width: None,
+            },
+            big_endian: false,
+            swap: false,
+        };
+        let res = read_failed(&reader, &join_failed(e));
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "frame read failed");
     }
 
     #[test]
