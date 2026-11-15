@@ -164,8 +164,11 @@ of a higher level also work at lower levels (`/dicom-web/series?PatientID=X`).
 - Single value. Patient's Name and Referring Physician's Name ignore case
   (also for non-ASCII letters). Every other value matches exactly. A single
   time (`12`) matches the whole period it names.
-- List of UIDs, comma-separated, on the UID keys. At most 1000 values; a
-  longer list gets 400.
+- List of values on the UID keys and on Modalities in Study, separated by
+  commas or backslashes (`\`, or `%5C` URL-encoded; OHIF uses it for
+  several Study Instance UIDs). A study matches Modalities in Study when it
+  has a series of any listed modality. At most 1000 values; a longer list
+  gets 400.
 - Universal (empty value): matches everything.
 - Wildcard `*` and `?` on text keys (not on UIDs, dates or times). Only the
   two name keys ignore case.
@@ -217,7 +220,7 @@ BulkDataURIs.
 | HTTP status | Meaning |
 |---|---|
 | 200 | Search done. No match gives an empty array `[]` (PS3.18 8.3.4.4.1, Table 10.6.3-1). |
-| 400 | Invalid value for a supported parameter (bad date, time or number, unknown `includefield` attribute, a repeated key, bad percent-encoding) or a UID list over 1000 values. The plain-text body names the parameter. |
+| 400 | Invalid value for a supported parameter (bad date, time or number, unknown `includefield` attribute, a repeated key, bad percent-encoding) or a list over 1000 values. The plain-text body names the parameter. |
 | 404 | `[dicomweb] enabled = false` |
 | 406 | The request accepts no JSON type |
 | 421 | The `Host` header is not in `allowed_hosts` |

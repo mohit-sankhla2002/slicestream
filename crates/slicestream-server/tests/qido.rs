@@ -191,6 +191,36 @@ async fn study_date_range() {
     srv.stop().await;
 }
 
+/// OHIF joins several Study Instance UIDs with a backslash, URL-encoded.
+#[tokio::test]
+async fn study_uid_list_with_backslash() {
+    let srv = server().await;
+    for sep in ["%5C", "%5c", ","] {
+        let path = format!("/dicom-web/studies?StudyInstanceUID={}{sep}{}", a(), c());
+        let rows = qido(&srv, &path).await;
+        assert_eq!(uids(&rows, "0020000D"), [a(), c()], "{sep}");
+    }
+    // A literal backslash in the request target works too.
+    let path = format!("/dicom-web/studies?StudyInstanceUID={}\\{}", a(), c());
+    let rows = qido(&srv, &path).await;
+    assert_eq!(uids(&rows, "0020000D"), [a(), c()]);
+    srv.stop().await;
+}
+
+#[tokio::test]
+async fn modalities_in_study_several_values() {
+    let srv = server().await;
+    for value in ["MR,US", "MR%5CUS", "US\\MR"] {
+        let rows = qido(
+            &srv,
+            &format!("/dicom-web/studies?ModalitiesInStudy={value}"),
+        )
+        .await;
+        assert_eq!(uids(&rows, "0020000D"), [a(), c()], "{value}");
+    }
+    srv.stop().await;
+}
+
 #[tokio::test]
 async fn modalities_in_study() {
     let srv = server().await;

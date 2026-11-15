@@ -328,15 +328,7 @@ fn parse_matcher(key: Key, param: &str, value: &str) -> Result<Matcher, QueryErr
         return Ok(Matcher::Universal);
     }
     match key.kind() {
-        Kind::Uid => {
-            if value.contains(',') {
-                Ok(Matcher::List(
-                    value.split(',').map(str::to_string).collect(),
-                ))
-            } else {
-                Ok(Matcher::Single(value.to_string()))
-            }
-        }
+        Kind::Uid => Ok(single_or_list(value)),
         Kind::Date | Kind::Time => {
             let (check, what): (fn(&str) -> bool, &str) = if key.kind() == Kind::Date {
                 (valid_date, "invalid date")
@@ -367,10 +359,24 @@ fn parse_matcher(key: Key, param: &str, value: &str) -> Result<Matcher, QueryErr
         Kind::Text => {
             if value.contains(['*', '?']) {
                 Ok(Matcher::Wildcard(value.to_string()))
+            } else if key == Key::ModalitiesInStudy {
+                Ok(single_or_list(value))
             } else {
                 Ok(Matcher::Single(value.to_string()))
             }
         }
+    }
+}
+
+/// Several values, separated by `,` or by `\` as in a DICOM multi-valued
+/// attribute (OHIF sends several Study Instance UIDs that way), are a list;
+/// one value is a single value.
+fn single_or_list(value: &str) -> Matcher {
+    const SEPARATORS: [char; 2] = [',', '\\'];
+    if value.contains(SEPARATORS) {
+        Matcher::List(value.split(SEPARATORS).map(str::to_string).collect())
+    } else {
+        Matcher::Single(value.to_string())
     }
 }
 
@@ -498,6 +504,51 @@ mod tests {
         );
         let r = q(Level::Study, "PatientName=").unwrap();
         assert_eq!(matcher(&r, Key::PatientName), &Matcher::Universal);
+    }
+
+    #[test]
+    fn parse_uid_list_backslash() {
+        // OHIF joins several Study Instance UIDs with a backslash (PS3.18
+        // allows it as the value separator, like the comma).
+        let list = Matcher::List(vec!["1.2.3".into(), "1.2.4".into()]);
+        for raw in ["1.2.3\\1.2.4", "1.2.3%5C1.2.4", "1.2.3%5c1.2.4"] {
+            let r = q(Level::Study, &format!("StudyInstanceUID={raw}")).unwrap();
+            assert_eq!(matcher(&r, Key::StudyInstanceUid), &list, "{raw}");
+        }
+        let r = q(Level::Instance, "SOPInstanceUID=1.2.3,1.2.4%5C1.2.5").unwrap();
+        assert_eq!(
+            matcher(&r, Key::SopInstanceUid),
+            &Matcher::List(vec!["1.2.3".into(), "1.2.4".into(), "1.2.5".into()])
+        );
+    }
+
+    #[test]
+    fn parse_modalities_in_study_list() {
+        let list = Matcher::List(vec!["CT".into(), "MR".into()]);
+        for raw in ["CT,MR", "CT\\MR", "CT%5CMR"] {
+            let r = q(Level::Study, &format!("ModalitiesInStudy={raw}")).unwrap();
+            assert_eq!(matcher(&r, Key::ModalitiesInStudy), &list, "{raw}");
+        }
+        let r = q(Level::Study, "ModalitiesInStudy=CT").unwrap();
+        assert_eq!(
+            matcher(&r, Key::ModalitiesInStudy),
+            &Matcher::Single("CT".into())
+        );
+        // Wildcards work as before, with or without a separator.
+        for raw in ["C*", "C?,MR"] {
+            let r = q(Level::Study, &format!("ModalitiesInStudy={raw}")).unwrap();
+            assert_eq!(
+                matcher(&r, Key::ModalitiesInStudy),
+                &Matcher::Wildcard(raw.into()),
+                "{raw}"
+            );
+        }
+        // Other text keys keep a separator as part of the value.
+        let r = q(Level::Study, "StudyDescription=A,B").unwrap();
+        assert_eq!(
+            matcher(&r, Key::StudyDescription),
+            &Matcher::Single("A,B".into())
+        );
     }
 
     #[test]
