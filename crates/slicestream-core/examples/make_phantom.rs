@@ -3,13 +3,40 @@
 //!
 //! ```sh
 //! cargo run -p slicestream-core --example make_phantom -- data/phantom 120
+//! cargo run -p slicestream-core --example make_phantom -- data/phantom 120 512
 //! ```
+//!
+//! The optional third argument is the image size in pixels (default 256).
 
 use std::path::Path;
 
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+
+/// Pixels of slice `z` of `slices`, `size` x `size`, 16-bit little-endian.
+pub fn phantom_pixels(z: usize, slices: usize, size: u16) -> Vec<u8> {
+    let n = size as i32;
+    // A sphere whose cross-section grows and shrinks across the stack,
+    // plus a slice-number gradient so ordering mistakes are obvious.
+    let zc = z as f64 / slices.max(1) as f64 - 0.5;
+    let radius = (0.16 - zc * zc).max(0.0).sqrt() * n as f64;
+    let mut pixels = Vec::with_capacity((n * n * 2) as usize);
+    for y in 0..n {
+        for x in 0..n {
+            let dx = (x - n / 2) as f64;
+            let dy = (y - n / 2) as f64;
+            let inside = dx * dx + dy * dy <= radius * radius;
+            let hu: i32 = if inside {
+                1024 + 60
+            } else {
+                1024 - 1000 + (x * 200 / n)
+            };
+            pixels.extend_from_slice(&(hu as u16).to_le_bytes());
+        }
+    }
+    pixels
+}
 
 pub fn write_phantom(
     dir: &Path,
@@ -19,28 +46,9 @@ pub fn write_phantom(
     std::fs::create_dir_all(dir)?;
     let series_uid = "2.25.1000000000000000000000000000001";
     let study_uid = "2.25.1000000000000000000000000000002";
-    let n = size as i32;
 
     for z in 0..slices {
-        // A sphere whose cross-section grows and shrinks across the stack,
-        // plus a slice-number gradient so ordering mistakes are obvious.
-        let zc = z as f64 / slices.max(1) as f64 - 0.5;
-        let radius = (0.16 - zc * zc).max(0.0).sqrt() * n as f64;
-        let mut pixels = Vec::with_capacity((n * n * 2) as usize);
-        for y in 0..n {
-            for x in 0..n {
-                let dx = (x - n / 2) as f64;
-                let dy = (y - n / 2) as f64;
-                let inside = dx * dx + dy * dy <= radius * radius;
-                let hu: i32 = if inside {
-                    1024 + 60
-                } else {
-                    1024 - 1000 + (x * 200 / n)
-                };
-                pixels.extend_from_slice(&(hu as u16).to_le_bytes());
-            }
-        }
-
+        let pixels = phantom_pixels(z, slices, size);
         let sop_uid = format!("2.25.1000000000000000000000000001{z:05}");
         let ds = |s: String| PrimitiveValue::from(s);
         let obj = InMemDicomObject::from_element_iter([
@@ -124,7 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = args.next().unwrap_or_else(|| "data/phantom".into());
     let slices: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(120);
-    write_phantom(Path::new(&dir), slices, 256)?;
+    let size: u16 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(256);
+    write_phantom(Path::new(&dir), slices, size)?;
     println!("wrote {slices} slices to {dir}");
     Ok(())
 }
