@@ -482,3 +482,148 @@ async fn cors_preflight_on_study_path() {
     assert_eq!(r.header("access-control-allow-origin"), None);
     srv.stop().await;
 }
+
+/// A series of `n` tiny instances (instance numbers 1..=n).
+async fn series_of(n: u32, extra: &[(dicom_core::Tag, VR, &str)]) -> TestServer {
+    let srv = TestServer::start(|_| {}).await;
+    let files: Vec<Vec<u8>> = (1..=n).map(|i| dicom_with(1, 1, 1, i, extra)).collect();
+    srv.stow(&files).await;
+    srv
+}
+
+async fn assert_series_metadata_count(n: u32) {
+    let srv = series_of(n, &[]).await;
+    let r = srv
+        .get(
+            &format!(
+                "{}/metadata",
+                metadata_path(&study(), Some(&series()), None)
+            ),
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, 200);
+    let rows = r.json();
+    let got = sops(rows.as_array().expect("valid JSON array"));
+    let want: Vec<String> = (1..=n).map(|i| sop(1, 1, 1, i)).collect();
+    assert_eq!(got, want);
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn series_metadata_128_instances() {
+    assert_series_metadata_count(128).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn series_metadata_129_instances() {
+    assert_series_metadata_count(129).await;
+}
+
+/// Open a GET and read a little, leaving the server blocked on a full socket.
+async fn start_stalled(addr: SocketAddr, path: &str) -> (TcpStream, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut first = vec![0u8; 4096];
+    let n = s.read(&mut first).await.unwrap();
+    first.truncate(n);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    (s, first)
+}
+
+/// Read the rest; true when the chunked body ended with its terminator.
+async fn finish_complete(mut s: TcpStream, mut buf: Vec<u8>) -> bool {
+    let _ = s.read_to_end(&mut buf).await;
+    buf.ends_with(b"0\r\n\r\n")
+}
+
+fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            walk(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_vanishing_mid_stream_aborts_multipart() {
+    let srv = TestServer::start(|c| c.storage.max_instance_bytes = 128 << 20).await;
+    let small = dicom(1, 1, 1, 2);
+    // The first part is big enough to keep the server blocked on the socket.
+    srv.stow(&[dicom_sized(1, 1, 1, 1, 32 << 20), small.clone()])
+        .await;
+    let (s, first) = start_stalled(srv.addr(), &format!("/dicom-web/studies/{}", study())).await;
+    let mut files = Vec::new();
+    walk(&srv.root().join("objects"), &mut files);
+    let victim = files
+        .into_iter()
+        .find(|p| std::fs::metadata(p).unwrap().len() == small.len() as u64)
+        .expect("second blob");
+    std::fs::remove_file(victim).unwrap();
+    assert!(
+        !finish_complete(s, first).await,
+        "a missing blob must abort the body, not end it cleanly"
+    );
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_vanishing_mid_stream_aborts_body() {
+    // 128 instances of about 60 KB each fill the first chunk (7+ MB), so the
+    // server is blocked sending it while the 129th instance's data is removed.
+    let big = "x".repeat(60_000);
+    let srv = series_of(129, &[(tags::IMAGE_COMMENTS, VR::LT, &big)]).await;
+    let path = format!(
+        "{}/metadata",
+        metadata_path(&study(), Some(&series()), None)
+    );
+    let (s, first) = start_stalled(srv.addr(), &path).await;
+    let pool = index_pool(&srv.root()).await;
+    let n = sqlx::query(
+        "DELETE FROM instance_data WHERE instance_fk =
+         (SELECT id FROM instances ORDER BY id DESC LIMIT 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(n, 1);
+    assert!(
+        !finish_complete(s, first).await,
+        "missing metadata must abort the body, not shorten the array"
+    );
+    srv.stop().await;
+}
+
+/// An instance deleted after the pre-check is missing from the batch result;
+/// that must abort the body too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_deleted_mid_stream_aborts_metadata() {
+    let big = "x".repeat(60_000);
+    let srv = series_of(129, &[(tags::IMAGE_COMMENTS, VR::LT, &big)]).await;
+    let path = format!(
+        "{}/metadata",
+        metadata_path(&study(), Some(&series()), None)
+    );
+    let (s, first) = start_stalled(srv.addr(), &path).await;
+    let pool = index_pool(&srv.root()).await;
+    let last = "(SELECT id FROM instances ORDER BY id DESC LIMIT 1)";
+    for table in ["instance_data WHERE instance_fk", "instances WHERE id"] {
+        sqlx::query(&format!("DELETE FROM {table} = {last}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert!(
+        !finish_complete(s, first).await,
+        "a deleted instance must abort the body, not shorten the array"
+    );
+    srv.stop().await;
+}

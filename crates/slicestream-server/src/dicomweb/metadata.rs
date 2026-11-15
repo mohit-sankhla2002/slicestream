@@ -145,17 +145,18 @@ fn json_stream(
                             return Some((Err(std::io::Error::other(e)), (Phase::Done, wrote)));
                         }
                     };
+                    let mut found: std::collections::HashMap<i64, MetadataState> =
+                        states.into_iter().collect();
                     let mut out = Vec::new();
-                    for (id, s) in states {
-                        let MetadataState::Ready(json) = s else {
-                            tracing::error!(instance = id, "metadata vanished mid-stream");
+                    for inst in chunk {
+                        // An instance deleted, or failing, after the pre-check
+                        // must not shorten the array silently.
+                        let Some(MetadataState::Ready(json)) = found.remove(&inst.id) else {
+                            tracing::error!(instance = inst.id, "metadata vanished mid-stream");
                             return Some((
                                 Err(std::io::Error::other("metadata unavailable")),
                                 (Phase::Done, wrote),
                             ));
-                        };
-                        let Some(inst) = chunk.iter().find(|i| i.id == id) else {
-                            continue;
                         };
                         if wrote {
                             out.push(b',');
