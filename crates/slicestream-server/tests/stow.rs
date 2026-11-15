@@ -64,6 +64,7 @@ async fn harness_with(
         scheduler: SchedulerConfig::default(),
         ingestor: Arc::clone(&ingestor),
         http: cfg,
+        dicomweb: Default::default(),
         metrics: None,
         gauges: Default::default(),
         archives: None,
@@ -427,6 +428,7 @@ async fn post_instance_too_large_413() {
             allowed_hosts: vec![HOST.into()],
             ..HttpConfig::default()
         },
+        dicomweb: Default::default(),
         metrics: None,
         gauges: Default::default(),
         archives: None,

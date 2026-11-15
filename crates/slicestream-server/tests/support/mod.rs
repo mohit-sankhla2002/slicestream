@@ -1,14 +1,23 @@
 //! Fixtures shared by the integration tests: synthesized DICOM, NIfTI and
-//! archives (no real patient data).
+//! archives (no real patient data), a server on an ephemeral port and a
+//! minimal HTTP client.
 #![allow(dead_code)]
 
 use std::io::{Cursor, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use dicom_core::{DataElement, PrimitiveValue, VR};
+use dicom_core::{DataElement, PrimitiveValue, Tag, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use slicestream_server::config::Config;
+use slicestream_server::{Running, start};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_util::sync::CancellationToken;
 use zip::write::{SimpleFileOptions, ZipWriter};
 
 /// Part-10 CT image of patient `patient` (`P<patient>`), study `study`,
@@ -25,11 +34,34 @@ pub fn dicom_sized(
     inst: u32,
     pixel_bytes: usize,
 ) -> Vec<u8> {
+    dicom_build(patient, study, series, inst, pixel_bytes, &[])
+}
+
+/// [`dicom`] with extra string attributes; an attribute the fixture already
+/// has is replaced.
+pub fn dicom_with(
+    patient: u32,
+    study: u32,
+    series: u32,
+    inst: u32,
+    extra: &[(Tag, VR, &str)],
+) -> Vec<u8> {
+    dicom_build(patient, study, series, inst, 32, extra)
+}
+
+fn dicom_build(
+    patient: u32,
+    study: u32,
+    series: u32,
+    inst: u32,
+    pixel_bytes: usize,
+    extra: &[(Tag, VR, &str)],
+) -> Vec<u8> {
     let study_uid = format!("2.25.9{patient}0{study}");
     let series_uid = format!("{study_uid}.{series}");
     let sop_uid = format!("{series_uid}.{inst}");
     let s = |v: &str| PrimitiveValue::from(v);
-    let obj = InMemDicomObject::from_element_iter([
+    let mut obj = InMemDicomObject::from_element_iter([
         DataElement::new(tags::SOP_CLASS_UID, VR::UI, s(uids::CT_IMAGE_STORAGE)),
         DataElement::new(tags::SOP_INSTANCE_UID, VR::UI, s(&sop_uid)),
         DataElement::new(tags::PATIENT_ID, VR::LO, s(&format!("P{patient}"))),
@@ -66,6 +98,9 @@ pub fn dicom_sized(
             PrimitiveValue::from(vec![7u8; pixel_bytes]),
         ),
     ]);
+    for (tag, vr, value) in extra {
+        obj.put(DataElement::new(*tag, *vr, s(value)));
+    }
     let file = obj
         .with_meta(
             FileMetaTableBuilder::new()
@@ -80,6 +115,200 @@ pub fn dicom_sized(
 
 pub fn sop(patient: u32, study: u32, series: u32, inst: u32) -> String {
     format!("2.25.9{patient}0{study}.{series}.{inst}")
+}
+
+/// Study Instance UID of the [`dicom`] fixtures.
+pub fn study_uid(patient: u32, study: u32) -> String {
+    format!("2.25.9{patient}0{study}")
+}
+
+/// Series Instance UID of the [`dicom`] fixtures.
+pub fn series_uid(patient: u32, study: u32, series: u32) -> String {
+    format!("2.25.9{patient}0{study}.{series}")
+}
+
+/// The full server (`start`) on an ephemeral port with a temp storage root
+/// and DIMSE off.
+pub struct TestServer {
+    pub running: Running,
+    shutdown: CancellationToken,
+    dir: tempfile::TempDir,
+}
+
+impl TestServer {
+    pub async fn start(configure: impl FnOnce(&mut Config)) -> TestServer {
+        TestServer::start_in(tempfile::tempdir().unwrap(), configure).await
+    }
+
+    /// Start on `dir`, keeping whatever storage is already under it.
+    pub async fn start_in(
+        dir: tempfile::TempDir,
+        configure: impl FnOnce(&mut Config),
+    ) -> TestServer {
+        let mut config = Config::default();
+        config.storage.root = dir.path().join("store");
+        config.http.addr = "127.0.0.1:0".parse().unwrap();
+        config.http.web_dir = dir.path().join("web");
+        config.dimse.enabled = false;
+        configure(&mut config);
+        let shutdown = CancellationToken::new();
+        let running = start(config, shutdown.clone()).await.unwrap();
+        TestServer {
+            running,
+            shutdown,
+            dir,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.running.http_addr
+    }
+
+    /// The storage root.
+    pub fn root(&self) -> PathBuf {
+        self.dir.path().join("store")
+    }
+
+    pub async fn stop(self) {
+        self.stop_keep_dir().await;
+    }
+
+    /// Stop the server and hand back its temp dir (storage still on disk).
+    pub async fn stop_keep_dir(self) -> tempfile::TempDir {
+        self.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), self.running.task)
+            .await
+            .expect("server stops promptly")
+            .unwrap()
+            .unwrap();
+        self.dir
+    }
+
+    pub async fn get(&self, path: &str, headers: &[(&str, &str)]) -> Reply {
+        http_get(self.addr(), path, headers).await
+    }
+
+    /// STOW-RS `parts` to `/dicom-web/studies`; expects 200.
+    pub async fn stow(&self, parts: &[Vec<u8>]) -> Reply {
+        let r = stow(self.addr(), "/dicom-web/studies", parts, &[]).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        r
+    }
+}
+
+/// One HTTP response.
+pub struct Reply {
+    pub status: u16,
+    /// Header lines in order, names as sent.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Reply {
+    /// The first value of header `name`.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.header_all(name).into_iter().next()
+    }
+
+    /// Every value of header `name`, in order.
+    pub fn header_all(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// HTTP/1.0 request, one per connection, so the response is never chunked
+/// and ends at EOF. Sends `Host: <addr>` unless `headers` has a Host.
+pub async fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Reply {
+    let mut head = format!("{method} {path} HTTP/1.0\r\n");
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        head.push_str(&format!("Host: {addr}\r\n"));
+    }
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    s.write_all(body).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head");
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    let headers = lines
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            Some((k.trim().to_owned(), v.trim().to_owned()))
+        })
+        .collect();
+    Reply {
+        status,
+        headers,
+        body: buf[split + 4..].to_vec(),
+    }
+}
+
+pub async fn http_get(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Reply {
+    http_request(addr, "GET", path, headers, b"").await
+}
+
+pub async fn http_options(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Reply {
+    http_request(addr, "OPTIONS", path, headers, b"").await
+}
+
+pub const STOW_BOUNDARY: &str = "XXsupportXX";
+
+/// A STOW-RS body of `application/dicom` parts.
+pub fn stow_body(parts: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for part in parts {
+        body.extend_from_slice(
+            format!("--{STOW_BOUNDARY}\r\nContent-Type: application/dicom\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(part);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{STOW_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// POST `parts` as STOW-RS to `path` with extra `headers`.
+pub async fn stow(
+    addr: SocketAddr,
+    path: &str,
+    parts: &[Vec<u8>],
+    headers: &[(&str, &str)],
+) -> Reply {
+    let ct = format!("multipart/related; type=\"application/dicom\"; boundary={STOW_BOUNDARY}");
+    let mut all = vec![("Content-Type", ct.as_str())];
+    all.extend_from_slice(headers);
+    http_request(addr, "POST", path, &all, &stow_body(parts)).await
 }
 
 /// NIfTI-1 single file: 348-byte header, 4-byte extension flag, 8 data

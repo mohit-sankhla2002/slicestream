@@ -1,10 +1,10 @@
 //! Server configuration: one TOML file with `[storage]`, `[http]`,
-//! `[dimse]` and `[archives]`.
+//! `[dimse]`, `[archives]` and `[dicomweb]`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use slicestream_archive::Limits;
 use slicestream_dimse::ScpConfig;
@@ -19,6 +19,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub dimse: ScpConfig,
     pub archives: ArchivesConfig,
+    pub dicomweb: DicomwebConfig,
 }
 
 impl Config {
@@ -29,7 +30,30 @@ impl Config {
         };
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+        let config: Config =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("checking config {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Check values that parse but make no sense.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(url) = &self.http.public_url {
+            let rest = url
+                .strip_prefix("http://")
+                .or_else(|| url.strip_prefix("https://"));
+            if rest.is_none_or(|r| r.is_empty() || r.starts_with('/')) {
+                bail!(
+                    "[http] public_url must start with http:// or https:// and name a host: {url:?}"
+                );
+            }
+        }
+        if self.dicomweb.max_results == 0 {
+            bail!("[dicomweb] max_results must be at least 1");
+        }
+        Ok(())
     }
 }
 
@@ -56,6 +80,10 @@ pub struct HttpConfig {
     /// Serve `/api/metrics`, `/api/metrics/history` and `/api/console/series`
     /// and run the background sampler.
     pub metrics_enabled: bool,
+    /// Base of Retrieve URLs and BulkDataURIs (for example
+    /// `https://pacs.example.org` behind a reverse proxy). Unset:
+    /// `http://<Host header>`.
+    pub public_url: Option<String>,
 }
 
 impl Default for HttpConfig {
@@ -68,6 +96,7 @@ impl Default for HttpConfig {
             cors_allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
             metrics_enabled: true,
+            public_url: None,
         }
     }
 }
@@ -85,6 +114,7 @@ impl std::fmt::Debug for HttpConfig {
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("metrics_enabled", &self.metrics_enabled)
+            .field("public_url", &self.public_url)
             .finish()
     }
 }
@@ -139,6 +169,26 @@ impl ArchivesConfig {
             max_entries: self.max_entries,
             max_expanded_bytes: self.max_expanded_bytes,
             min_free_bytes: self.min_free_bytes,
+        }
+    }
+}
+
+/// DICOMweb read routes (QIDO-RS and WADO-RS). Every field has a default, so
+/// `[dicomweb]` may be empty. STOW-RS is not affected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DicomwebConfig {
+    /// Mount the `/dicom-web` GET routes.
+    pub enabled: bool,
+    /// QIDO-RS `limit`: its default and its maximum (at least 1).
+    pub max_results: u32,
+}
+
+impl Default for DicomwebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_results: 1000,
         }
     }
 }

@@ -1,8 +1,9 @@
-# DICOM conformance statement (storage ingest)
+# DICOM conformance statement (storage ingest and DICOMweb read)
 
-This statement covers the storage ingest features of slicestream: a DIMSE
-Storage SCP and an HTTP STOW-RS endpoint. It is not a full DICOM Conformance
-Statement per PS3.2. It lists what the server accepts and returns.
+This statement covers the storage ingest features of slicestream (a DIMSE
+Storage SCP and an HTTP STOW-RS endpoint) and its DICOMweb read routes. It is
+not a full DICOM Conformance Statement per PS3.2. It lists what the server
+accepts and returns.
 
 ## Implementation identity
 
@@ -97,10 +98,138 @@ is not served yet, so they return 404 for now.
 | 401 | A `stow_token` is configured and the bearer token is missing or wrong |
 | 421 | The `Host` header is not in `allowed_hosts` (any route) |
 
+RetrieveURLs start with `[http] public_url` when it is set (for example
+`https://example.org/pacs` behind a reverse proxy). Otherwise they start with
+`http://<Host header>`.
+
 Ingest routes never send CORS headers. Read routes send them only for the
 origins in `[http] cors_allowed_origins` (default: none). Every route checks
 the `Host` header against `[http] allowed_hosts` (default: `localhost`,
 `127.0.0.1`, `[::1]` and the host of `[http] addr`).
+
+## DICOMweb read
+
+The DICOMweb read routes answer `GET` (and `HEAD`). `[dicomweb] enabled =
+false` unmounts them: they then return 404. STOW-RS is not affected.
+
+They have no authentication. Anyone who can reach the HTTP port can read
+patient data through them. The default `[http] addr` is `127.0.0.1`; on any
+other address the server logs a warning at startup.
+
+They are read routes, so they send CORS headers only for the origins in
+`[http] cors_allowed_origins`. A preflight may ask for the `Accept` request
+header. Responses expose `Warning` to scripts.
+
+### QIDO-RS
+
+| Method and path | Returns |
+|---|---|
+| `GET /dicom-web/studies` | Studies |
+| `GET /dicom-web/series` | Series of all studies |
+| `GET /dicom-web/instances` | Instances of all studies |
+| `GET /dicom-web/studies/{study}/series` | Series of one study |
+| `GET /dicom-web/studies/{study}/instances` | Instances of one study |
+| `GET /dicom-web/studies/{study}/series/{series}/instances` | Instances of one series |
+
+**Media type.** Results are `application/dicom+json`. An `Accept` of
+`application/dicom+json`, `application/json`, `*/*`, or no `Accept` at all
+gives JSON. A request that accepts only other types (for example
+`application/dicom+xml`) gets 406. Results are gzip or Brotli compressed when
+`Accept-Encoding` allows it.
+
+**Matching keys.** By keyword (`PatientName=`) or by tag (`00100010=`). Keys
+of a higher level also work at lower levels (`/dicom-web/series?PatientID=X`).
+
+| Level | Keys |
+|---|---|
+| Study | Study Date, Study Time, Accession Number, Modalities in Study, Referring Physician's Name, Patient's Name, Patient ID, Study Instance UID, Study ID, Study Description |
+| Series | Modality, Series Instance UID, Series Number, Performed Procedure Step Start Date, Performed Procedure Step Start Time, Series Description, Request Attributes Sequence |
+| Instance | SOP Class UID, SOP Instance UID, Instance Number |
+
+**Match types.**
+
+- Single value. Patient's Name and Referring Physician's Name ignore case
+  (also for non-ASCII letters). Every other value matches exactly. A single
+  time (`12`) matches the whole period it names.
+- List of UIDs, comma-separated, on the UID keys. At most 1000 values; a
+  longer list gets 400.
+- Universal (empty value): matches everything.
+- Wildcard `*` and `?` on text keys (not on UIDs, dates or times). Only the
+  two name keys ignore case.
+- Range on dates and times (`20260101-20260131`), with either end open.
+
+**Other parameters.**
+
+- `includefield`: repeatable and comma-separated, by keyword or tag, or `all`.
+- `limit`: default and maximum are `[dicomweb] max_results` (1000).
+- `offset`: matches to skip. Results are in storage order, so paging is
+  stable.
+- `fuzzymatching`: `true` is answered with literal matching and a warning.
+
+**Returned attributes.** Each result has the attributes of PS3.18 Tables
+10.6.3-3 (study), 10.6.3-4 (series) or 10.6.3-5 (instance) that the
+instance has, plus the attributes used as matching keys. Series of all
+studies also carry the study attributes; instances carry the series
+attributes unless the path names the series, and the study attributes unless
+it names the study (PS3.18 10.6.3.3). Series and instance results always
+carry Study Instance UID, and instance results Series Instance UID.
+
+The server computes Number of Study Related Series and Instances, Number of
+Series Related Instances, Modalities in Study, Retrieve URL (0008,1190),
+Instance Availability (`ONLINE`) and Specific Character Set (`ISO_IR 192`).
+Other attributes come from the index. An attribute the index holds but that
+is empty is returned without a value.
+
+`includefield` attributes the index does not hold come from the stored
+metadata of a representative instance: the instance with the lowest internal
+id in the study or series (at instance level, the instance itself).
+`includefield=all` adds the Patient, General Study and Patient Study modules
+at study level, the General Series module at series level, and every
+attribute of the instance at instance level. An attribute that holds a bulk
+value (also inside a sequence) is never returned: QIDO-RS gives no
+BulkDataURIs.
+
+**Warnings.** Each is one `Warning` header of the form
+`299 <service>: "<text>"`, where `<service>` is the server's base URI (PS3.18
+8.3.4.2):
+
+| When | Text |
+|---|---|
+| `fuzzymatching=true` | `The fuzzymatching parameter is not supported. Only literal matching has been performed.` |
+| More matches exist after this page | `There are additional results that can be requested` |
+| Some query parameters were ignored | `The following query parameters were ignored: <names>` |
+
+**Status codes.**
+
+| HTTP status | Meaning |
+|---|---|
+| 200 | Search done. No match gives an empty array `[]` (PS3.18 8.3.4.4.1, Table 10.6.3-1). |
+| 400 | Invalid value for a supported parameter (bad date, time or number, unknown `includefield` attribute, a repeated key, bad percent-encoding) or a UID list over 1000 values. The plain-text body names the parameter. |
+| 404 | `[dicomweb] enabled = false` |
+| 406 | The request accepts no JSON type |
+| 421 | The `Host` header is not in `allowed_hosts` |
+
+**Deviations and choices.**
+
+- Unknown query parameters, attributes that are not matching keys, and keys
+  of a lower level (Modality in a study search) are ignored, with a
+  warning. PS3.18 8.3: "The origin server shall ignore any unsupported
+  Query Parameters."
+- No fuzzy matching; Patient's Name matching ignores case instead.
+- Request Attributes Sequence keys: an empty value matches every series;
+  any other value matches none. Request attributes are not indexed.
+- `includefield` may name attributes of any level. At study level a series
+  or instance attribute (for example Modality, which OHIF asks for) is taken
+  from the representative instance. PS3.18 10.6.3.3.1 says such attributes
+  are not returned at study level.
+- Timezone Offset From UTC (0008,0201) and Request Attributes Sequence
+  (0040,0275) are not indexed. They are returned only when `includefield`
+  names them.
+- The "more results" warning does not say how many: the server stops
+  counting after the page. PS3.18 8.3.4.4.1 words it as `There are
+  <remaining> additional results that can be requested`.
+- Modalities in Study matches one modality per query. A study matches when
+  any of its series has it. A wildcard on this key matches nothing.
 
 ## Limits and defaults
 
@@ -111,6 +240,9 @@ the `Host` header against `[http] allowed_hosts` (default: `localhost`,
 | `[http] max_request_bytes` | 17179869184 (16 GiB) |
 | `[http] cors_allowed_origins` | empty (no CORS) |
 | `[http] allowed_hosts` | empty (loopback names and the host of `addr`) |
+| `[http] public_url` | unset (`http://<Host>`) |
+| `[dicomweb] enabled` | `true` |
+| `[dicomweb] max_results` | 1000 (QIDO-RS `limit` default and maximum; at least 1) |
 | `[dimse] max_associations` | 64 |
 | `[dimse] max_pdu_length` | 116794 |
 | `[dimse] read_timeout_secs` / `write_timeout_secs` | 60 / 60 |

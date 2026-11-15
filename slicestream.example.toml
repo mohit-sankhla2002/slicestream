@@ -10,6 +10,7 @@ max_request_bytes = 17179869184  # 16 GiB
 cors_allowed_origins = []        # e.g. ["https://viewer.example.org"]; empty: no CORS
 allowed_hosts = []               # empty: localhost, 127.0.0.1, [::1], addr's host
 metrics_enabled = true           # GET /api/metrics, /api/metrics/history, /api/console/series
+# public_url = "https://pacs.example.org"  # base of Retrieve URLs and BulkDataURIs; default http://<Host>
 
 [dimse]
 enabled = true
@@ -38,3 +39,7 @@ min_free_bytes = 2147483648         # keep 2 GiB free: refuse (507) or abort bel
 max_concurrent_jobs = 2             # further uploads wait (queue cap: 4x this)
 job_retention = 50                  # finished jobs kept in memory for the API
 body_idle_timeout_secs = 60         # a body silent this long is refused (408)
+
+[dicomweb]
+enabled = true        # false: the /dicom-web GET routes are not mounted (STOW-RS stays)
+max_results = 1000    # QIDO limit: default and maximum

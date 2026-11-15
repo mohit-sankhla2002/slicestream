@@ -19,6 +19,8 @@ rar = ["slicestream-archive/rar"]
 [dependencies]
 slicestream-archive = { path = "../slicestream-archive", version = "0.1.0", default-features = false }
 slicestream-core = { path = "../slicestream-core", version = "0.1.0" }
+slicestream-dicomweb = { path = "../slicestream-dicomweb", version = "0.1.0" }
+dicom-core = "0.10.1"
 slicestream-store = { path = "../slicestream-store", version = "0.1.0" }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["ws"] }
@@ -26,11 +28,11 @@ futures-util = "0.3.34"
 mime = "0.3.18"
 multer = "3.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 subtle = "2.6.1"
 tokio = { version = "1.54.1", features = ["full"] }
 tower = { version = "0.5.3", default-features = false }
-tower-http = { version = "0.7.1", features = ["fs", "cors"] }
+tower-http = { version = "0.7.1", features = ["fs", "cors", "compression-gzip", "compression-br"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -42,7 +44,6 @@ fs4 = "1.1.0"
 slicestream-dimse = { version = "0.1.0", path = "../slicestream-dimse" }
 
 [dev-dependencies]
-dicom-core = "0.10.1"
 dicom-dictionary-std = "0.10.1"
 dicom-object = "0.10.1"
 dicom-transfer-syntax-registry = "0.10.1"
@@ -50,6 +51,7 @@ flate2 = "1.1.11"
 tar = "0.4.46"
 dicom-ul = { version = "0.10.1", features = ["async"] }
 http-body-util = "0.1.5"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3"
 tokio-tungstenite = "0.29.0"
 tower = { version = "0.5.3", features = ["util"] }

@@ -22,6 +22,7 @@ use subtle::ConstantTimeEq;
 
 use crate::AppState;
 use crate::config::HttpConfig;
+use crate::dicomweb::request_base_url;
 
 const APPLICATION_DICOM: &str = "application/dicom";
 const DICOM_JSON: &str = "application/dicom+json";
@@ -147,7 +148,7 @@ pub async fn stow_inner(
     // instances belong to.
     let retrieve_study = study.or_else(|| single_study(&results));
     let (status, value) = stow_response(
-        &base_url(&state.http, headers),
+        &request_base_url(&state.http, headers),
         retrieve_study.as_deref(),
         &results,
     );
@@ -268,17 +269,6 @@ fn multipart_error(e: multer::Error) -> Response {
         )
             .into_response(),
     }
-}
-
-/// `scheme://host` used to build RetrieveURLs.
-fn base_url(http: &HttpConfig, headers: &HeaderMap) -> String {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_graphic()))
-        .map(str::to_owned)
-        .unwrap_or_else(|| http.addr.to_string());
-    format!("http://{host}")
 }
 
 /// Whether the request carries the configured bearer token (if any).
