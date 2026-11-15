@@ -17,6 +17,7 @@ use crate::AppState;
 use crate::config::HttpConfig;
 
 mod bulk;
+mod fetch;
 mod frames;
 mod metadata;
 pub mod qido;

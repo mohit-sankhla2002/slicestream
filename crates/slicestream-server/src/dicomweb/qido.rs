@@ -5,18 +5,25 @@
 //! Availability, Specific Character Set). `includefield` attributes the
 //! index does not hold come from the stored metadata of the row's
 //! representative instance (the lowest instance id of the study or series).
+//!
+//! The body is streamed [`ROWS_PER_CHUNK`] rows at a time. The metadata of
+//! a chunk's representatives is read for that chunk only, under the
+//! [`MetadataReader`] budget, and dropped once its rows are written.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures_util::{Stream, StreamExt, stream};
 use slicestream_dicomweb::{
     Include, Level, Matcher, QidoQuery, default_fields, negotiate_json, parse_qido,
 };
-use slicestream_store::{MetadataState, QidoRow};
+use slicestream_store::{MetadataState, MetadataStateKind, QidoRow};
 
+use super::fetch::MetadataReader;
 use super::qido_json::{
     SERIES_INSTANCE_UID, STUDY_INSTANCE_UID, Wanted, index_value, indexed, pick, write_object,
 };
@@ -27,8 +34,11 @@ use crate::routes::internal_error;
 /// Most values in one UID list: each is one bound SQL parameter, and SQLite
 /// limits those.
 const MAX_LIST: usize = 1000;
-/// Representatives whose metadata is read at once.
-const METADATA_CHUNK: usize = 128;
+/// Result rows whose representatives' metadata is read together. A chunk's
+/// rows go out as one piece of the body.
+const ROWS_PER_CHUNK: usize = 64;
+/// A piece of the body goes out early once it is this large.
+const FLUSH_BYTES: usize = 1 << 20;
 
 const FUZZY_WARNING: &str =
     "The fuzzymatching parameter is not supported. Only literal matching has been performed.";
@@ -220,7 +230,7 @@ pub async fn series_instances(
 }
 
 async fn search(
-    state: &AppState,
+    state: &Arc<AppState>,
     level: Level,
     study: Option<&str>,
     series: Option<&str>,
@@ -249,37 +259,17 @@ async fn search(
 
     let fields = Fields::new(&query);
     let base = request_base_url(&state.http, headers);
-    let mut body = Vec::new();
-    body.push(b'[');
-    let mut first = true;
-    for rows in page.rows.chunks(METADATA_CHUNK) {
-        let mut metadata = match &fields.metadata {
-            Wanted::Nothing => HashMap::new(),
-            want => match load_metadata(state, rows, want).await {
-                Ok(m) => m,
-                Err(e) => return internal_error(&e),
-            },
-        };
-        for row in rows {
-            if !first {
-                body.push(b',');
-            }
-            first = false;
-            let mut attrs = metadata.remove(&row.representative).unwrap_or_default();
-            for &tag in &fields.tags {
-                if let Some(v) = index_value(tag, row, &base) {
-                    attrs.insert(tag, v.to_string());
-                }
-            }
-            write_object(&mut body, &attrs);
-        }
+    let mut body = QidoBody::new(Arc::clone(state), page.rows, fields, base.clone());
+    // The first chunk is prepared before the response starts, so a failure
+    // there is still a clean 500.
+    if let Err(e) = body.prepare_chunk().await {
+        return internal_error(&e);
     }
-    body.push(b']');
 
     let mut res = (
         StatusCode::OK,
         [(header::CONTENT_TYPE, HeaderValue::from_static(DICOM_JSON))],
-        body,
+        Body::from_stream(body.into_stream()),
     )
         .into_response();
     let mut texts = Vec::new();
@@ -402,43 +392,170 @@ impl Fields {
     }
 }
 
-/// Picked metadata attributes of each representative in `rows`, as JSON
-/// text by tag. A representative stored before scanning existed is scanned
-/// first. Representatives without metadata (the scan failed or the
-/// metadata was too large) are left out.
-async fn load_metadata(
-    state: &AppState,
-    rows: &[QidoRow],
-    want: &Wanted,
-) -> anyhow::Result<HashMap<i64, BTreeMap<u32, String>>> {
-    let index = state.ingestor.index();
-    let ids: Vec<i64> = rows.iter().map(|r| r.representative).collect();
-    let mut states: HashMap<i64, MetadataState> =
-        index.metadata_batch(&ids).await?.into_iter().collect();
-    let unscanned: Vec<i64> = states
-        .iter()
-        .filter(|(_, s)| matches!(s, MetadataState::Unscanned))
-        .map(|(id, _)| *id)
-        .collect();
-    if !unscanned.is_empty() {
-        for &id in &unscanned {
-            if let Err(e) = state.ingestor.ensure_scanned(id).await {
-                tracing::warn!(instance = id, "scan on demand failed: {e}");
+/// A QIDO-RS response body being written: `[`, the rows' objects, `]`.
+struct QidoBody {
+    state: Arc<AppState>,
+    rows: Vec<QidoRow>,
+    fields: Fields,
+    base: String,
+    /// Next row to write.
+    at: usize,
+    /// End of the chunk of rows `reader` reads metadata for.
+    chunk_end: usize,
+    /// Representatives of the current chunk whose metadata `reader` still
+    /// has to hand out.
+    ready: HashSet<i64>,
+    reader: MetadataReader,
+    opened: bool,
+    done: bool,
+}
+
+impl QidoBody {
+    fn new(state: Arc<AppState>, rows: Vec<QidoRow>, fields: Fields, base: String) -> Self {
+        QidoBody {
+            state,
+            rows,
+            fields,
+            base,
+            at: 0,
+            chunk_end: 0,
+            ready: HashSet::new(),
+            reader: MetadataReader::new(Vec::new()),
+            opened: false,
+            done: false,
+        }
+    }
+
+    /// Set up the chunk of rows that starts at the next row: find which of
+    /// its representatives have metadata (scanning any stored before
+    /// scanning existed). Representatives without metadata (the scan failed
+    /// or the metadata was too large) get only the index attributes.
+    async fn prepare_chunk(&mut self) -> anyhow::Result<()> {
+        self.chunk_end = (self.at + ROWS_PER_CHUNK).min(self.rows.len());
+        self.ready.clear();
+        self.reader = MetadataReader::new(Vec::new());
+        if matches!(self.fields.metadata, Wanted::Nothing) || self.at == self.chunk_end {
+            return Ok(());
+        }
+        let ids: Vec<i64> = self.rows[self.at..self.chunk_end]
+            .iter()
+            .map(|r| r.representative)
+            .collect();
+        let index = self.state.ingestor.index();
+        let mut states: HashMap<i64, MetadataStateKind> =
+            index.metadata_states(&ids).await?.into_iter().collect();
+        let unscanned: Vec<i64> = states
+            .iter()
+            .filter(|(_, s)| matches!(s, MetadataStateKind::Unscanned))
+            .map(|(id, _)| *id)
+            .collect();
+        if !unscanned.is_empty() {
+            for &id in &unscanned {
+                if let Err(e) = self.state.ingestor.ensure_scanned(id).await {
+                    tracing::warn!(instance = id, "scan on demand failed: {e}");
+                }
+            }
+            states.extend(index.metadata_states(&unscanned).await?);
+        }
+        let mut items = Vec::new();
+        for id in ids {
+            match states.get(&id) {
+                Some(MetadataStateKind::Ready(len)) => {
+                    if self.ready.insert(id) {
+                        items.push((id, *len));
+                    }
+                }
+                Some(MetadataStateKind::Unavailable(reason)) => {
+                    tracing::debug!(instance = id, "no metadata for QIDO-RS: {reason}");
+                }
+                Some(MetadataStateKind::Unscanned) | None => {}
             }
         }
-        states.extend(index.metadata_batch(&unscanned).await?);
+        self.reader = MetadataReader::new(items);
+        Ok(())
     }
-    Ok(states
-        .into_iter()
-        .filter_map(|(id, s)| match s {
-            MetadataState::Ready(json) => Some((id, pick(id, &json, want))),
-            MetadataState::Unscanned => None,
-            MetadataState::Unavailable(reason) => {
-                tracing::debug!(instance = id, "no metadata for QIDO-RS: {reason}");
-                None
+
+    /// The attributes `fields.metadata` asks for from the metadata of
+    /// `representative`; none when it has no metadata.
+    async fn picked(&mut self, representative: i64) -> anyhow::Result<BTreeMap<u32, String>> {
+        if !self.ready.remove(&representative) {
+            return Ok(BTreeMap::new());
+        }
+        match self.reader.next(self.state.ingestor.index()).await? {
+            Some((id, Some(MetadataState::Ready(json)))) if id == representative => {
+                Ok(pick(id, &json, &self.fields.metadata))
             }
+            // Gone since its state was read: like an instance without metadata.
+            Some((id, _)) if id == representative => Ok(BTreeMap::new()),
+            other => anyhow::bail!(
+                "metadata of instance {representative} read out of order: got {:?}",
+                other.map(|o| o.0)
+            ),
+        }
+    }
+
+    /// The next piece of the body: the rest of the current chunk of rows,
+    /// or [`FLUSH_BYTES`] of it; `[` comes with the first piece, `]` with
+    /// the last.
+    async fn step(&mut self) -> Option<std::io::Result<Bytes>> {
+        if self.done {
+            return None;
+        }
+        let mut out = Vec::new();
+        if !self.opened {
+            self.opened = true;
+            out.push(b'[');
+        }
+        loop {
+            if self.at == self.rows.len() {
+                out.push(b']');
+                self.done = true;
+                return Some(Ok(Bytes::from(out)));
+            }
+            if self.at == self.chunk_end
+                && let Err(e) = self.prepare_chunk().await
+            {
+                return self.fail(e);
+            }
+            let representative = self.rows[self.at].representative;
+            let mut attrs = match self.picked(representative).await {
+                Ok(a) => a,
+                Err(e) => return self.fail(e),
+            };
+            let row = &self.rows[self.at];
+            for &tag in &self.fields.tags {
+                if let Some(v) = index_value(tag, row, &self.base) {
+                    attrs.insert(tag, v.to_string());
+                }
+            }
+            if self.at > 0 {
+                out.push(b',');
+            }
+            write_object(&mut out, &attrs);
+            self.at += 1;
+            let chunk_done = self.at == self.chunk_end && self.at < self.rows.len();
+            if chunk_done || out.len() >= FLUSH_BYTES {
+                return Some(Ok(Bytes::from(out)));
+            }
+        }
+    }
+
+    /// End the body with an error: the client sees a broken stream, not a
+    /// short array.
+    fn fail(&mut self, e: anyhow::Error) -> Option<std::io::Result<Bytes>> {
+        tracing::error!("QIDO-RS response failed mid-stream: {e:#}");
+        self.done = true;
+        Some(Err(std::io::Error::other("QIDO-RS response failed")))
+    }
+
+    fn into_stream(self) -> impl Stream<Item = std::io::Result<Bytes>> {
+        // Fused: the compression layer polls once more after the end.
+        stream::unfold(self, |mut body| async move {
+            let item = body.step().await?;
+            Some((item, body))
         })
-        .collect())
+        .fuse()
+    }
 }
 
 #[cfg(test)]

@@ -145,7 +145,10 @@ header. Responses expose `Warning` to scripts.
 `application/dicom+json`, `application/json`, `*/*`, or no `Accept` at all
 gives JSON. A request that accepts only other types (for example
 `application/dicom+xml`) gets 406. Results are gzip or Brotli compressed when
-`Accept-Encoding` allows it.
+`Accept-Encoding` allows it. They are streamed 64 results at a time, with
+the stored metadata `includefield` needs read for those 64 only. A failure
+after the response has started ends the body early; the client sees a
+broken stream.
 
 **Matching keys.** By keyword (`PatientName=`) or by tag (`00100010=`). Keys
 of a higher level also work at lower levels (`/dicom-web/series?PatientID=X`).
@@ -268,7 +271,9 @@ in the response is stored in it; otherwise 406. `transfer-syntax=*` and no
 `transfer-syntax` accept whatever is stored.
 
 **Metadata.** The response is `application/dicom+json`: a JSON array with one
-object per instance, in storage order. It is streamed, and gzip or Brotli
+object per instance, in storage order. It is streamed an instance at a
+time, with at most 8 MiB of stored metadata read at once (or one larger
+instance's), and gzip or Brotli
 compressed when `Accept-Encoding` allows it. Group 0002 is not included.
 Pixel Data, Float Pixel Data, Double Float Pixel Data, binary values of VR
 OB, OD, OF, OL, OV, OW or UN longer than 1,024 bytes, and any other value

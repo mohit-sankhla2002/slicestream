@@ -404,6 +404,41 @@ pub async fn http_request(
     }
 }
 
+/// HTTP/1.1 GET with `Connection: close`: the status and header lines
+/// (lower-cased) and, for a chunked response, each chunk's bytes; for any
+/// other response, the body as one piece.
+pub async fn http11_chunks(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (String, Vec<Vec<u8>>) {
+    let mut head = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&buf[..split]).to_ascii_lowercase();
+    if !head.contains("transfer-encoding: chunked") {
+        return (head, vec![buf[split..].to_vec()]);
+    }
+    let mut chunks = Vec::new();
+    let mut rest = &buf[split..];
+    loop {
+        let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+        let n = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap(), 16).unwrap();
+        if n == 0 {
+            return (head, chunks);
+        }
+        chunks.push(rest[eol + 2..eol + 2 + n].to_vec());
+        rest = &rest[eol + 2 + n + 2..];
+    }
+}
+
 pub async fn http_get(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Reply {
     http_request(addr, "GET", path, headers, b"").await
 }

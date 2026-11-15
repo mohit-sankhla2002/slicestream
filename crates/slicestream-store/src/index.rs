@@ -82,6 +82,17 @@ pub enum MetadataState {
     Unavailable(String),
 }
 
+/// [`MetadataState`] without the metadata, from [`Index::metadata_states`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataStateKind {
+    /// Metadata of this many bytes is stored.
+    Ready(u64),
+    /// Not scanned yet.
+    Unscanned,
+    /// Scanned, but there is no metadata (over the size cap, or the scan failed).
+    Unavailable(String),
+}
+
 /// What the scan stored beside the metadata, from [`Index::stored_data`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredData {
@@ -976,6 +987,45 @@ impl Index {
                 Some(m) => MetadataState::Ready(m),
                 None if version < SCAN_VERSION => MetadataState::Unscanned,
                 None => MetadataState::Unavailable(
+                    problem.unwrap_or_else(|| "no metadata was stored".into()),
+                ),
+            };
+            found.insert(r.try_get::<i64, _>(0)?, state);
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| found.remove(id).map(|s| (*id, s)))
+            .collect())
+    }
+
+    /// [`Index::metadata_batch`] without reading the metadata: only whether
+    /// it is there, and its length. Unknown ids are left out; the rest keep
+    /// the order of `ids`.
+    pub async fn metadata_states(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, MetadataStateKind)>, sqlx::Error> {
+        let list = serde_json::to_string(ids).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        // SQLite answers length() of a blob from its header, without
+        // reading the blob.
+        let rows = sqlx::query(
+            "SELECT i.id, i.scan_version, i.scan_problem, length(d.metadata)
+             FROM instances i
+             LEFT JOIN instance_data d ON d.instance_fk = i.id
+             WHERE i.id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(list)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut found = std::collections::HashMap::new();
+        for r in &rows {
+            let version: i64 = r.try_get(1)?;
+            let problem: Option<String> = r.try_get(2)?;
+            let len: Option<i64> = r.try_get(3)?;
+            let state = match len {
+                Some(n) => MetadataStateKind::Ready(to_u64(n, "metadata length")?),
+                None if version < SCAN_VERSION => MetadataStateKind::Unscanned,
+                None => MetadataStateKind::Unavailable(
                     problem.unwrap_or_else(|| "no metadata was stored".into()),
                 ),
             };

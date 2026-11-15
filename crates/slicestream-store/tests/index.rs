@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use slicestream_store::{
     BlobHash, DuplicatePolicy, FrameTable, Index, InstanceData, InstanceHeader, InstanceRecord,
-    MetadataState, NiftiMeta, SCAN_VERSION, Scope, StorageCounts, StoredDataState, StudyInfo,
-    UploadCounts, UpsertOutcome, fold_name, read_header, scan_instance,
+    MetadataState, MetadataStateKind, NiftiMeta, SCAN_VERSION, Scope, StorageCounts,
+    StoredDataState, StudyInfo, UploadCounts, UpsertOutcome, fold_name, read_header, scan_instance,
 };
 
 fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
@@ -751,6 +751,26 @@ async fn metadata_batch_states() {
         )
     );
     assert!(idx.metadata_batch(&[]).await.unwrap().is_empty());
+
+    // The same states without the metadata: its length instead.
+    let len = ready.data.metadata.as_ref().unwrap().len() as u64;
+    let kinds = idx.metadata_states(&query).await.unwrap();
+    assert_eq!(
+        kinds,
+        [
+            (ids[0], MetadataStateKind::Ready(len)),
+            (ids[1], MetadataStateKind::Unscanned),
+            (
+                ids[2],
+                MetadataStateKind::Unavailable("metadata too large".into())
+            ),
+        ]
+    );
+    // Order follows the ids asked for.
+    let reversed: Vec<i64> = ids.iter().rev().copied().collect();
+    let kinds = idx.metadata_states(&reversed).await.unwrap();
+    assert_eq!(kinds.iter().map(|k| k.0).collect::<Vec<_>>(), reversed);
+    assert!(idx.metadata_states(&[]).await.unwrap().is_empty());
 }
 
 #[tokio::test]

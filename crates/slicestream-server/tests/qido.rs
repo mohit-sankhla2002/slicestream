@@ -816,3 +816,32 @@ async fn startup_backfills_unscanned_instances() {
     }
     srv.stop().await;
 }
+
+/// `includefield=all` at instance level reads every instance's metadata.
+/// The body is streamed a chunk of rows at a time, not built whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn includefield_all_instances_streams_in_chunks() {
+    let srv = TestServer::start(|_| {}).await;
+    let comment = |i: u32| format!("comment {i}");
+    let files: Vec<Vec<u8>> = (1..=130)
+        .map(|i| dicom_with(1, 1, 1, i, &[(tags::IMAGE_COMMENTS, VR::LT, &comment(i))]))
+        .collect();
+    srv.stow(&files).await;
+    let path = "/dicom-web/instances?includefield=all";
+    let (head, chunks) = http11_chunks(srv.addr(), path, &[]).await;
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    // 130 rows, 64 per chunk.
+    assert!(chunks.len() >= 3, "{} chunks", chunks.len());
+    let rows: Vec<Value> = serde_json::from_slice(&chunks.concat()).unwrap();
+    assert_eq!(rows.len(), 130);
+    // Each row carries its own instance's metadata.
+    for row in &rows {
+        let n = val(row, "00200013").as_i64().unwrap() as u32;
+        assert_eq!(val(row, "00204000"), comment(n).as_str());
+        assert_eq!(val(row, "00280004"), "MONOCHROME2");
+    }
+    // The same answer as a whole (HTTP/1.0) body.
+    assert_eq!(qido(&srv, path).await, rows);
+    srv.stop().await;
+}

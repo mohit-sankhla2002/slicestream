@@ -24,8 +24,9 @@ pub use frames::FrameTable;
 pub use header::{HeaderError, InstanceHeader, read_header};
 pub use index::{
     CONSOLE_SERIES_LIMIT, ConsoleSeriesRow, DuplicatePolicy, Index, InstanceRecord, InstanceRef,
-    InstanceSummary, MetadataState, NiftiMeta, NiftiRow, Scope, SeriesRow, SliceRow, StorageCounts,
-    StoredData, StoredDataState, StudyInfo, UploadCounts, UploadRow, UpsertOutcome, fold_name,
+    InstanceSummary, MetadataState, MetadataStateKind, NiftiMeta, NiftiRow, Scope, SeriesRow,
+    SliceRow, StorageCounts, StoredData, StoredDataState, StudyInfo, UploadCounts, UploadRow,
+    UpsertOutcome, fold_name,
 };
 pub use ingest::{
     Expectations, IngestError, IngestFailure, IngestSource, Ingestor, RecoveryReport, Stored,

@@ -593,3 +593,18 @@ async fn instance_deleted_mid_stream_aborts_metadata() {
     );
     srv.stop().await;
 }
+
+/// The metadata array is sent an instance at a time: `[`, one chunk per
+/// instance, `]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_streams_one_instance_at_a_time() {
+    let srv = series_of(3, &[]).await;
+    let path = format!(
+        "{}/metadata",
+        metadata_path(&study(), Some(&series()), None)
+    );
+    let sizes = chunk_sizes(srv.addr(), &path, &[]).await;
+    assert_eq!(sizes.len(), 5, "{sizes:?}");
+    assert_eq!((sizes[0], sizes[4]), (1, 1), "{sizes:?}");
+    srv.stop().await;
+}
