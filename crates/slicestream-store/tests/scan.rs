@@ -265,19 +265,17 @@ fn scan_big_endian_offsets() {
 }
 
 #[test]
-fn scan_deflated_has_metadata_no_offsets() {
+fn scan_rejects_deflated_like_read_header() {
     let dir = tempfile::tempdir().unwrap();
     let p = support::deflated(dir.path());
-    let scan = scan_instance(&p).unwrap();
-    assert!(!scan.data.offsets_valid);
-    assert_eq!(scan.data.frames, None);
-    assert!(scan.data.bulk.is_empty());
-    assert_eq!(scan.data.problem, None);
-    assert_eq!(scan.header, read_header(&p).unwrap());
-    let v = metadata(&scan);
-    assert_eq!(v["00100010"]["Value"][0]["Alphabetic"], "SCAN^TEST");
-    assert_eq!(v["00280008"], json!({"vr":"IS","Value":[2]}));
-    assert_eq!(v["7FE00010"]["BulkDataURI"], "bulk/7FE00010");
+    // Rejected as before M1: the data set encoding is not supported.
+    let want = read_header(&p).unwrap_err();
+    assert_eq!(
+        want.to_string(),
+        "unparseable DICOM: unsupported transfer syntax 1.2.840.10008.1.2.1.99"
+    );
+    let got = scan_instance(&p).unwrap_err();
+    assert_eq!(format!("{got:?}"), format!("{want:?}"));
 }
 
 #[test]

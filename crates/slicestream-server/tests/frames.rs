@@ -494,29 +494,78 @@ async fn frames_ambiguous_500() {
     srv.stop().await;
 }
 
+/// `obj` as a Deflated Explicit VR Little Endian Part-10 file, written by
+/// hand: the server neither reads nor writes deflated data sets.
+fn deflated_part10(obj: InMemDicomObject) -> Vec<u8> {
+    use std::io::Write;
+    let mut dataset = Vec::new();
+    obj.write_dataset_with_ts(
+        &mut dataset,
+        &dicom_transfer_syntax_registry::entries::EXPLICIT_VR_LITTLE_ENDIAN.erased(),
+    )
+    .unwrap();
+    let meta = dicom_object::FileMetaTableBuilder::new()
+        .transfer_syntax(DEFLATED)
+        .media_storage_sop_class_uid(
+            uids::MULTI_FRAME_GRAYSCALE_WORD_SECONDARY_CAPTURE_IMAGE_STORAGE,
+        )
+        .media_storage_sop_instance_uid(image_sop(1))
+        .build()
+        .unwrap();
+    let mut out = vec![0u8; 128];
+    out.extend_from_slice(b"DICM");
+    meta.write(&mut out).unwrap();
+    let mut z = flate2::write::DeflateEncoder::new(out, flate2::Compression::default());
+    z.write_all(&dataset).unwrap();
+    z.finish().unwrap()
+}
+
+/// Deflated data sets are rejected at ingest, as before M1: their data
+/// set encoding is not supported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deflated_frames_fall_back() {
+async fn deflated_upload_rejected() {
     let srv = TestServer::start(|_| {}).await;
-    let file = two_frames_with_bulk(&image_sop(1), DEFLATED);
-    srv.stow(std::slice::from_ref(&file)).await;
-    let old = old_frames(&file);
-    assert_eq!(old.concat(), pixel_bytes(2 * 4 * 4 * 2));
-    // The pixels are served inflated, so they are Explicit VR Little Endian.
-    for accept in [OCTET, OCTET_ANY] {
-        let r = get(&srv, &frames_path(&image_sop(1), "2,1"), accept).await;
-        assert_eq!(
-            parts(&r),
-            [
-                (octet_type(EXPLICIT_LE), old[1].clone()),
-                (octet_type(EXPLICIT_LE), old[0].clone())
-            ]
-        );
-    }
-    // Bulk data has no recorded offsets either: whole-file parse.
-    let r = get(&srv, &bulk_path(&image_sop(1), PRIVATE_BULK), OCTET).await;
-    assert_eq!(bodies(&r), [private_ob_value()]);
-    let r = get(&srv, &bulk_path(&image_sop(1), "7FE00010"), OCTET).await;
-    assert_eq!(bodies(&r), old);
+    let mut obj = with_private_ob(image(&image_sop(1), 2, 4, 4, 16));
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::from(pixel_bytes(2 * 4 * 4 * 2)),
+    ));
+    let file = deflated_part10(obj);
+    // The file really is deflated: its data set inflates to valid DICOM.
+    assert!(!file.windows(16).any(|w| w == b"SLICESTREAM TEST"));
+
+    let r = stow(
+        srv.addr(),
+        "/dicom-web/studies",
+        std::slice::from_ref(&file),
+        &[],
+    )
+    .await;
+    assert_eq!(r.status, 409, "{}", r.text());
+    let failed = &r.json()["00081198"]["Value"];
+    assert_eq!(failed.as_array().map(Vec::len), Some(1), "{}", r.text());
+    assert_eq!(failed[0]["00081197"]["Value"][0], 0xC000);
+
+    let r = http_request(
+        srv.addr(),
+        "POST",
+        "/api/instances",
+        &[("Content-Type", "application/dicom")],
+        &file,
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", r.text());
+    assert_eq!(r.json()["status"], 0xC000);
+    let error = r.json()["error"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        error.contains("unsupported transfer syntax 1.2.840.10008.1.2.1.99"),
+        "{error}"
+    );
+
+    let r = srv.get("/dicom-web/instances", &[]).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json(), serde_json::json!([]));
     srv.stop().await;
 }
 

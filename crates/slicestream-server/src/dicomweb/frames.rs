@@ -1,9 +1,9 @@
 //! WADO-RS frames (PS3.18 10.4): chosen frames of one instance, one part per
 //! frame in request order, with no transcoding (big-endian pixels may be
 //! byte-swapped). Frames in the instance's frame table are read with
-//! positioned reads. Instances that are not scanned yet, or deflated, are
-//! parsed whole instead. Each frame is read when its part is sent, so a
-//! request holds one frame in memory at a time.
+//! positioned reads. Instances that are not scanned yet are parsed whole
+//! instead. Each frame is read when its part is sent, so a request holds one
+//! frame in memory at a time.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +27,6 @@ const MAX_LISTED: usize = 4096;
 pub(crate) const EXPLICIT_LE: &str = "1.2.840.10008.1.2.1";
 pub(crate) const EXPLICIT_BE: &str = "1.2.840.10008.1.2.2";
 const IMPLICIT_LE: &str = "1.2.840.10008.1.2";
-const DEFLATED_LE: &str = "1.2.840.10008.1.2.1.99";
 
 pub async fn frames(
     State(state): State<Arc<AppState>>,
@@ -168,7 +167,7 @@ pub(super) async fn respond(
 }
 
 /// The frame table when the scan recorded one; a whole-file parse when it
-/// recorded no file offsets (deflated) or has not run yet.
+/// recorded no file offsets or has not run yet.
 fn frame_source(data: Option<StoredData>) -> Result<Source, Box<Response>> {
     match data {
         Some(data) if data.offsets_valid => match (data.frames, data.problem) {
@@ -186,11 +185,9 @@ fn frame_source(data: Option<StoredData>) -> Result<Source, Box<Response>> {
 }
 
 /// The transfer syntax frames are served in, and whether they are
-/// encapsulated. Deflate compresses the whole data set, so frames come out
-/// inflated: Explicit VR Little Endian.
+/// encapsulated.
 fn served_syntax(stored: &str) -> (&str, bool) {
     match stored {
-        DEFLATED_LE => (EXPLICIT_LE, false),
         IMPLICIT_LE | EXPLICIT_LE | EXPLICIT_BE => (stored, false),
         _ => (stored, true),
     }
@@ -346,7 +343,6 @@ mod tests {
 
     #[test]
     fn served_syntaxes() {
-        assert_eq!(served_syntax(DEFLATED_LE), (EXPLICIT_LE, false));
         assert_eq!(served_syntax(IMPLICIT_LE), (IMPLICIT_LE, false));
         assert_eq!(served_syntax(EXPLICIT_BE), (EXPLICIT_BE, false));
         assert_eq!(

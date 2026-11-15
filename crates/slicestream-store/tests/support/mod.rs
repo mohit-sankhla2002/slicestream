@@ -164,7 +164,9 @@ pub fn big_endian_pixels() -> Vec<u16> {
     (0..12u16).map(|i| 0x0102 + i * 0x0101).collect()
 }
 
-/// Two 4x4 16-bit frames, Deflated Explicit VR Little Endian.
+/// Two 4x4 16-bit frames, Deflated Explicit VR Little Endian. Written by
+/// hand (the store does not read or write deflated data sets): the Explicit
+/// VR Little Endian data set as raw DEFLATE stored blocks.
 pub fn deflated(dir: &Path) -> PathBuf {
     let mut obj = base(2, 4, 4, 16);
     obj.put(DataElement::new(
@@ -172,12 +174,46 @@ pub fn deflated(dir: &Path) -> PathBuf {
         VR::OW,
         PrimitiveValue::from(pixel_bytes(2 * 4 * 4 * 2)),
     ));
-    write(
-        dir,
-        "deflated.dcm",
-        obj,
-        uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN,
+    let mut dataset = Vec::new();
+    obj.write_dataset_with_ts(
+        &mut dataset,
+        &dicom_transfer_syntax_registry::entries::EXPLICIT_VR_LITTLE_ENDIAN.erased(),
     )
+    .unwrap();
+    let meta = FileMetaTableBuilder::new()
+        .transfer_syntax(uids::DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN)
+        .media_storage_sop_class_uid(
+            uids::MULTI_FRAME_GRAYSCALE_WORD_SECONDARY_CAPTURE_IMAGE_STORAGE,
+        )
+        .media_storage_sop_instance_uid(SOP_UID)
+        .build()
+        .unwrap();
+    let mut bytes = vec![0u8; 128];
+    bytes.extend_from_slice(b"DICM");
+    meta.write(&mut bytes).unwrap();
+    bytes.extend(stored_deflate(&dataset));
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("deflated.dcm");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// `data` as a raw DEFLATE stream (RFC 1951) of uncompressed blocks.
+fn stored_deflate(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut blocks = data.chunks(0xFFFF).peekable();
+    if blocks.peek().is_none() {
+        return vec![1, 0, 0, 0xFF, 0xFF];
+    }
+    while let Some(block) = blocks.next() {
+        // BFINAL on the last block, BTYPE 00 (stored).
+        out.push(u8::from(blocks.peek().is_none()));
+        let len = block.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    out
 }
 
 /// Bits Allocated 1: frames are bit-packed back to back.

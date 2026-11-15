@@ -49,9 +49,19 @@ within `read_timeout_secs`.
 ## Accepted transfer syntaxes
 
 The SCP accepts every transfer syntax in `dicom-transfer-syntax-registry`
-0.10.1, including encapsulated (compressed) ones. Pixel data is never decoded
-or transcoded on ingest. Instances are stored exactly as received, wrapped in
-a Part-10 file.
+0.10.1 whose data set it can read, including encapsulated (compressed) ones.
+Pixel data is never decoded or transcoded on ingest. Instances are stored
+exactly as received, wrapped in a Part-10 file.
+
+Deflated Explicit VR Little Endian (`1.2.840.10008.1.2.1.99`) is not
+supported for storage, and neither are JPIP Referenced Deflate
+(`1.2.840.10008.1.2.4.95`) and JPIP HTJ2K Referenced Deflate
+(`1.2.840.10008.1.2.4.205`): their whole data set is compressed. The SCP
+rejects a presentation context that proposes only these (result
+"transfer syntaxes not supported"); other presentation contexts of the
+association are still accepted. A deflated instance sent with STOW-RS or
+`POST /api/instances` fails with 0xC000 (`unsupported transfer syntax`),
+and nothing is stored.
 
 ## Status codes
 
@@ -292,11 +302,8 @@ with and without quotes. A bare media type (not wrapped in
 request names one frame; for more it gets 406.
 
 Frames are read at the file offsets recorded when the instance was stored.
-Two kinds of instance have none and are read by parsing the whole file,
-which is slower: instances stored before scanning existed (until the
-background scan reaches them) and deflated instances. A deflated instance's
-frames come out inflated, so they are served as Explicit VR Little Endian
-(`transfer-syntax=1.2.840.10008.1.2.1`), also for `transfer-syntax=*`.
+Instances stored before scanning existed have none until the background
+scan reaches them, and are read by parsing the whole file, which is slower.
 
 **Bulk data.** `{path}` is the end of a `BulkDataURI` from the metadata: a
 tag (`00091001`), or a path through sequence items (`00480105/0/00282000`,
@@ -312,8 +319,8 @@ Pixel Data (`7FE00010`) is served like the frames resource with every frame
 listed: one part per frame, with the same media types and rules.
 
 A path that is not a bulk value of the instance gets 404. For an instance
-with no recorded offsets (deflated, or not scanned yet), the file is parsed
-and the value of the element at that path is sent.
+with no recorded offsets (not scanned yet), the file is parsed and the value
+of the element at that path is sent.
 
 | HTTP status | Meaning |
 |---|---|
@@ -332,9 +339,6 @@ body early; the client sees a broken stream.
 - Bulk data values other than Pixel Data are not converted: a big-endian
   instance's values are sent big-endian, even when no transfer syntax was
   asked for. PS3.18's default for bulk data is Explicit VR Little Endian.
-- Frames of a deflated instance are labelled Explicit VR Little Endian, not
-  the stored Deflated Explicit VR Little Endian: the data set is inflated to
-  read them.
 
 ## Limits and defaults
 

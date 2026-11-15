@@ -308,6 +308,33 @@ async fn c_store_three_slices() {
     h.stop().await;
 }
 
+/// Deflated Explicit VR Little Endian is not supported for storage: a
+/// presentation context that proposes only it is rejected at negotiation;
+/// the rest of the association is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deflated_presentation_context_rejected() {
+    const DEFLATED: &str = "1.2.840.10008.1.2.1.99";
+    let h = Harness::start(|_| {}, |_| {}).await;
+    let scu = ClientAssociationOptions::new()
+        .calling_ae_title("TESTSCU")
+        .called_ae_title("SLICESTREAM")
+        .with_presentation_context(uids::CT_IMAGE_STORAGE, vec![DEFLATED])
+        .with_presentation_context(uids::VERIFICATION, vec![IMPLICIT_VR_LITTLE_ENDIAN.uid()])
+        .read_timeout(Duration::from_secs(10))
+        .connection_timeout(Duration::from_secs(10))
+        .establish_async(h.addr)
+        .await
+        .expect("association accepted");
+    let accepted: Vec<&str> = scu
+        .presentation_contexts()
+        .iter()
+        .map(|pc| pc.abstract_syntax.trim_end_matches('\0'))
+        .collect();
+    assert_eq!(accepted, [uids::VERIFICATION]);
+    scu.release().await.unwrap();
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_called_ae_rejected() {
     let h = Harness::start(|_| {}, |_| {}).await;

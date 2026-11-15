@@ -1,8 +1,8 @@
 //! WADO-RS bulk data (PS3.18 10.4): the value a `BulkDataURI` points to.
 //! Pixel Data is served as its frames, one part per frame. Other values are
 //! read at the file offsets the scan recorded, in 1 MiB reads. Without
-//! recorded offsets (deflated, or not scanned yet) the file is parsed and
-//! the element at the path is taken.
+//! recorded offsets (not scanned yet) the file is parsed and the element at
+//! the path is taken.
 
 use std::os::unix::fs::FileExt;
 use std::path::{Path as FsPath, PathBuf};
@@ -52,7 +52,7 @@ pub async fn bulk(
             },
             None => return no_value(),
         },
-        // Deflated (no file offsets, so no bulk list) or not scanned yet.
+        // Not scanned yet, or scanned without file offsets: no bulk list.
         _ => {
             let Some((items, tag)) = parse_path(&path) else {
                 return no_value();

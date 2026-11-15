@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 #[path = "../../slicestream-core/examples/make_phantom.rs"]
 mod phantom;
+mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -923,4 +924,22 @@ async fn ensure_scanned_single() {
     // Already scanned, and unknown ids, are no-ops.
     ing.ensure_scanned(ids[0]).await.unwrap();
     ing.ensure_scanned(9999).await.unwrap();
+}
+
+#[tokio::test]
+async fn ingest_rejects_deflated_as_before() {
+    let d = tempfile::tempdir().unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store")))
+        .await
+        .unwrap();
+    let file = support::deflated(&d.path().join("src"));
+    let err = ing.import_file(&file).await.unwrap_err();
+    assert!(
+        matches!(&err.error, IngestError::Unparseable(m)
+            if m == "unsupported transfer syntax 1.2.840.10008.1.2.1.99"),
+        "{err:?}"
+    );
+    assert_eq!(err.status(), 0xC000);
+    assert!(ing.index().list_series().await.unwrap().is_empty());
+    assert!(files_under(&ing.config().root.join("objects")).is_empty());
 }

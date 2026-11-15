@@ -112,9 +112,11 @@ benchmarks against Orthanc and dcm4chee.
 
 ## Known limits of the current scaffold
 
-- Frames are read at offsets recorded at ingest. Two kinds of instance have
-  none and are still read by parsing the whole file: instances stored before
-  M1 (until the background scan reaches them) and deflated instances.
+- Frames are read at offsets recorded at ingest. Instances stored before
+  M1 have none until the background scan reaches them, and are read by
+  parsing the whole file.
+- Deflated data sets (Deflated Explicit VR Little Endian) are not accepted
+  for storage.
 - The DICOMweb read routes have no authentication or authorization until M6.
   Keep the server on loopback or behind an authenticating proxy.
 - No transcoding: instances and frames are sent in the transfer syntax they

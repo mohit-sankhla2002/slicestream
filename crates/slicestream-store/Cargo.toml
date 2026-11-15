@@ -18,7 +18,7 @@ dicom-dictionary-std = { version = "0.10.1", features = ["sop-class"] }
 dicom-encoding = "0.10.1"
 dicom-object = "0.10.1"
 dicom-parser = "0.10.1"
-dicom-transfer-syntax-registry = { version = "0.10.1", features = ["deflate"] }
+dicom-transfer-syntax-registry = "0.10.1"
 fs4 = "1.1.0"
 rand = "0.9"
 serde = { version = "1.0.229", features = ["derive"] }

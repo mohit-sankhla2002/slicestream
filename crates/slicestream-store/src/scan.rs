@@ -109,7 +109,9 @@ pub struct InstanceData {
     /// `None` when the instance has no usable pixel data.
     pub frames: Option<FrameTable>,
     pub bulk: Vec<BulkValue>,
-    /// False for deflated data sets: no frame or bulk offsets are recorded.
+    /// False when the data set was read through a codec (deflate, which is
+    /// not enabled: deflated data sets are rejected): no frame or bulk
+    /// offsets are recorded.
     pub offsets_valid: bool,
     /// What went wrong, if anything. The instance is still stored.
     pub problem: Option<String>,
