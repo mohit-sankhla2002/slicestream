@@ -5,7 +5,8 @@
 //! table and a bulk-value table. Bulk values are never read into memory:
 //! their file offset and length are recorded and the JSON gets a
 //! `BulkDataURI`. Like [`read_header`], memory stays bounded whatever the
-//! instance size (the frame table grows with the number of frames).
+//! instance size: the JSON and the bulk list by [`MAX_METADATA_BYTES`], the
+//! frame table by [`MAX_FRAGMENTS`].
 //!
 //! Acceptance does not change: when the scan fails before it has passed the
 //! header attributes, [`read_header`] decides whether the instance is
@@ -39,6 +40,9 @@ pub const MAX_METADATA_BYTES: usize = 67_108_864;
 /// Binary values (OB, OD, OF, OL, OV, OW, UN) longer than this are bulk data.
 pub const BULK_BINARY_MIN: u32 = 1024;
 
+/// Most encapsulated pixel data fragments recorded for one instance.
+pub const MAX_FRAGMENTS: usize = 1_048_576;
+
 /// Top-level attributes read for the query columns, on top of the ones
 /// `read_header` needs.
 const QUERY_ATTRS: &[Tag] = &[
@@ -54,18 +58,37 @@ const QUERY_ATTRS: &[Tag] = &[
 /// Path of the top-level Pixel Data value.
 const PIXEL_DATA_PATH: &str = "7FE00010";
 
+/// Most distinct problems kept for one instance.
+const MAX_PROBLEMS: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanLimits {
     /// Metadata JSON above this size is dropped and recorded as a problem.
     pub max_metadata_bytes: usize,
+    /// Encapsulated pixel data with more fragments than this gets no frame
+    /// table; the count is recorded as a problem.
+    pub max_fragments: usize,
 }
 
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
             max_metadata_bytes: MAX_METADATA_BYTES,
+            max_fragments: MAX_FRAGMENTS,
         }
     }
+}
+
+/// How much the scan held in memory, for tests that check it stays bounded.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanTrace {
+    /// Most metadata JSON bytes buffered at once.
+    pub peak_metadata_bytes: usize,
+    /// Most fragment locations held at once.
+    pub fragments_kept: usize,
+    /// Bytes of Basic and Extended Offset Tables read into memory.
+    pub table_bytes: u64,
 }
 
 /// Where one bulk value lives in the stored file.
@@ -107,6 +130,15 @@ pub fn scan_instance(path: &Path) -> Result<InstanceScan, HeaderError> {
 /// [`read_header`] would; any later problem is reported in
 /// [`InstanceData::problem`]. Blocking.
 pub fn scan_instance_with(path: &Path, limits: &ScanLimits) -> Result<InstanceScan, HeaderError> {
+    scan_instance_traced(path, limits).map(|(scan, _)| scan)
+}
+
+/// [`scan_instance_with`], also reporting what the scan held in memory.
+#[doc(hidden)]
+pub fn scan_instance_traced(
+    path: &Path,
+    limits: &ScanLimits,
+) -> Result<(InstanceScan, ScanTrace), HeaderError> {
     let mut scanner = Scanner::new(open_data_set(path)?, limits);
     let stop = scanner.run().err();
     let header = match scanner.header.take() {
@@ -156,6 +188,8 @@ struct Scanner {
     header: Option<InstanceHeader>,
     json: DicomJsonWriter,
     max_json: usize,
+    max_fragments: usize,
+    trace: ScanTrace,
     /// Set once the JSON passed `max_json`; later output is only counted.
     json_over: bool,
     json_dropped: usize,
@@ -181,6 +215,8 @@ impl Scanner {
             header: None,
             json: DicomJsonWriter::new(),
             max_json: limits.max_metadata_bytes,
+            max_fragments: limits.max_fragments,
+            trace: ScanTrace::default(),
             json_over: false,
             json_dropped: 0,
             bulk: Vec::new(),
@@ -231,13 +267,30 @@ impl Scanner {
         depth: usize,
     ) -> Result<(), Stop> {
         self.element_value(header, prefix, depth)?;
+        self.bound_json();
+        Ok(())
+    }
+
+    /// Called after every piece of JSON output (an element, or the start or
+    /// end of a sequence or item), so the buffer never holds more than the
+    /// cap plus that piece. Past the cap, output is only counted, and the
+    /// bulk list is dropped with the metadata it belongs to.
+    fn bound_json(&mut self) {
         if !self.json_over && self.json.len() > self.max_json {
             self.json_over = true;
+            self.bulk = Vec::new();
         }
         if self.json_over {
             self.json_dropped += self.json.discard();
         }
-        Ok(())
+    }
+
+    /// Record a problem that does not stop the scan. Repeats, and any past
+    /// [`MAX_PROBLEMS`], are left out.
+    fn problem(&mut self, problem: String) {
+        if self.problems.len() < MAX_PROBLEMS && !self.problems.contains(&problem) {
+            self.problems.push(problem);
+        }
     }
 
     /// One element whose header was just decoded. `depth` is 0 at the top
@@ -285,6 +338,7 @@ impl Scanner {
                 tag,
                 tags::EXTENDED_OFFSET_TABLE | tags::EXTENDED_OFFSET_TABLE_LENGTHS
             ) && self.offsets_valid
+                && self.table_allowed(self.number_of_frames())
                 && u64::from(len) == 8 * u64::from(self.number_of_frames())
             {
                 return self.extended_offset_table(tag, vr, path, offset, len);
@@ -337,9 +391,15 @@ impl Scanner {
         self.header.as_ref().map_or(1, |h| h.number_of_frames)
     }
 
+    /// Offset tables are read only for at most [`ScanLimits::max_fragments`]
+    /// frames: a table for more frames could not be used anyway.
+    fn table_allowed(&self, frames: u32) -> bool {
+        usize::try_from(frames).is_ok_and(|n| n <= self.max_fragments)
+    }
+
     fn add_bulk(&mut self, tag: Tag, vr: VR, path: String, offset: u64, len: u32) {
         self.json.bulk(tag, vr, &path);
-        if self.offsets_valid {
+        if self.offsets_valid && !self.json_over {
             self.bulk.push(BulkValue {
                 path,
                 offset,
@@ -373,6 +433,7 @@ impl Scanner {
             return Err(parse_error("sequences nested too deeply"));
         }
         self.json.begin_sequence(header.tag());
+        self.bound_json();
         let end = header.len.get().map(|len| self.position() + u64::from(len));
         let mut index = 0usize;
         while end.is_none_or(|end| self.position() < end) {
@@ -394,11 +455,13 @@ impl Scanner {
         }
         self.check_end(end)?;
         self.json.end_sequence();
+        self.bound_json();
         Ok(())
     }
 
     fn item(&mut self, len: Length, prefix: &str, depth: usize) -> Result<(), Stop> {
         self.json.begin_item();
+        self.bound_json();
         let end = len.get().map(|len| self.position() + u64::from(len));
         while end.is_none_or(|end| self.position() < end) {
             let header = self.walker.decoder.decode_header().map_err(parse_error)?;
@@ -412,6 +475,7 @@ impl Scanner {
         }
         self.check_end(end)?;
         self.json.end_item();
+        self.bound_json();
         Ok(())
     }
 
@@ -438,20 +502,23 @@ impl Scanner {
         };
         match native_table(header, offset, len) {
             Some(Ok(table)) => self.frames = Some(table),
-            Some(Err(problem)) => self.problems.push(problem.into()),
+            Some(Err(problem)) => self.problem(problem.into()),
             None => {}
         }
         Ok(())
     }
 
     /// Read the fragments of encapsulated top-level Pixel Data and group
-    /// them into frames.
+    /// them into frames. Past [`ScanLimits::max_fragments`] fragments their
+    /// locations are no longer kept and there is no frame table.
     fn encapsulated(&mut self, vr: VR) -> Result<(), Stop> {
         self.json.bulk(tags::PIXEL_DATA, vr, PIXEL_DATA_PATH);
         let frames = self.number_of_frames();
         let mut basic: Option<Vec<u32>> = None;
         let mut fragments = Vec::new();
         let mut marked = Vec::new();
+        // Fragments seen, after the Basic Offset Table.
+        let mut seen = 0u64;
         loop {
             match self
                 .walker
@@ -467,9 +534,15 @@ impl Scanner {
                     self.check_stored(offset, len, || "pixel data truncated".into())?;
                     if basic.is_none() {
                         basic = Some(self.basic_offset_table(len, frames)?);
-                    } else {
+                        continue;
+                    }
+                    seen += 1;
+                    if fragments.len() < self.max_fragments {
                         marked.push(self.starts_codestream(len)?);
                         fragments.push((offset, u64::from(len)));
+                        self.trace.fragments_kept = self.trace.fragments_kept.max(fragments.len());
+                    } else {
+                        self.walker.skip(len)?;
                     }
                 }
                 SequenceItemHeader::SequenceDelimiter => break,
@@ -479,6 +552,16 @@ impl Scanner {
             }
         }
         if !self.offsets_valid {
+            return Ok(());
+        }
+        if seen > fragments.len() as u64 {
+            let sop = self.header.as_ref().map(|h| h.sop_instance_uid.as_str());
+            tracing::warn!(
+                sop_instance_uid = sop.unwrap_or_default(),
+                fragments = seen,
+                "too many fragments for a frame table"
+            );
+            self.problem(format!("too many fragments ({seen})"));
             return Ok(());
         }
         let extended = match (&self.extended_offsets, &self.extended_lengths) {
@@ -496,16 +579,20 @@ impl Scanner {
                     fragments = fragments.len(),
                     "frame boundaries unknown"
                 );
-                self.problems.push("frame boundaries unknown".into());
+                self.problem("frame boundaries unknown".into());
             }
         }
         Ok(())
     }
 
     /// The first item of encapsulated pixel data. Read only when it has one
-    /// entry per frame; any other table is unusable and skipped.
+    /// entry per frame, for at most [`ScanLimits::max_fragments`] frames;
+    /// any other table is unusable and skipped.
     fn basic_offset_table(&mut self, len: u32, frames: u32) -> Result<Vec<u32>, Stop> {
-        if !self.offsets_valid || u64::from(len) != 4 * u64::from(frames) {
+        if !self.offsets_valid
+            || !self.table_allowed(frames)
+            || u64::from(len) != 4 * u64::from(frames)
+        {
             self.walker.skip(len)?;
             return Ok(Vec::new());
         }
@@ -514,6 +601,7 @@ impl Scanner {
             .decoder
             .read_to_vec(len, &mut raw)
             .map_err(parse_error)?;
+        self.trace.table_bytes += u64::from(len);
         let (entries, _) = raw.as_chunks::<4>();
         Ok(entries.iter().map(|&e| u32::from_le_bytes(e)).collect())
     }
@@ -546,6 +634,7 @@ impl Scanner {
             .decoder
             .read_to_vec(len, &mut raw)
             .map_err(parse_error)?;
+        self.trace.table_bytes += u64::from(len);
         let (entries, _) = raw.as_chunks::<8>();
         let values = entries.iter().map(|&e| u64::from_le_bytes(e)).collect();
         if tag == tags::EXTENDED_OFFSET_TABLE {
@@ -561,7 +650,7 @@ impl Scanner {
         Ok(())
     }
 
-    fn finish(self, mut header: InstanceHeader, stop: Option<Stop>) -> InstanceScan {
+    fn finish(self, mut header: InstanceHeader, stop: Option<Stop>) -> (InstanceScan, ScanTrace) {
         let attr = |tag| get_str(&self.attrs, tag);
         header.study_time = attr(tags::STUDY_TIME);
         header.study_id = attr(tags::STUDY_ID);
@@ -575,24 +664,30 @@ impl Scanner {
 
         let mut problems: Vec<String> = stop.map(Stop::describe).into_iter().collect();
         problems.extend(self.problems);
+        let trace = ScanTrace {
+            peak_metadata_bytes: self.json.peak(),
+            ..self.trace
+        };
         let json = self.json.finish();
         let size = self.json_dropped + json.len();
-        let metadata = if size > self.max_json {
+        // The bulk list goes with the metadata that holds its paths.
+        let (metadata, bulk) = if size > self.max_json {
             problems.push(format!("metadata too large ({size} bytes)"));
-            None
+            (None, Vec::new())
         } else {
-            Some(json)
+            (Some(json), self.bulk)
         };
-        InstanceScan {
+        let scan = InstanceScan {
             header,
             data: InstanceData {
                 metadata,
                 frames: self.frames,
-                bulk: self.bulk,
+                bulk,
                 offsets_valid: self.offsets_valid,
                 problem: (!problems.is_empty()).then(|| problems.join("; ")),
             },
-        }
+        };
+        (scan, trace)
     }
 }
 

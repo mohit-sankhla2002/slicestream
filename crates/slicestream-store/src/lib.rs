@@ -34,7 +34,7 @@ pub use ingest::{
 pub use part10::{IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, write_part10_prefix};
 pub use qido::{InstanceFields, QidoPage, QidoRow, SeriesFields, StudyFields};
 pub use scan::{
-    BULK_BINARY_MIN, BulkValue, InstanceData, InstanceScan, MAX_METADATA_BYTES, SCAN_VERSION,
-    ScanLimits, scan_instance, scan_instance_with,
+    BULK_BINARY_MIN, BulkValue, InstanceData, InstanceScan, MAX_FRAGMENTS, MAX_METADATA_BYTES,
+    SCAN_VERSION, ScanLimits, ScanTrace, scan_instance, scan_instance_traced, scan_instance_with,
 };
 pub use stats::IngestStats;

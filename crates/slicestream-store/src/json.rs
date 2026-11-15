@@ -14,6 +14,8 @@ pub(crate) struct DicomJsonWriter {
     buf: Vec<u8>,
     /// One entry per open object or sequence, innermost last.
     open: Vec<Level>,
+    /// Largest `buf` length seen at a `discard`.
+    peak: usize,
 }
 
 struct Level {
@@ -34,6 +36,7 @@ impl DicomJsonWriter {
         Self {
             buf: vec![b'{'],
             open: vec![Level::new(b"}")],
+            peak: 0,
         }
     }
 
@@ -46,8 +49,15 @@ impl DicomJsonWriter {
     /// still continues the same document.
     pub(crate) fn discard(&mut self) -> usize {
         let n = self.buf.len();
+        self.peak = self.peak.max(n);
         self.buf.clear();
         n
+    }
+
+    /// Most bytes held at once so far. The buffer only grows between
+    /// discards, so this is exact.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.max(self.buf.len())
     }
 
     /// Close every open level and return the JSON text. A writer stopped

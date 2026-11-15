@@ -14,8 +14,9 @@ use dicom_object::InMemDicomObject;
 use serde_json::{Value, json};
 use slicestream_core::frame::{read_frame_at, read_frame_bytes};
 use slicestream_store::{
-    BULK_BINARY_MIN, BulkValue, FrameTable, InstanceHeader, InstanceScan, MAX_METADATA_BYTES,
-    SCAN_VERSION, ScanLimits, read_header, scan_instance, scan_instance_with,
+    BULK_BINARY_MIN, BulkValue, FrameTable, InstanceHeader, InstanceScan, MAX_FRAGMENTS,
+    MAX_METADATA_BYTES, SCAN_VERSION, ScanLimits, read_header, scan_instance, scan_instance_traced,
+    scan_instance_with,
 };
 use support::{ele, ele_long, item, pixel_bytes};
 
@@ -67,6 +68,8 @@ fn scan_constants() {
     assert_eq!(MAX_METADATA_BYTES, 67_108_864);
     assert_eq!(BULK_BINARY_MIN, 1024);
     assert_eq!(ScanLimits::default().max_metadata_bytes, MAX_METADATA_BYTES);
+    assert_eq!(MAX_FRAGMENTS, 1_048_576);
+    assert_eq!(ScanLimits::default().max_fragments, MAX_FRAGMENTS);
 }
 
 #[test]
@@ -596,6 +599,7 @@ fn scan_metadata_cap() {
         &p,
         &ScanLimits {
             max_metadata_bytes: 1024,
+            ..ScanLimits::default()
         },
     )
     .unwrap();
@@ -749,4 +753,178 @@ fn bulk_value_serializes() {
     };
     let s = serde_json::to_string(&b).unwrap();
     assert_eq!(serde_json::from_str::<BulkValue>(&s).unwrap(), b);
+}
+
+/// The UIDs `read_header` needs, then `between`, then Study and Series UID.
+fn minimal_with(between: &[u8]) -> Vec<u8> {
+    let mut ds = Vec::new();
+    ds.extend(ui(
+        tags::SOP_CLASS_UID,
+        uids::SECONDARY_CAPTURE_IMAGE_STORAGE,
+    ));
+    ds.extend(ui(tags::SOP_INSTANCE_UID, support::SOP_UID));
+    ds.extend(ele(Tag(0x0009, 0x0010), b"LO", b"SLICESTREAM TEST"));
+    ds.extend_from_slice(between);
+    ds.extend(ui(tags::STUDY_INSTANCE_UID, support::STUDY_UID));
+    ds.extend(ui(tags::SERIES_INSTANCE_UID, support::SERIES_UID));
+    ds
+}
+
+/// Sequence delimitation item.
+fn sequence_end() -> Vec<u8> {
+    let mut out = vec![0xFE, 0xFF, 0xDD, 0xE0];
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out
+}
+
+#[test]
+fn scan_empty_items_stay_under_metadata_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // One private sequence of 200,000 empty items: 1.6 MB of file, about
+    // 600 KB of JSON (`{},` per item) and no element inside any item.
+    let mut sq = item(0, &[]).repeat(200_000);
+    sq.extend(sequence_end());
+    let p = support::raw(
+        dir.path(),
+        &minimal_with(&ele_long(Tag(0x0009, 0x1001), b"SQ", u32::MAX, &sq)),
+    );
+    let limits = ScanLimits {
+        max_metadata_bytes: 1024,
+        ..ScanLimits::default()
+    };
+    let (scan, trace) = scan_instance_traced(&p, &limits).unwrap();
+    assert_eq!(shared(scan.header.clone()), read_header(&p).unwrap());
+    assert_eq!(scan.data.metadata, None);
+    let problem = scan.data.problem.as_deref().unwrap_or_default();
+    assert!(problem.starts_with("metadata too large ("), "{problem}");
+    // Never more than one element or item past the cap.
+    assert!(
+        trace.peak_metadata_bytes <= 1024 + 64,
+        "buffered {} bytes of JSON against a 1024-byte cap",
+        trace.peak_metadata_bytes
+    );
+    // The full scan still has it all.
+    let full = scan_instance(&p).unwrap();
+    assert_eq!(full.data.problem, None);
+    assert_eq!(
+        metadata(&full)["00091001"]["Value"]
+            .as_array()
+            .unwrap()
+            .len(),
+        200_000
+    );
+}
+
+#[test]
+fn scan_nested_bulk_values_stay_under_metadata_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // 20,000 items, each with an empty Pixel Data element: every one is a
+    // bulk value with a path, from 20 bytes of file.
+    let px = ele_long(tags::PIXEL_DATA, b"OB", 0, &[]);
+    let mut sq = item(px.len() as u32, &px).repeat(20_000);
+    sq.extend(sequence_end());
+    let p = support::raw(
+        dir.path(),
+        &minimal_with(&ele_long(Tag(0x0009, 0x1001), b"SQ", u32::MAX, &sq)),
+    );
+    let full = scan_instance(&p).unwrap();
+    assert_eq!(full.data.bulk.len(), 20_000);
+    assert_eq!(full.data.bulk[19_999].path, "00091001/19999/7FE00010");
+
+    let limits = ScanLimits {
+        max_metadata_bytes: 1024,
+        ..ScanLimits::default()
+    };
+    let (scan, trace) = scan_instance_traced(&p, &limits).unwrap();
+    assert_eq!(scan.data.metadata, None);
+    // No metadata to find bulk paths in: no bulk list either.
+    assert!(
+        scan.data.bulk.is_empty(),
+        "{} bulk values",
+        scan.data.bulk.len()
+    );
+    assert!(trace.peak_metadata_bytes <= 1024 + 128, "{trace:?}");
+}
+
+#[test]
+fn scan_too_many_fragments_has_no_frame_table() {
+    let dir = tempfile::tempdir().unwrap();
+    // One frame in 1,000 empty fragments: 8 KB of file, 16 KB of locations.
+    let frames = vec![vec![Vec::new(); 1000]];
+    let p = support::encapsulated(dir.path(), &frames, false, false, uids::JPEG_BASELINE8_BIT);
+    let full = scan_instance(&p).unwrap();
+    assert_eq!(full.data.problem, None);
+    assert_eq!(full.data.frames.as_ref().map(FrameTable::count), Some(1));
+
+    let limits = ScanLimits {
+        max_fragments: 100,
+        ..ScanLimits::default()
+    };
+    let (scan, trace) = scan_instance_traced(&p, &limits).unwrap();
+    // Still accepted, with metadata; only the frame table is missing.
+    assert_eq!(scan.header, read_header(&p).unwrap());
+    assert_eq!(scan.data.frames, None);
+    assert_eq!(
+        scan.data.problem.as_deref(),
+        Some("too many fragments (1000)")
+    );
+    assert_eq!(metadata(&scan)["7FE00010"]["BulkDataURI"], "bulk/7FE00010");
+    assert!(trace.fragments_kept <= 100, "{trace:?}");
+}
+
+#[test]
+fn scan_offset_tables_read_only_within_fragment_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    // 150 one-fragment frames with a Basic and an Extended Offset Table.
+    let frames: Vec<Vec<Vec<u8>>> = (0..150u8).map(|i| vec![vec![i; 2]]).collect();
+    let p = support::encapsulated(dir.path(), &frames, true, true, uids::JPEG_BASELINE8_BIT);
+    let (full, trace) = scan_instance_traced(&p, &ScanLimits::default()).unwrap();
+    assert_eq!(full.data.problem, None);
+    assert_eq!(trace.table_bytes, 150 * (4 + 8 + 8));
+
+    let limits = ScanLimits {
+        max_fragments: 100,
+        ..ScanLimits::default()
+    };
+    let (scan, trace) = scan_instance_traced(&p, &limits).unwrap();
+    assert_eq!(trace.table_bytes, 0, "tables for more frames than the cap");
+    assert_eq!(scan.data.frames, None);
+    assert_eq!(
+        scan.data.problem.as_deref(),
+        Some("too many fragments (150)")
+    );
+    // The Extended Offset Table is then an ordinary bulk value.
+    let v = metadata(&scan);
+    assert_eq!(v["7FE00001"]["BulkDataURI"], "bulk/7FE00001");
+}
+
+#[test]
+fn scan_repeated_problems_recorded_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let us = |tag, v: u16| ele(tag, b"US", &v.to_le_bytes());
+    let mut ds = Vec::new();
+    ds.extend(ui(
+        tags::SOP_CLASS_UID,
+        uids::SECONDARY_CAPTURE_IMAGE_STORAGE,
+    ));
+    ds.extend(ui(tags::SOP_INSTANCE_UID, support::SOP_UID));
+    ds.extend(ui(tags::STUDY_INSTANCE_UID, support::STUDY_UID));
+    ds.extend(ui(tags::SERIES_INSTANCE_UID, support::SERIES_UID));
+    ds.extend(us(tags::SAMPLES_PER_PIXEL, 1));
+    ds.extend(ele(
+        tags::PHOTOMETRIC_INTERPRETATION,
+        b"CS",
+        b"MONOCHROME2 ",
+    ));
+    ds.extend(us(tags::ROWS, 4));
+    ds.extend(us(tags::COLUMNS, 4));
+    ds.extend(us(tags::BITS_ALLOCATED, 16));
+    ds.extend(us(tags::BITS_STORED, 16));
+    ds.extend(us(tags::PIXEL_REPRESENTATION, 0));
+    // 50,000 empty Pixel Data elements, each one too short for its frame.
+    ds.extend(ele_long(tags::PIXEL_DATA, b"OW", 0, &[]).repeat(50_000));
+    let p = support::raw(dir.path(), &ds);
+    let scan = scan_instance(&p).unwrap();
+    assert_eq!(scan.header, read_header(&p).unwrap());
+    assert_eq!(scan.data.problem.as_deref(), Some("pixel data too short"));
 }
