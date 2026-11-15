@@ -1029,6 +1029,16 @@ impl Index {
             .collect()
     }
 
+    /// SOP Instance UID and blob of instance `id`; `None` when unknown.
+    pub async fn instance_blob(&self, id: i64) -> Result<Option<(String, BlobHash)>, sqlx::Error> {
+        let row = sqlx::query("SELECT sop_instance_uid, blob_sha256 FROM instances WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| Ok((r.try_get(0)?, parse_hash(r.try_get(1)?)?)))
+            .transpose()
+    }
+
     /// Record the scan of instance `id`, but only if it still points at
     /// `blob` (an overwrite may have replaced it meanwhile). Fills empty
     /// study and series columns. Returns whether anything was written.

@@ -26,9 +26,9 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{error, warn};
 
 use crate::{
-    BlobHash, BlobKind, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceData,
-    InstanceHeader, InstanceRecord, NiftiMeta, SpoolError, SpooledBlob, StorageConfig, TempBlob,
-    UpsertOutcome, read_header,
+    BlobHash, BlobKind, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceHeader,
+    InstanceRecord, InstanceScan, NiftiMeta, SpoolError, SpooledBlob, StorageConfig, TempBlob,
+    UpsertOutcome, scan_instance,
 };
 
 /// Capacity of the [`StoredEvent`] broadcast channel.
@@ -37,6 +37,8 @@ const EVENT_CAPACITY: usize = 1024;
 const LOCK_STRIPES: usize = 64;
 /// Chunk size used by [`Ingestor::import_file`].
 const IMPORT_CHUNK: usize = 64 * 1024;
+/// How many backfill scans run at once.
+const BACKFILL_PARALLELISM: usize = 2;
 /// Lock file under the storage root, held exclusively by the owning process.
 const LOCK_FILE: &str = "LOCK";
 
@@ -441,6 +443,30 @@ impl Shared {
         })
     }
 
+    /// Scan instance `id` (currently `blob`) and record the result, under
+    /// the per-UID lock so it serializes with an overwrite of the same
+    /// instance. A blob that is missing or unparseable is recorded as a scan
+    /// problem so it is not retried. Writes nothing if the row's blob changed.
+    async fn scan_row(
+        self: Arc<Self>,
+        id: i64,
+        uid: String,
+        blob: BlobHash,
+    ) -> Result<(), IngestError> {
+        let _guard = self.lock_for(&uid).lock().await;
+        let path = self.blobs.path_of(&blob, BlobKind::Dicom);
+        let scan = blocking(move || scan_instance(&path)).await?;
+        match scan {
+            Ok(scan) => self.index.write_scan(id, &blob, &scan).await?,
+            Err(e) => {
+                let problem = format!("cannot scan stored blob: {e}");
+                warn!(id, blob = %blob.to_hex(), %problem, "recording scan failure");
+                self.index.write_scan_failure(id, &blob, &problem).await?
+            }
+        };
+        Ok(())
+    }
+
     /// The critical section of [`Ingestor::ingest_nifti`]: commit → index →
     /// cleanup, serialized per blob hash (identical bytes, identical hash).
     /// Runs in its own task so that dropping the caller cannot interrupt it.
@@ -642,12 +668,12 @@ impl Ingestor {
         source: IngestSource,
         expect: Expectations,
     ) -> Result<Stored, IngestFailure> {
-        let (spooled, header) = blocking(move || {
-            let header = read_header(spooled.path());
-            (spooled, header)
+        let (spooled, scan) = blocking(move || {
+            let scan = scan_instance(spooled.path());
+            (spooled, scan)
         })
         .await?;
-        let header = header.map_err(IngestError::from)?;
+        let InstanceScan { header, data } = scan.map_err(IngestError::from)?;
         validate(&header, &expect).map_err(|e| IngestFailure::for_instance(e, &header))?;
         let (sop_class_uid, sop_instance_uid) = (
             header.sop_class_uid.clone(),
@@ -664,15 +690,8 @@ impl Ingestor {
             size_bytes: spooled.len,
             source: source.as_str().to_owned(),
             calling_ae,
-            // Until the ingest path runs the scan, the background scan fills this in.
-            data: InstanceData {
-                metadata: None,
-                frames: None,
-                bulk: Vec::new(),
-                offsets_valid: false,
-                problem: None,
-            },
-            scanned: false,
+            data,
+            scanned: true,
         };
         let shared = Arc::clone(&self.shared);
         tokio::spawn(shared.store(spooled, rec))
@@ -684,6 +703,42 @@ impl Ingestor {
                 sop_class_uid: Some(sop_class_uid),
                 sop_instance_uid: Some(sop_instance_uid),
             })
+    }
+
+    /// Scan up to `limit` instances stored before scanning existed (or at an
+    /// older scan version), two at a time. Returns how many rows it handled;
+    /// 0 means nothing is left to scan. Rows whose blob is unreadable are
+    /// recorded as scan problems, so they do not come back.
+    pub async fn backfill_batch(&self, limit: i64) -> Result<usize, IngestError> {
+        let rows = self.shared.index.unscanned(limit).await?;
+        let total = rows.len();
+        for pair in rows.chunks(BACKFILL_PARALLELISM) {
+            let tasks: Vec<_> = pair
+                .iter()
+                .map(|(id, uid, blob)| {
+                    tokio::spawn(Arc::clone(&self.shared).scan_row(*id, uid.clone(), *blob))
+                })
+                .collect();
+            for task in tasks {
+                task.await.map_err(join_error)??;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Scan instance `id` now unless it is already scanned. Unknown ids are
+    /// a no-op.
+    pub async fn ensure_scanned(&self, id: i64) -> Result<(), IngestError> {
+        let index = &self.shared.index;
+        if index.stored_data(id).await?.is_some() {
+            return Ok(());
+        }
+        let Some((uid, blob)) = index.instance_blob(id).await? else {
+            return Ok(());
+        };
+        tokio::spawn(Arc::clone(&self.shared).scan_row(id, uid, blob))
+            .await
+            .map_err(join_error)?
     }
 
     /// Startup-only crash recovery: remove every file in `tmp/`, mark

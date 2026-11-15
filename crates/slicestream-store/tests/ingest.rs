@@ -751,3 +751,176 @@ async fn spool_sync_respects_max_instance_bytes() {
     let ok = ing.spool_sync(&mut &[0u8; 100][..]).unwrap();
     assert_eq!(ok.len, 100);
 }
+
+async fn index_pool(root: &Path) -> sqlx::SqlitePool {
+    sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
+        .await
+        .unwrap()
+}
+
+/// Ingest `n` phantom slices through the pipeline; returns instance ids.
+async fn ingest_slices(ing: &Ingestor, src: &Path, n: usize) -> Vec<i64> {
+    phantom::write_phantom(src, n, 16).unwrap();
+    for i in 1..=n {
+        ing.import_file(&src.join(format!("IM{i:05}.dcm")))
+            .await
+            .unwrap();
+    }
+    let ids = sqlx::query_scalar::<_, i64>("SELECT id FROM instances ORDER BY id")
+        .fetch_all(&index_pool(&ing.config().root).await)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), n);
+    ids
+}
+
+async fn unscan_all(root: &Path) {
+    let pool = index_pool(root).await;
+    for q in [
+        "DELETE FROM instance_data",
+        "UPDATE instances SET scan_version = 0",
+        "UPDATE studies SET study_time = NULL",
+    ] {
+        sqlx::query(q).execute(&pool).await.unwrap();
+    }
+}
+
+async fn studies_with_time(root: &Path) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM studies WHERE study_time IS NOT NULL")
+        .fetch_one(&index_pool(root).await)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ingest_stores_scan_data() {
+    let d = tempfile::tempdir().unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store")))
+        .await
+        .unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 1).await;
+    let data = ing.index().stored_data(ids[0]).await.unwrap().unwrap();
+    assert!(matches!(
+        data.frames,
+        Some(slicestream_store::FrameTable::Native { .. })
+    ));
+    let md = ing.index().metadata_batch(&ids).await.unwrap();
+    let slicestream_store::MetadataState::Ready(json) = &md[0].1 else {
+        panic!("metadata not ready: {:?}", md[0].1)
+    };
+    let v: serde_json::Value = serde_json::from_slice(json).unwrap();
+    assert!(v.get("00100010").is_some());
+}
+
+#[tokio::test]
+async fn backfill_scans_old_rows() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let src = d.path().join("src");
+    phantom::write_phantom(&src, 5, 16).unwrap();
+    for i in 1..=5 {
+        let f = src.join(format!("IM{i:05}.dcm"));
+        let mut obj = dicom_object::open_file(&f).unwrap();
+        obj.put(DataElement::new(
+            tags::STUDY_TIME,
+            VR::TM,
+            PrimitiveValue::from("101530"),
+        ));
+        obj.write_to_file(&f).unwrap();
+        ing.import_file(&f).await.unwrap();
+    }
+    let ids = sqlx::query_scalar::<_, i64>("SELECT id FROM instances ORDER BY id")
+        .fetch_all(&index_pool(&root).await)
+        .await
+        .unwrap();
+    let before = studies_with_time(&root).await;
+    assert_eq!(before, 1, "the files have a study time");
+    unscan_all(&root).await;
+    assert_eq!(studies_with_time(&root).await, 0);
+    assert!(ing.index().stored_data(ids[0]).await.unwrap().is_none());
+
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(ing.backfill_batch(2).await.unwrap());
+    }
+    assert_eq!(got, vec![2, 2, 1, 0]);
+    assert!(ing.index().unscanned(10).await.unwrap().is_empty());
+    for id in ids {
+        assert!(ing.index().stored_data(id).await.unwrap().is_some());
+    }
+    assert_eq!(studies_with_time(&root).await, before);
+}
+
+#[tokio::test]
+async fn backfill_skips_instance_replaced_meanwhile() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let mut cfg = config(&root);
+    cfg.on_duplicate = DuplicatePolicy::Overwrite;
+    let ing = Ingestor::open(cfg).await.unwrap();
+    let file = phantom_file(&d.path().join("src"));
+    ing.import_file(&file).await.unwrap();
+    unscan_all(&root).await;
+
+    // The backfill read the row and scanned the old bytes...
+    let (id, _, old_blob) = ing.index().unscanned(10).await.unwrap().remove(0);
+    let old_scan = slicestream_store::scan_instance(&file).unwrap();
+    // ...then an overwrite replaced the instance.
+    let mut obj = dicom_object::open_file(&file).unwrap();
+    obj.put(DataElement::new(
+        tags::SERIES_DESCRIPTION,
+        VR::LO,
+        PrimitiveValue::from("changed"),
+    ));
+    obj.write_to_file(&file).unwrap();
+    let b = ing.import_file(&file).await.unwrap();
+    assert!(b.replaced);
+
+    assert!(
+        !ing.index()
+            .write_scan(id, &old_blob, &old_scan)
+            .await
+            .unwrap()
+    );
+    let md = ing.index().metadata_batch(&[id]).await.unwrap();
+    let slicestream_store::MetadataState::Ready(json) = &md[0].1 else {
+        panic!("not ready")
+    };
+    assert!(String::from_utf8_lossy(json).contains("changed"));
+}
+
+#[tokio::test]
+async fn backfill_records_unreadable_blob_problem() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 1).await;
+    unscan_all(&root).await;
+    let (_, _, blob) = ing.index().unscanned(1).await.unwrap().remove(0);
+    std::fs::remove_file(ing.blobs().path_of(&blob, BlobKind::Dicom)).unwrap();
+
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 1);
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 0);
+    let md = ing.index().metadata_batch(&ids).await.unwrap();
+    assert!(matches!(
+        md[0].1,
+        slicestream_store::MetadataState::Unavailable(_)
+    ));
+}
+
+#[tokio::test]
+async fn ensure_scanned_single() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 2).await;
+    unscan_all(&root).await;
+
+    ing.ensure_scanned(ids[0]).await.unwrap();
+    assert!(ing.index().stored_data(ids[0]).await.unwrap().is_some());
+    assert!(ing.index().stored_data(ids[1]).await.unwrap().is_none());
+    // Already scanned, and unknown ids, are no-ops.
+    ing.ensure_scanned(ids[0]).await.unwrap();
+    ing.ensure_scanned(9999).await.unwrap();
+}
