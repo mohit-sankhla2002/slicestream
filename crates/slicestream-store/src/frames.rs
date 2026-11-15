@@ -246,34 +246,54 @@ fn fragment_at(fragments: &[(u64, u64)], rel: u64) -> Option<usize> {
         .ok()
 }
 
+/// Fragment index where each frame starts, from offset table entries. `None`
+/// unless every entry hits a fragment start, the first is 0 and they
+/// strictly increase.
+fn frame_starts(
+    fragments: &[(u64, u64)],
+    offsets: impl Iterator<Item = u64>,
+) -> Option<Vec<usize>> {
+    let starts: Vec<usize> = offsets
+        .map(|rel| fragment_at(fragments, rel))
+        .collect::<Option<_>>()?;
+    if starts.first() != Some(&0) || starts.windows(2).any(|w| w[0] >= w[1]) {
+        return None;
+    }
+    Some(starts)
+}
+
 /// Frame `k` starts at the fragment `offsets[k]` points to and is
-/// `lengths[k]` bytes long (which leaves out trailing padding).
+/// `lengths[k]` bytes long (which leaves out trailing padding). It must fit
+/// before the fragment where frame `k + 1` starts.
 fn by_extended_table(
     n: usize,
     fragments: &[(u64, u64)],
     offsets: &[u64],
     lengths: &[u64],
 ) -> Option<Vec<Vec<(u64, u64)>>> {
-    if offsets.len() != n || lengths.len() != n {
+    if offsets.len() != n || lengths.len() != n || lengths.contains(&0) {
         return None;
     }
-    offsets
-        .iter()
-        .zip(lengths)
-        .map(|(&rel, &len)| {
-            let mut i = fragment_at(fragments, rel)?;
-            let mut left = len;
-            let mut frame = Vec::new();
-            while left > 0 {
-                let (offset, frag_len) = *fragments.get(i)?;
-                let take = frag_len.min(left);
-                frame.push((offset, take));
-                left -= take;
-                i += 1;
+    let starts = frame_starts(fragments, offsets.iter().copied())?;
+    let mut frames = Vec::with_capacity(n);
+    for (k, (&start, &len)) in starts.iter().zip(lengths).enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(fragments.len());
+        let mut left = len;
+        let mut frame = Vec::new();
+        for &(offset, frag_len) in &fragments[start..end] {
+            if left == 0 {
+                break;
             }
-            Some(frame)
-        })
-        .collect()
+            let take = frag_len.min(left);
+            frame.push((offset, take));
+            left -= take;
+        }
+        if left > 0 {
+            return None;
+        }
+        frames.push(frame);
+    }
+    Some(frames)
 }
 
 fn by_basic_table(
@@ -284,13 +304,7 @@ fn by_basic_table(
     if basic.is_empty() || basic.len() != n {
         return None;
     }
-    let starts: Vec<usize> = basic
-        .iter()
-        .map(|&rel| fragment_at(fragments, u64::from(rel)))
-        .collect::<Option<_>>()?;
-    if starts[0] != 0 || starts.windows(2).any(|w| w[0] >= w[1]) {
-        return None;
-    }
+    let starts = frame_starts(fragments, basic.iter().map(|&rel| u64::from(rel)))?;
     Some(split_at(fragments, &starts))
 }
 
@@ -460,5 +474,43 @@ mod tests {
             None
         );
         assert_eq!(group_fragments(1, &[], &[], &[], None), None);
+    }
+
+    #[test]
+    fn malformed_extended_table_falls_through() {
+        let two = &FRAGS[..2];
+        let one_each = Some(vec![vec![(100, 10)], vec![(118, 6)]]);
+        // Both frames point at the first fragment.
+        let eot: (&[u64], &[u64]) = (&[0, 0], &[10, 6]);
+        assert_eq!(
+            group_fragments(2, two, &[false; 2], &[], Some(eot)),
+            one_each
+        );
+        // Offsets that go backwards.
+        let eot: (&[u64], &[u64]) = (&[18, 0], &[6, 10]);
+        assert_eq!(
+            group_fragments(2, two, &[false; 2], &[], Some(eot)),
+            one_each
+        );
+        // Empty frames.
+        let eot: (&[u64], &[u64]) = (&[0, 18], &[0, 0]);
+        assert_eq!(
+            group_fragments(2, two, &[false; 2], &[], Some(eot)),
+            one_each
+        );
+
+        // Three fragments; markers say frames are [0], [1, 2] or [0, 1], [2].
+        // Not starting at the first fragment.
+        let eot: (&[u64], &[u64]) = (&[18, 32], &[6, 4]);
+        assert_eq!(
+            group_fragments(2, &FRAGS, &[true, false, true], &[], Some(eot)),
+            Some(vec![vec![(100, 10), (118, 6)], vec![(132, 4)]])
+        );
+        // Frame 0's length runs into fragment 1, where frame 1 starts.
+        let eot: (&[u64], &[u64]) = (&[0, 18], &[16, 10]);
+        assert_eq!(
+            group_fragments(2, &FRAGS, &[true, true, false], &[], Some(eot)),
+            Some(vec![vec![(100, 10)], vec![(118, 6), (132, 4)]])
+        );
     }
 }
