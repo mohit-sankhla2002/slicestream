@@ -1,0 +1,16 @@
+[package]
+name = "slicestream-dicomweb"
+description = "DICOMweb request models and parsing for slicestream: QIDO-RS queries."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+dicom-core = "0.10.1"
+dicom-dictionary-std = "0.10.1"
+percent-encoding = "2.3.2"

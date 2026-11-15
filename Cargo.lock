@@ -2205,6 +2205,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slicestream-dicomweb"
+version = "0.1.0"
+dependencies = [
+ "dicom-core",
+ "dicom-dictionary-std",
+ "percent-encoding",
+]
+
+[[package]]
 name = "slicestream-dimse"
 version = "0.1.0"
 dependencies = [
