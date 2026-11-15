@@ -1,4 +1,5 @@
-//! DICOMweb read routes (PS3.18): QIDO-RS search. Mounted on the read
+//! DICOMweb read routes (PS3.18): QIDO-RS search and WADO-RS metadata and
+//! instance retrieve. Mounted on the read
 //! router when `[dicomweb] enabled = true`, so they share its CORS policy.
 
 use std::sync::Arc;
@@ -8,14 +9,17 @@ use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, Version, header
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use slicestream_dicomweb::{MediaRange, parse_accept};
+use slicestream_store::{InstanceRef, Scope};
 use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 use crate::AppState;
 use crate::config::HttpConfig;
 
+mod metadata;
 pub mod qido;
 mod qido_json;
+mod retrieve;
 
 pub(crate) const DICOM_JSON: &str = "application/dicom+json";
 
@@ -33,6 +37,24 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/dicom-web/studies/{study}/series/{series}/instances",
             get(qido::series_instances),
+        )
+        .route("/dicom-web/studies/{study}/metadata", get(metadata::study))
+        .route(
+            "/dicom-web/studies/{study}/series/{series}/metadata",
+            get(metadata::series),
+        )
+        .route(
+            "/dicom-web/studies/{study}/series/{series}/instances/{instance}/metadata",
+            get(metadata::instance),
+        )
+        .route("/dicom-web/studies/{study}", get(retrieve::study))
+        .route(
+            "/dicom-web/studies/{study}/series/{series}",
+            get(retrieve::series),
+        )
+        .route(
+            "/dicom-web/studies/{study}/series/{series}/instances/{instance}",
+            get(retrieve::instance),
         )
         // JSON compresses well; pixel data and multipart bodies do not.
         .layer(
@@ -84,6 +106,21 @@ pub(crate) fn warning(service: &str, text: &str) -> Option<HeaderValue> {
     };
     let value = format!("299 {}: \"{}\"", clean(service, false), clean(text, true));
     HeaderValue::from_str(&value).ok()
+}
+
+/// The instances in `scope`, or the 404 / 500 response to send. An empty
+/// scope is a 404: unknown UID, or a series that is not in that study.
+pub(crate) async fn find(
+    state: &AppState,
+    scope: &Scope,
+) -> Result<Vec<InstanceRef>, Box<Response>> {
+    match state.ingestor.index().find_instances(scope).await {
+        Ok(v) if v.is_empty() => Err(Box::new(plain(StatusCode::NOT_FOUND, "not found".into()))),
+        Ok(v) => Ok(v),
+        Err(e) => Err(Box::new(crate::routes::internal_error(
+            &anyhow::Error::new(e),
+        ))),
+    }
 }
 
 /// A plain-text response (errors).

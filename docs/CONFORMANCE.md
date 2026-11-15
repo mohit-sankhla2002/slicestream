@@ -84,8 +84,8 @@ FailedSOPSequence item carries (0008,1150) / (0008,1155) whenever the part's
 header could be parsed.
 
 The RetrieveURLs follow the WADO-RS layout
-(`/dicom-web/studies/{study}/series/{series}/instances/{instance}`), but WADO-RS
-is not served yet, so they return 404 for now.
+(`/dicom-web/studies/{study}/series/{series}/instances/{instance}`) and can be
+fetched with [WADO-RS](#wado-rs).
 
 | HTTP status | Meaning |
 |---|---|
@@ -339,3 +339,51 @@ through STOW-RS, `POST /api/instances` or C-STORE.
 server (default and Implicit VR Little Endian transfer syntaxes, duplicate
 detection, and rejection of a wrong called AE title). CI runs it as the
 `interop` job.
+
+### WADO-RS
+
+| Method and path | Returns |
+|---|---|
+| `GET /dicom-web/studies/{study}` | Every instance of the study |
+| `GET /dicom-web/studies/{study}/series/{series}` | Every instance of the series |
+| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}` | One instance |
+| `GET /dicom-web/studies/{study}/metadata` | DICOM JSON of every instance of the study |
+| `GET /dicom-web/studies/{study}/series/{series}/metadata` | DICOM JSON of every instance of the series |
+| `GET /dicom-web/studies/{study}/series/{series}/instances/{instance}/metadata` | DICOM JSON of one instance |
+
+**Instances.** The response is `multipart/related; type="application/dicom"`,
+one part per instance, each part the stored file byte for byte. A part's
+`Content-Type` is `application/dicom; transfer-syntax=<stored syntax>`. An
+`Accept` of exactly `application/dicom` (no `multipart/related`) gets the file
+itself, and is only possible when the request names one instance; for more it
+gets 406. Bodies are streamed in 1 MiB reads and are never compressed.
+
+**Transfer syntax.** The server does not transcode: it sends every instance
+in the transfer syntax it was stored with. This is the same as Orthanc. A
+request for a specific `transfer-syntax` is answered only when every instance
+in the response is stored in it; otherwise 406. `transfer-syntax=*` and no
+`transfer-syntax` accept whatever is stored.
+
+**Metadata.** The response is `application/dicom+json`: a JSON array with one
+object per instance, in storage order. It is streamed, and gzip or Brotli
+compressed when `Accept-Encoding` allows it. Group 0002 is not included.
+Pixel Data, Float Pixel Data, Double Float Pixel Data, binary values of VR
+OB, OD, OF, OL, OV, OW or UN longer than 1,024 bytes, and any other value
+longer than 64 KiB carry a `BulkDataURI` instead of a value. Smaller binary
+values are inline as base64 `InlineBinary`. The `BulkDataURI` is an absolute
+URL that starts with `[http] public_url` when it is set, otherwise with
+`http://<Host header>`. An instance whose metadata
+would exceed 64 MiB has none, and gets 500.
+
+Instances stored before metadata scanning existed are scanned on the first
+request, and in the background after startup.
+
+| HTTP status | Meaning |
+|---|---|
+| 200 | Instances or metadata found |
+| 404 | Unknown study, series or instance, or a series that is not in that study |
+| 406 | No acceptable media type or transfer syntax (also bare `application/dicom` for several instances) |
+| 500 | An instance has no metadata (for example its object is over 64 MiB); the body says why |
+
+A stored file that cannot be read after the response has started ends the
+body early; the client sees a broken stream.
