@@ -9,6 +9,7 @@ mod index;
 mod ingest;
 mod json;
 mod part10;
+mod qido;
 mod scan;
 mod stats;
 
@@ -31,6 +32,7 @@ pub use ingest::{
     StoredEvent, StoredNifti, is_storage_sop_class,
 };
 pub use part10::{IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, write_part10_prefix};
+pub use qido::{InstanceFields, QidoPage, QidoRow, SeriesFields, StudyFields};
 pub use scan::{
     BULK_BINARY_MIN, BulkValue, InstanceData, InstanceScan, MAX_METADATA_BYTES, SCAN_VERSION,
     ScanLimits, scan_instance, scan_instance_with,

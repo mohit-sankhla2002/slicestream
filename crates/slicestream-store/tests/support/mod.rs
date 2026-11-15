@@ -263,3 +263,67 @@ fn tag_bytes(tag: Tag) -> Vec<u8> {
     out.extend_from_slice(&tag.element().to_le_bytes());
     out
 }
+
+/// Attributes of a synthesized instance for query tests. Empty strings are left out.
+#[derive(Default, Clone)]
+pub struct Spec<'a> {
+    pub patient_name: &'a str,
+    pub patient_id: &'a str,
+    pub study_uid: &'a str,
+    pub series_uid: &'a str,
+    pub sop_uid: &'a str,
+    pub modality: &'a str,
+    pub study_date: &'a str,
+    pub study_time: &'a str,
+    pub study_description: &'a str,
+    pub accession: &'a str,
+    pub referring: &'a str,
+    pub series_number: Option<i64>,
+    pub instance_number: Option<i64>,
+}
+
+/// A one-frame instance with the attributes of `spec`, written to `dir/<sop uid>.dcm`.
+pub fn instance(dir: &Path, spec: &Spec) -> PathBuf {
+    let mut obj = base(1, 4, 4, 16);
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::from(pixel_bytes(4 * 4 * 2)),
+    ));
+    let mut put = |tag, vr, v: &str| {
+        if !v.is_empty() {
+            obj.put(DataElement::new(tag, vr, PrimitiveValue::from(v)));
+        }
+    };
+    put(tags::PATIENT_NAME, VR::PN, spec.patient_name);
+    put(tags::PATIENT_ID, VR::LO, spec.patient_id);
+    put(tags::STUDY_INSTANCE_UID, VR::UI, spec.study_uid);
+    put(tags::SERIES_INSTANCE_UID, VR::UI, spec.series_uid);
+    put(tags::SOP_INSTANCE_UID, VR::UI, spec.sop_uid);
+    put(tags::MODALITY, VR::CS, spec.modality);
+    put(tags::STUDY_DATE, VR::DA, spec.study_date);
+    put(tags::STUDY_TIME, VR::TM, spec.study_time);
+    put(tags::STUDY_DESCRIPTION, VR::LO, spec.study_description);
+    put(tags::ACCESSION_NUMBER, VR::SH, spec.accession);
+    put(tags::REFERRING_PHYSICIAN_NAME, VR::PN, spec.referring);
+    if let Some(n) = spec.series_number {
+        put(tags::SERIES_NUMBER, VR::IS, &n.to_string());
+    }
+    if let Some(n) = spec.instance_number {
+        put(tags::INSTANCE_NUMBER, VR::IS, &n.to_string());
+    }
+    let file = obj
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .media_storage_sop_class_uid(
+                    uids::MULTI_FRAME_GRAYSCALE_WORD_SECONDARY_CAPTURE_IMAGE_STORAGE,
+                )
+                .media_storage_sop_instance_uid(spec.sop_uid),
+        )
+        .unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{}.dcm", spec.sop_uid));
+    file.write_to_file(&path).unwrap();
+    path
+}

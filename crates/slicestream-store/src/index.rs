@@ -245,7 +245,7 @@ pub struct SliceRow {
 /// Handle to the SQLite index. Cheap to clone (wraps a connection pool).
 #[derive(Debug, Clone)]
 pub struct Index {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 fn decode_err(msg: String) -> sqlx::Error {
