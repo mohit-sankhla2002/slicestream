@@ -926,3 +926,95 @@ fn scan_repeated_problems_recorded_once() {
     assert_eq!(scan.header, read_header(&p).unwrap());
     assert_eq!(scan.data.problem.as_deref(), Some("pixel data too short"));
 }
+
+/// Two 4x5 16-bit frames and a 2,000-byte private OB value.
+fn frames_and_private_value(dir: &Path, name: &str, ts: &str) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let px = pixel_bytes(2 * 4 * 5 * 2);
+    let value = pixel_bytes(2000).into_iter().rev().collect::<Vec<u8>>();
+    let mut obj = support::base(2, 4, 5, 16);
+    obj.put(creator());
+    obj.put(private(0x1001, VR::OB, PrimitiveValue::from(value.clone())));
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::from(px.clone()),
+    ));
+    (support::write(dir, name, obj, ts), px, value)
+}
+
+/// The same file without its 128-byte preamble: it starts with `DICM`.
+fn without_preamble(p: &Path) -> PathBuf {
+    let bytes = std::fs::read(p).unwrap();
+    assert_eq!(&bytes[128..132], b"DICM");
+    let out = p.with_extension("nopreamble.dcm");
+    std::fs::write(&out, &bytes[128..]).unwrap();
+    out
+}
+
+/// Frames and the bulk value read at the recorded offsets are the stored
+/// pixels and value.
+fn check_offsets(p: &Path, px: &[u8], value: &[u8]) -> InstanceScan {
+    let scan = scan_instance(p).unwrap();
+    assert_eq!(scan.data.problem, None, "{}", p.display());
+    assert!(scan.data.offsets_valid);
+    assert!(matches!(
+        scan.data.frames,
+        Some(FrameTable::Native { count: 2, .. })
+    ));
+    let frames = frames_at(p, &scan);
+    assert_eq!(
+        frames,
+        [px[..40].to_vec(), px[40..].to_vec()],
+        "{}",
+        p.display()
+    );
+    let bulk = &scan.data.bulk;
+    assert_eq!(bulk.len(), 1, "{bulk:?}");
+    assert_eq!(bulk[0].path, "00091001");
+    assert_eq!(file_bytes(p, bulk[0].offset, bulk[0].len), value);
+    assert_eq!(metadata(&scan)["00091001"]["BulkDataURI"], "bulk/00091001");
+    scan
+}
+
+#[test]
+fn scan_implicit_vr_little_endian_offsets() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, px, value) =
+        frames_and_private_value(dir.path(), "implicit.dcm", uids::IMPLICIT_VR_LITTLE_ENDIAN);
+    let scan = check_offsets(&p, &px, &value);
+    assert_eq!(scan.header, read_header(&p).unwrap());
+    assert_eq!(scan.header.transfer_syntax, uids::IMPLICIT_VR_LITTLE_ENDIAN);
+    // The whole-file parse reads the same frames.
+    let info = scan.header.frame_info.clone().unwrap();
+    for (k, frame) in frames_at(&p, &scan).iter().enumerate() {
+        let old = read_frame_bytes(&p, k as u32, &info).unwrap();
+        assert_eq!(&frame[..], &old[..], "frame {k}");
+    }
+    // Without a preamble too.
+    let bare = without_preamble(&p);
+    let scan = check_offsets(&bare, &px, &value);
+    assert_eq!(scan.header, read_header(&bare).unwrap());
+}
+
+#[test]
+fn scan_offsets_without_preamble() {
+    let dir = tempfile::tempdir().unwrap();
+    let (p, px, value) =
+        frames_and_private_value(dir.path(), "explicit.dcm", uids::EXPLICIT_VR_LITTLE_ENDIAN);
+    let with = check_offsets(&p, &px, &value);
+    let bare = without_preamble(&p);
+    let scan = check_offsets(&bare, &px, &value);
+    assert_eq!(scan.header, with.header);
+    assert_eq!(scan.header, read_header(&bare).unwrap());
+    // Every offset is 128 bytes earlier than in the file with the preamble.
+    match (&with.data.frames, &scan.data.frames) {
+        (
+            Some(FrameTable::Native { offset: a, .. }),
+            Some(FrameTable::Native { offset: b, .. }),
+        ) => {
+            assert_eq!(a - 128, *b)
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(with.data.bulk[0].offset - 128, scan.data.bulk[0].offset);
+}
