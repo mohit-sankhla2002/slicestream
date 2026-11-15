@@ -301,10 +301,11 @@ frames come out inflated, so they are served as Explicit VR Little Endian
 tag (`00091001`), or a path through sequence items (`00480105/0/00282000`,
 items counted from 0). The response is `multipart/related;
 type="application/octet-stream"` with one part holding the value. An
-`Accept` of a bare `application/octet-stream` gets the value itself. Values
-are sent as stored, read in 1 MiB pieces: little-endian, or big-endian for
-an Explicit VR Big Endian instance. The part's `Content-Type` names that
-byte order (`transfer-syntax=1.2.840.10008.1.2.1` or `1.2.840.10008.1.2.2`).
+`Accept` of a bare `application/octet-stream` gets the value itself; `*/*`
+or no `Accept` gets the multipart response. Values are sent as stored, read
+in 1 MiB pieces: little-endian, or big-endian for an Explicit VR Big Endian
+instance. The part's `Content-Type` names that byte order
+(`transfer-syntax=1.2.840.10008.1.2.1` or `1.2.840.10008.1.2.2`).
 
 Pixel Data (`7FE00010`) is served like the frames resource with every frame
 listed: one part per frame, with the same media types and rules.
@@ -442,3 +443,23 @@ through STOW-RS, `POST /api/instances` or C-STORE.
 server (default and Implicit VR Little Endian transfer syntaxes, duplicate
 detection, and rejection of a wrong called AE title). CI runs it as the
 `interop` job.
+
+`scripts/interop-dicomweb.sh` runs the Python `dicomweb-client` 0.61.2 (with
+`pydicom` 3.0.2) against the server. It stores the phantom and a synthetic
+RLE Lossless multi-frame instance over STOW-RS. It searches for studies,
+series and instances, also with a Patient's Name wildcard. It retrieves
+series metadata, frames (native, with `transfer-syntax=*` and as
+`image/dicom-rle`), Pixel Data through its `BulkDataURI`, one instance and a
+whole series, and compares the bytes with the files. CI runs it in the
+`interop` job too. dicomweb-client sends the `Host` header without the port,
+so the script sets `[http] public_url`; otherwise its `BulkDataURI`s would
+point at port 80.
+
+OHIF v3.13 (the `ohif/app:v3.13.14` Docker image) was checked by hand with
+Playwright, on another origin, with the data source entry from the README,
+with `omitQuotationForMultipartRequest: false`, and with
+`singlepart: 'bulkdata,video'`. In each case the study list loaded, the
+patient name, MRN, accession, date range, modality and description filters
+narrowed it, studies opened, thumbnails showed, every series scrolled end to
+end, and there were no console errors and no failed requests. This is not
+run in CI.

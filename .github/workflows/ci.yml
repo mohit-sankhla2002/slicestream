@@ -45,3 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y dcmtk
       - run: bash scripts/interop-dcmtk.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: bash scripts/interop-dicomweb.sh

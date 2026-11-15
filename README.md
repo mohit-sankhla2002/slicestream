@@ -3,8 +3,9 @@
 **A fast, memory-safe DICOM server in Rust that streams slices to the browser in the order the user scrolls through them.**
 
 > Status: early (v0.1). The streaming core works end to end, with a browser test console.
-> Instances can be stored over STOW-RS, a single-file upload or DIMSE C-STORE.
-> Query/retrieve and the full DICOMweb read path are on the [roadmap](docs/ARCHITECTURE.md#roadmap).
+> Instances can be stored over STOW-RS, a single-file upload or DIMSE C-STORE, and read
+> back over DICOMweb (QIDO-RS and WADO-RS), so [OHIF](#use-with-ohif) works with no plugin.
+> DIMSE query/retrieve is on the [roadmap](docs/ARCHITECTURE.md#roadmap).
 > Not for clinical use.
 
 ![The slicestream test console after uploading a 120-slice phantom](docs/images/console.png)
@@ -36,7 +37,7 @@ custom protocol only helps if clients can adopt it in a few lines of code.
 |---|---|
 | Parse untrusted DICOM from the network | Memory safety rules out a whole class of parser CVEs that C/C++ PACS code has had. |
 | Thousands of concurrent streams | `tokio` async I/O, no GC pauses, so tail latency stays predictable while users scroll. |
-| Zero-copy frame serving | `bytes::Bytes` and (planned) mmap/`pread` send frame bytes straight from disk to socket. |
+| Zero-copy frame serving | Frame offsets are recorded at ingest; `pread` and `bytes::Bytes` send frame bytes straight from disk to socket. |
 | CPU-heavy transcoding (JPEG → HTJ2K) | Native speed and safe parallelism (`rayon`), with no GIL. |
 | Same code in the browser | The core crate can compile to **WASM** for a client-side scheduler and decoders. |
 | Use from other languages | One core, many bindings: C ABI, Python (PyO3), Node (napi-rs). |
@@ -54,15 +55,21 @@ for now.
   multi-frame files with a Basic Offset Table. It contains the scroll-aware
   `PrefetchScheduler` and the wire protocol.
 - `slicestream-store`: crash-safe ingest into content-addressed blobs plus a
-  SQLite index, with de-duplication and startup recovery.
+  SQLite index, with de-duplication and startup recovery. At ingest it
+  records where each frame and each large value sits in the file, and stores
+  the instance's DICOM JSON.
+- `slicestream-dicomweb`: QIDO-RS query parsing, `Accept` negotiation,
+  the `multipart/related` writer and URL helpers.
 - `slicestream-archive`: opens ZIP, 7z, RAR, tar, tar.gz and plain gzip
   files (nested in any combination) and finds DICOM and NIfTI files inside,
   with limits against zip bombs.
 - `slicestream-dimse`: a C-STORE / C-ECHO storage SCP (default port 11112).
 - `slicestream-server`: an axum server with a JSON API, single-frame HTTP fetch,
   and a WebSocket stream that changes its send order on every scroll event.
-  It also accepts STOW-RS uploads, and runs the DIMSE SCP. The series list
-  comes from the storage index, so new instances are streamable at once.
+  It also accepts STOW-RS uploads, serves the DICOMweb read routes
+  (QIDO-RS search; WADO-RS instances, metadata, frames and bulk data), and
+  runs the DIMSE SCP. The series list comes from the storage index, so new
+  instances are streamable at once.
 - `web/`: a dependency-free browser test console, served by the server itself:
   - **Upload**: drop files or a folder and send them one request each, over
     STOW-RS or as single files, with an optional bearer token.
@@ -141,6 +148,31 @@ Every setting has a default. To change them, copy
 | GET | `/api/metrics/history` | The last 300 one-second samples, oldest first |
 | GET | `/api/console/series` | Every series with study and patient details, for the test console |
 | GET (WS) | `/api/series/{uid}/stream` | Scroll-aware frame stream. See [docs/PROTOCOL.md](docs/PROTOCOL.md). |
+| GET | `/dicom-web/studies` | QIDO-RS: search for studies |
+| GET | `/dicom-web/series` | QIDO-RS: search for series of all studies |
+| GET | `/dicom-web/instances` | QIDO-RS: search for instances of all studies |
+| GET | `/dicom-web/studies/{study}/series` | QIDO-RS: search for series of one study |
+| GET | `/dicom-web/studies/{study}/instances` | QIDO-RS: search for instances of one study |
+| GET | `/dicom-web/studies/{study}/series/{series}/instances` | QIDO-RS: search for instances of one series |
+| GET | `/dicom-web/studies/{study}` | WADO-RS: every instance of the study, as stored |
+| GET | `/dicom-web/studies/{study}/series/{series}` | WADO-RS: every instance of the series |
+| GET | `/dicom-web/studies/{study}/series/{series}/instances/{instance}` | WADO-RS: one instance |
+| GET | `/dicom-web/studies/{study}/metadata` | WADO-RS: DICOM JSON of every instance of the study |
+| GET | `/dicom-web/studies/{study}/series/{series}/metadata` | WADO-RS: DICOM JSON of every instance of the series |
+| GET | `/dicom-web/studies/{study}/series/{series}/instances/{instance}/metadata` | WADO-RS: DICOM JSON of one instance |
+| GET | `/dicom-web/studies/{study}/series/{series}/instances/{instance}/frames/{list}` | WADO-RS: frames, for example `frames/1,3` |
+| GET | `/dicom-web/studies/{study}/series/{series}/instances/{instance}/bulk/{path}` | WADO-RS: one bulk data value (the `BulkDataURI`s in the metadata) |
+
+The `/dicom-web` GET routes follow PS3.18. Media types, matching keys,
+status codes and every deviation are listed in
+[docs/CONFORMANCE.md](docs/CONFORMANCE.md#dicomweb-read). They have **no
+authentication** yet (that is M6): anyone who can reach the HTTP port can read
+patient data. Keep `[http] addr` on loopback (the default) or put the server
+behind a proxy that authenticates. `[dicomweb] enabled = false` turns them
+off (STOW-RS stays). `[dicomweb] max_results` (default 1000) is the QIDO-RS
+`limit` default and maximum. Retrieve URLs and `BulkDataURI`s start with
+`[http] public_url` when it is set (for example `https://example.org/pacs`
+behind a reverse proxy), otherwise with `http://<Host header>`.
 
 If `[http] stow_token` is set, the four POST endpoints need
 `Authorization: Bearer <token>`. They never have CORS headers, so web pages on
@@ -158,6 +190,65 @@ server by another name (for example when binding `0.0.0.0`), list it in
 Archive uploads can be turned off with `[archives] enabled = false` (both
 routes then return 404). Limits are in the `[archives]` section of
 [`slicestream.example.toml`](slicestream.example.toml).
+
+## Use with OHIF
+
+slicestream is a standard DICOMweb server, so [OHIF](https://ohif.org) v3 uses
+it through its built-in `dicomweb` data source. No plugin and no
+slicestream-specific option is needed. Add this entry to `dataSources` in
+OHIF's `app-config.js`, and set `defaultDataSourceName: 'slicestream'`:
+
+```js
+{
+  namespace: '@ohif/extension-default.dataSourcesModule.dicomweb',
+  sourceName: 'slicestream',
+  configuration: {
+    friendlyName: 'slicestream',
+    name: 'slicestream',
+    qidoRoot: 'http://localhost:8080/dicom-web',
+    wadoRoot: 'http://localhost:8080/dicom-web',
+    wadoUriRoot: 'http://localhost:8080/dicom-web',
+    imageRendering: 'wadors',
+    thumbnailRendering: 'wadors',
+    enableStudyLazyLoad: true,
+    supportsFuzzyMatching: false,
+    supportsWildcard: true,
+    qidoSupportsIncludeField: true,
+    staticWado: false,
+    bulkDataURI: { enabled: true },
+    omitQuotationForMultipartRequest: true,
+  },
+}
+```
+
+OHIF runs on another origin (for example `http://localhost:3000`), so allow it
+in the server's configuration:
+
+```toml
+[http]
+cors_allowed_origins = ["http://localhost:3000"]
+```
+
+The study list, its filters (patient name, MRN, accession, date range,
+modality, description), thumbnails and scrolling work. This was checked with
+the `ohif/app:v3.13.14` Docker image, also with
+`omitQuotationForMultipartRequest: false` and with
+`singlepart: 'bulkdata,video'`. Remember that the read routes have no
+authentication yet; see [SECURITY.md](SECURITY.md).
+
+![OHIF showing the synthetic phantom from slicestream](docs/images/ohif.png)
+
+To try it without patient data, store the phantom and a synthetic RLE
+multi-frame instance, then serve with a `slicestream.toml` that holds the
+`cors_allowed_origins` line above:
+
+```sh
+cargo run -p slicestream-core --example make_phantom -- data/phantom 120
+cargo run -p slicestream-core --example make_rle_multiframe -- data/rle 16
+cargo run -p slicestream-server -- import data/phantom
+cargo run -p slicestream-server -- import data/rle
+cargo run -p slicestream-server -- --config slicestream.toml serve
+```
 
 ## RAR and the UnRAR licence
 
@@ -190,7 +281,8 @@ See [docs/CONFORMANCE.md](docs/CONFORMANCE.md) for the conformance statement.
 
 ```
 crates/slicestream-core     transport-agnostic library (index, frames, scheduler, protocol)
-crates/slicestream-store    ingest pipeline, blob store and SQLite index
+crates/slicestream-store    ingest pipeline, blob store, SQLite index and instance scan
+crates/slicestream-dicomweb QIDO-RS parsing, Accept negotiation, multipart writer
 crates/slicestream-archive  archive walking (ZIP/7z/RAR/tar/gzip), NIfTI header parsing
 crates/slicestream-dimse    DIMSE C-STORE / C-ECHO storage SCP
 crates/slicestream-server   reference HTTP + WebSocket server (axum/tokio)
@@ -198,6 +290,8 @@ slicestream.example.toml    configuration with every default
 web/                        browser test console (upload, metrics, series, viewer)
 docs/ARCHITECTURE.md        target architecture and roadmap
 docs/PROTOCOL.md            language-neutral wire protocol spec
+docs/CONFORMANCE.md         DICOM conformance: DIMSE, STOW-RS, DICOMweb read
+scripts/                    interop checks (DCMTK, dicomweb-client) and a benchmark
 ```
 
 ## Contributing

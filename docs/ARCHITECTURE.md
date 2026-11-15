@@ -38,10 +38,10 @@ without custom code, and with backends written in any language.
 slicestream-core       index, frame extraction, scheduler, protocol      (exists)
 slicestream-server     axum binary: wires everything together             (exists)
 slicestream-archive    ZIP/7z/RAR/tar/gzip walker, NIfTI header            (exists)
-slicestream-store      Storage trait: fs, object_store (S3/GCS/Azure)      planned
+slicestream-store      ingest, filesystem blobs, SQLite index, scan        (exists; object_store planned)
 slicestream-index      Index trait: SQLite (sqlx), PostgreSQL              planned
-slicestream-dicomweb   QIDO-RS / WADO-RS / STOW-RS handlers, multipart     planned
-slicestream-dimse      C-ECHO/C-STORE/C-FIND/C-MOVE/C-GET SCP+SCU         planned (dicom-ul)
+slicestream-dicomweb   QIDO-RS parsing, Accept negotiation, multipart      (exists)
+slicestream-dimse      C-ECHO/C-STORE SCP                                  (exists; C-FIND/C-MOVE/C-GET planned)
 slicestream-codec      transcode to HTJ2K (OpenJPH), JPEG-LS, JPEG, RLE    planned
 slicestream-wasm       browser build of core (scheduler, HTJ2K decode)     planned
 slicestream-ffi        C ABI + cbindgen header                             planned
@@ -55,6 +55,7 @@ Two levels, so teams can adopt step by step:
 
 1. **No custom code.** Point `@cornerstonejs/dicom-image-loader` (or OHIF's
    DICOMweb data source) at `/dicom-web`. Standard `wadors:` image IDs work.
+   The README has a tested OHIF data source entry.
    Once the codec crate exists, the server will also serve HTJ2K with
    `transfer-syntax=*` and HTTP byte ranges. That turns on Cornerstone's built-in
    progressive loading.
@@ -82,10 +83,12 @@ Two levels, so teams can adopt step by step:
 **M0 — Streaming core (done).** Folder index, frame extraction, scheduler,
 WebSocket stream, console viewer, CI.
 
-**M1 — Standard DICOMweb read path.** QIDO-RS (studies, series, instances),
-WADO-RS metadata, frames, bulk data, and `multipart/related`. Run as a
-Cornerstone/OHIF data source. Add a byte-offset index at ingest. Serve frames
-with `pread`.
+**M1 — Standard DICOMweb read path (done).** QIDO-RS (studies, series,
+instances), WADO-RS instances, metadata, frames and bulk data, as
+`multipart/related` or single part. OHIF v3.13 works with its stock DICOMweb
+data source. A byte-offset index is built at ingest, so frames and bulk data
+are served with `pread`; the WebSocket stream and `/api/series` frames use it
+too. Stores from before M1 are indexed in the background.
 
 **M2 — Storage and ingest (done for the filesystem).** STOW-RS, SQLite index,
 filesystem storage, de-duplication and an `import` command are done.
@@ -109,13 +112,20 @@ benchmarks against Orthanc and dcm4chee.
 
 ## Known limits of the current scaffold
 
-- Each frame request parses the whole file (no byte-offset index yet).
+- Frames are read at offsets recorded at ingest. Two kinds of instance have
+  none and are still read by parsing the whole file: instances stored before
+  M1 (until the background scan reaches them) and deflated instances.
+- The DICOMweb read routes have no authentication or authorization until M6.
+  Keep the server on loopback or behind an authenticating proxy.
+- No transcoding: instances and frames are sent in the transfer syntax they
+  were stored in. No `rendered` or `thumbnail` resources (M4), no HTTP
+  `Range` requests, no XML responses.
 - Frames go out as fast as TCP accepts them. There is no client credit or
   acknowledgement, so priority changes take effect only after the socket
   buffer drains.
 - The console viewer renders only native (uncompressed) grayscale.
 - Storage is the local filesystem only, and the series list is rebuilt from
-  the index on demand. There is no QIDO-RS/WADO-RS yet.
+  the index on demand.
 - One process owns a storage root. `serve` and `import` take an exclusive
   lock on `<root>/LOCK`; a second process on the same root fails at startup.
   Use `import` only while the server is stopped; while it runs, upload through
