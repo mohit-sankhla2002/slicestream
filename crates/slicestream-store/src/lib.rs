@@ -6,6 +6,7 @@ mod config;
 mod header;
 mod index;
 mod ingest;
+mod json;
 mod part10;
 mod stats;
 

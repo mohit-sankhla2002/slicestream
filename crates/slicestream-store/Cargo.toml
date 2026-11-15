@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+base64 = "0.22.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 dicom-core = "0.10.1"
 dicom-dictionary-std = { version = "0.10.1", features = ["sop-class"] }
