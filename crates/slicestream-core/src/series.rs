@@ -21,7 +21,6 @@ pub struct SliceRef {
     pub info: FrameInfo,
     position: Option<f64>,
     instance_number: Option<i64>,
-    #[cfg_attr(not(unix), allow(dead_code))]
     location: Option<FrameLocation>,
 }
 
@@ -71,6 +70,12 @@ impl SliceRef {
     pub fn with_location(mut self, loc: FrameLocation) -> SliceRef {
         self.location = Some(loc);
         self
+    }
+
+    /// Where the frame's bytes live, if recorded; `None` means reads parse
+    /// the file.
+    pub fn location(&self) -> Option<&FrameLocation> {
+        self.location.as_ref()
     }
 
     fn sort_key(&self) -> (f64, i64, u32) {

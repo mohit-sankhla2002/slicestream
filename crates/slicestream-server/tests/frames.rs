@@ -20,7 +20,8 @@ use slicestream_core::attrs::get_i64;
 use slicestream_core::frame::read_frame_bytes;
 use slicestream_core::protocol::decode_frame;
 use slicestream_core::{FrameInfo, Series};
-use slicestream_store::DuplicatePolicy;
+use slicestream_server::SeriesCatalog;
+use slicestream_store::{DuplicatePolicy, Ingestor, StorageConfig};
 use support::*;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -920,4 +921,71 @@ async fn blob_vanishing_mid_stream_aborts_frames() {
         "a missing blob must abort the body, not end it cleanly"
     );
     srv.stop().await;
+}
+
+/// Slices of `series` whose frame location is recorded (read with `pread`).
+fn located(series: &Series) -> usize {
+    (0..series.len())
+        .filter(|&i| series.slice(i).unwrap().location().is_some())
+        .count()
+}
+
+fn catalog_frames(series: &Series) -> Vec<Vec<u8>> {
+    (0..series.len())
+        .map(|i| series.load_frame(i).unwrap().data.to_vec())
+        .collect()
+}
+
+/// A catalog entry built while the rows were unscanned picks up their
+/// frame tables once the background scan records them: the WebSocket
+/// stream and `/api/series/.../frames` then read with `pread`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_picks_up_backfilled_frame_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    phantom::write_phantom(&src, 3, 16).unwrap();
+    let root = dir.path().join("store");
+    let ing = Ingestor::open(StorageConfig {
+        root: root.clone(),
+        ..StorageConfig::default()
+    })
+    .await
+    .unwrap();
+    for i in 1..=3 {
+        ing.import_file(&src.join(format!("IM{i:05}.dcm")))
+            .await
+            .unwrap();
+    }
+    // As in a store from before scanning existed.
+    let pool = index_pool(&root).await;
+    for q in [
+        "DELETE FROM instance_data",
+        "UPDATE instances SET scan_version = 0, scan_problem = NULL",
+    ] {
+        sqlx::query(q).execute(&pool).await.unwrap();
+    }
+
+    let catalog = SeriesCatalog::new(std::sync::Arc::clone(&ing));
+    catalog.spawn_invalidator();
+    let before = catalog.get(PHANTOM_SERIES).await.unwrap().unwrap();
+    assert_eq!(before.len(), 3);
+    assert_eq!(located(&before), 0, "unscanned rows have no frame table");
+    let old = catalog_frames(&before);
+
+    assert_eq!(ing.backfill_batch(64).await.unwrap(), 3);
+    // The cache is dropped by the invalidator task, so poll briefly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let after = loop {
+        let s = catalog.get(PHANTOM_SERIES).await.unwrap().unwrap();
+        if located(&s) == 3 {
+            break s;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the catalog still reads {} of 3 slices by parsing after the backfill",
+            3 - located(&s)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(catalog_frames(&after), old);
 }

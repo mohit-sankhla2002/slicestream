@@ -280,7 +280,11 @@ would exceed 64 MiB has none, and gets 500. Its bulk values other than
 Pixel Data are not recorded either, so their paths get 404.
 
 Instances stored before metadata scanning existed are scanned on the first
-request, and in the background after startup.
+request, and in the background after startup. Once scanned, the WebSocket
+stream and `/api/series` frames of their series are read at the recorded
+offsets too. An instance whose scan fails is not scanned again; its
+metadata gets 500 with the reason. When the index cannot be written, the
+background scan logs it and tries again after 5 seconds.
 
 **Frames.** `{list}` holds 1-based frame numbers, comma-separated, for
 example `3,1,3`. Each is digits only; at most 4,096 numbers. The response is

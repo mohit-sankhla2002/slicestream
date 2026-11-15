@@ -943,3 +943,145 @@ async fn ingest_rejects_deflated_as_before() {
     assert!(ing.index().list_series().await.unwrap().is_empty());
     assert!(files_under(&ing.config().root.join("objects")).is_empty());
 }
+
+/// Run `sql` on the index through a second connection.
+async fn exec(root: &Path, sql: &str) {
+    sqlx::query(sql)
+        .execute(&index_pool(root).await)
+        .await
+        .unwrap();
+}
+
+async fn scan_problem(root: &Path, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT scan_problem FROM instances WHERE id = ?1")
+        .bind(id)
+        .fetch_one(&index_pool(root).await)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn backfill_continues_past_a_row_whose_write_fails() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 3).await;
+    unscan_all(&root).await;
+    // Writing the scan of the first row fails, as SQLITE_TOOBIG would.
+    exec(
+        &root,
+        &format!(
+            "CREATE TRIGGER fail_first BEFORE INSERT ON instance_data
+             WHEN NEW.instance_fk = {} BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            ids[0]
+        ),
+    )
+    .await;
+
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 3);
+    assert!(ing.index().unscanned(10).await.unwrap().is_empty());
+    // The failing row is recorded as a problem, so it does not come back...
+    assert_eq!(
+        scan_problem(&root, ids[0]).await.as_deref(),
+        Some("the scan could not be recorded")
+    );
+    let md = ing.index().metadata_batch(&ids).await.unwrap();
+    assert!(matches!(
+        md[0].1,
+        slicestream_store::MetadataState::Unavailable(_)
+    ));
+    // ...and the rows after it are scanned.
+    for &id in &ids[1..] {
+        let data = ing.index().stored_data(id).await.unwrap().expect("scanned");
+        assert!(data.frames.is_some(), "{id}");
+        assert_eq!(scan_problem(&root, id).await, None);
+    }
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn backfill_skips_a_row_it_cannot_record_at_all() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 3).await;
+    unscan_all(&root).await;
+    // Neither the scan nor the failure can be written for the first row.
+    exec(
+        &root,
+        &format!(
+            "CREATE TRIGGER lock_first BEFORE UPDATE ON instances
+             WHEN OLD.id = {} BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            ids[0]
+        ),
+    )
+    .await;
+
+    // The row is skipped for this batch; the others are scanned.
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 2);
+    for &id in &ids[1..] {
+        assert!(ing.index().stored_data(id).await.unwrap().is_some(), "{id}");
+    }
+    let left: Vec<i64> = ing
+        .index()
+        .unscanned(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(left, [ids[0]]);
+    // A batch that records nothing is an error, so the caller backs off
+    // instead of spinning on the same rows.
+    assert!(ing.backfill_batch(10).await.is_err());
+    // Once the database accepts the write, the row is scanned.
+    exec(&root, "DROP TRIGGER lock_first").await;
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 1);
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 0);
+    assert!(ing.index().stored_data(ids[0]).await.unwrap().is_some());
+}
+
+/// Drain the events received so far, as SOP Instance UIDs.
+fn sops_sent(
+    rx: &mut tokio::sync::broadcast::Receiver<slicestream_store::StoredEvent>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        out.push(e.sop_instance_uid);
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn backfill_and_ensure_scanned_send_events() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 3).await;
+    let mut rows = ing.index().unscanned(10).await.unwrap();
+    assert!(rows.is_empty());
+    unscan_all(&root).await;
+    rows = ing.index().unscanned(10).await.unwrap();
+    assert_eq!(rows[0].0, ids[0]);
+    // The rows the backfill will scan, after ids[0].
+    let mut rest: Vec<String> = rows[1..].iter().map(|r| r.1.clone()).collect();
+    rest.sort();
+    let series = ing.index().list_series().await.unwrap()[0]
+        .series_instance_uid
+        .clone();
+
+    let mut rx = ing.subscribe();
+    // On demand: one event, for that instance's series.
+    ing.ensure_scanned(ids[0]).await.unwrap();
+    let e = rx.try_recv().expect("an event after ensure_scanned");
+    assert_eq!(e.series_instance_uid, series);
+    assert_eq!(e.sop_instance_uid, rows[0].1);
+    // Already scanned: nothing written, no event.
+    ing.ensure_scanned(ids[0]).await.unwrap();
+    assert!(rx.try_recv().is_err());
+
+    // In the background: one event per row scanned.
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 2);
+    assert_eq!(sops_sent(&mut rx), rest);
+}

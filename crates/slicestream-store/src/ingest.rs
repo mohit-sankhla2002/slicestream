@@ -39,6 +39,11 @@ const LOCK_STRIPES: usize = 64;
 const IMPORT_CHUNK: usize = 64 * 1024;
 /// How many backfill scans run at once.
 const BACKFILL_PARALLELISM: usize = 2;
+/// Scan problem recorded when the scan panicked. The details are logged.
+const SCAN_FAILED: &str = "the scan failed";
+/// Scan problem recorded when the scan result could not be written. The
+/// details are logged.
+const SCAN_NOT_RECORDED: &str = "the scan could not be recorded";
 /// Lock file under the storage root, held exclusively by the owning process.
 const LOCK_FILE: &str = "LOCK";
 
@@ -92,7 +97,9 @@ pub struct Stored {
     pub replaced: bool,
 }
 
-/// Broadcast after every successful ingest (including duplicates).
+/// Broadcast after every successful ingest (including duplicates), and
+/// after an instance stored earlier is scanned (in the background or on
+/// demand), since its frame table is new then.
 #[derive(Clone, Debug)]
 pub struct StoredEvent {
     pub series_instance_uid: String,
@@ -293,6 +300,13 @@ fn join_error(e: tokio::task::JoinError) -> IngestError {
     IngestError::Storage(io::Error::other(e))
 }
 
+/// A running [`Shared::scan_row`].
+struct ScanTask {
+    id: i64,
+    blob: BlobHash,
+    task: tokio::task::JoinHandle<Result<(), IngestError>>,
+}
+
 /// The ingest pipeline. Share it as `Arc<Ingestor>`.
 #[derive(Debug)]
 pub struct Ingestor {
@@ -355,6 +369,10 @@ struct TestHooks {
     /// until `.1` receives.
     pause_before_delete:
         std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Instance ids whose blocking scan panics.
+    panic_in_scan: std::sync::Mutex<Vec<i64>>,
+    /// Instance ids whose scan task panics outside the blocking scan.
+    panic_in_task: std::sync::Mutex<Vec<i64>>,
 }
 
 #[cfg(test)]
@@ -362,6 +380,10 @@ impl TestHooks {
     fn upsert_should_fail(&self) -> bool {
         self.fail_next_upsert
             .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn panics(list: &std::sync::Mutex<Vec<i64>>, id: i64) -> bool {
+        list.lock().unwrap().contains(&id)
     }
 
     fn before_delete(&self) {
@@ -445,8 +467,14 @@ impl Shared {
 
     /// Scan instance `id` (currently `blob`) and record the result, under
     /// the per-UID lock so it serializes with an overwrite of the same
-    /// instance. A blob that is missing or unparseable is recorded as a scan
-    /// problem so it is not retried. Writes nothing if the row's blob changed.
+    /// instance. Writes nothing if the row's blob changed. A recorded scan is
+    /// announced as a [`StoredEvent`], so caches built from the row (the
+    /// series catalog) pick up its frame table.
+    ///
+    /// Any failure for this row (a blob that is missing or unparseable, a
+    /// panicking scan, a scan result the index will not take) is recorded as
+    /// a scan problem, so the row is not retried. `Err` only when even that
+    /// cannot be written.
     async fn scan_row(
         self: Arc<Self>,
         id: i64,
@@ -454,17 +482,72 @@ impl Shared {
         blob: BlobHash,
     ) -> Result<(), IngestError> {
         let _guard = self.lock_for(&uid).lock().await;
+        #[cfg(test)]
+        if TestHooks::panics(&self.hooks.panic_in_task, id) {
+            panic!("injected scan task panic");
+        }
+        #[cfg(test)]
+        let panic_in_scan = TestHooks::panics(&self.hooks.panic_in_scan, id);
         let path = self.blobs.path_of(&blob, BlobKind::Dicom);
-        let scan = blocking(move || scan_instance(&path)).await?;
-        match scan {
-            Ok(scan) => self.index.write_scan(id, &blob, &scan).await?,
+        let scan = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if panic_in_scan {
+                panic!("injected scan panic");
+            }
+            scan_instance(&path)
+        })
+        .await;
+        let problem = match scan {
+            Ok(Ok(scan)) => match self.index.write_scan(id, &blob, &scan).await {
+                Ok(written) => {
+                    if written {
+                        // No receivers is fine.
+                        let _ = self.events.send(StoredEvent {
+                            series_instance_uid: scan.header.series_instance_uid,
+                            sop_instance_uid: scan.header.sop_instance_uid,
+                        });
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    error!(id, blob = %blob.to_hex(), error = %e, "cannot record scan");
+                    SCAN_NOT_RECORDED.to_owned()
+                }
+            },
+            Ok(Err(e)) => format!("cannot scan stored blob: {e}"),
             Err(e) => {
-                let problem = format!("cannot scan stored blob: {e}");
-                warn!(id, blob = %blob.to_hex(), %problem, "recording scan failure");
-                self.index.write_scan_failure(id, &blob, &problem).await?
+                error!(id, blob = %blob.to_hex(), error = %e, "scan task failed");
+                SCAN_FAILED.to_owned()
             }
         };
+        warn!(id, blob = %blob.to_hex(), %problem, "recording scan failure");
+        self.index.write_scan_failure(id, &blob, &problem).await?;
         Ok(())
+    }
+
+    /// Start [`Shared::scan_row`] in its own task.
+    fn spawn_scan(self: &Arc<Self>, id: i64, uid: String, blob: BlobHash) -> ScanTask {
+        ScanTask {
+            id,
+            blob,
+            task: tokio::spawn(Arc::clone(self).scan_row(id, uid, blob)),
+        }
+    }
+
+    /// Wait for a scan task. A panic in it (outside the scan itself) is
+    /// recorded as a scan problem like any other failure of the row.
+    async fn finish_scan(self: &Arc<Self>, scan: ScanTask) -> Result<(), IngestError> {
+        let ScanTask { id, blob, task } = scan;
+        match task.await {
+            Ok(result) => result,
+            Err(e) => {
+                error!(id, blob = %blob.to_hex(), error = %e, "scan task failed");
+                self.index
+                    .write_scan_failure(id, &blob, SCAN_FAILED)
+                    .await?;
+                Ok(())
+            }
+        }
     }
 
     /// The critical section of [`Ingestor::ingest_nifti`]: commit → index →
@@ -706,24 +789,39 @@ impl Ingestor {
     }
 
     /// Scan up to `limit` instances stored before scanning existed (or at an
-    /// older scan version), two at a time. Returns how many rows it handled;
-    /// 0 means nothing is left to scan. Rows whose blob is unreadable are
-    /// recorded as scan problems, so they do not come back.
+    /// older scan version), two at a time. Returns how many rows it recorded;
+    /// 0 means nothing is left to scan.
+    ///
+    /// A row that fails in any way (unreadable blob, panicking scan, a scan
+    /// result the index will not take) is recorded as a scan problem, so it
+    /// does not come back, and the batch goes on. A row for which even that
+    /// cannot be written is logged and left for a later batch. `Err` when
+    /// the rows cannot be listed, or when the batch recorded none of its
+    /// rows, so the caller can wait before trying again.
     pub async fn backfill_batch(&self, limit: i64) -> Result<usize, IngestError> {
         let rows = self.shared.index.unscanned(limit).await?;
-        let total = rows.len();
+        let mut recorded = 0;
+        let mut last_error = None;
         for pair in rows.chunks(BACKFILL_PARALLELISM) {
-            let tasks: Vec<_> = pair
+            let tasks: Vec<ScanTask> = pair
                 .iter()
-                .map(|(id, uid, blob)| {
-                    tokio::spawn(Arc::clone(&self.shared).scan_row(*id, uid.clone(), *blob))
-                })
+                .map(|(id, uid, blob)| self.shared.spawn_scan(*id, uid.clone(), *blob))
                 .collect();
             for task in tasks {
-                task.await.map_err(join_error)??;
+                let id = task.id;
+                match self.shared.finish_scan(task).await {
+                    Ok(()) => recorded += 1,
+                    Err(e) => {
+                        error!(id, error = %e, "cannot record the scan; the row is retried later");
+                        last_error = Some(e);
+                    }
+                }
             }
         }
-        Ok(total)
+        match last_error {
+            Some(e) if recorded == 0 => Err(e),
+            _ => Ok(recorded),
+        }
     }
 
     /// Scan instance `id` now unless it is already scanned. Unknown ids are
@@ -736,9 +834,8 @@ impl Ingestor {
         let Some((uid, blob)) = index.instance_blob(id).await? else {
             return Ok(());
         };
-        tokio::spawn(Arc::clone(&self.shared).scan_row(id, uid, blob))
-            .await
-            .map_err(join_error)?
+        let task = self.shared.spawn_scan(id, uid, blob);
+        self.shared.finish_scan(task).await
     }
 
     /// Startup-only crash recovery: remove every file in `tmp/`, mark
@@ -898,5 +995,64 @@ mod tests {
                 .is_file(),
             "index references a blob that no longer exists"
         );
+    }
+
+    /// A scan that panics, or whose task panics, is recorded as a problem;
+    /// the rest of the batch is still scanned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_records_panicked_scans() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        crate::phantom::write_phantom(&src, 3, 16).unwrap();
+        let ing = Ingestor::open(StorageConfig {
+            root: d.path().join("store"),
+            max_instance_bytes: 1 << 30,
+            on_duplicate: DuplicatePolicy::Keep,
+        })
+        .await
+        .unwrap();
+        for i in 1..=3 {
+            ing.import_file(&src.join(format!("IM{i:05}.dcm")))
+                .await
+                .unwrap();
+        }
+        let pool = &ing.shared.index.pool;
+        for q in [
+            "DELETE FROM instance_data",
+            "UPDATE instances SET scan_version = 0",
+        ] {
+            sqlx::query(q).execute(pool).await.unwrap();
+        }
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM instances ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        ing.shared.hooks.panic_in_scan.lock().unwrap().push(ids[0]);
+        ing.shared.hooks.panic_in_task.lock().unwrap().push(ids[1]);
+
+        assert_eq!(ing.backfill_batch(10).await.unwrap(), 3);
+        assert!(ing.index().unscanned(10).await.unwrap().is_empty());
+        let problem = |id: i64| {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT scan_problem FROM instances WHERE id = ?1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+        };
+        // The panic message is logged, not stored.
+        let failed = Some("the scan failed".to_owned());
+        assert_eq!(problem(ids[0]).await.unwrap(), failed);
+        assert_eq!(problem(ids[1]).await.unwrap(), failed);
+        assert_eq!(problem(ids[2]).await.unwrap(), None);
+        let data = ing.index().stored_data(ids[2]).await.unwrap().unwrap();
+        assert!(data.frames.is_some());
+        // ensure_scanned on a panicking row records it too.
+        sqlx::query("UPDATE instances SET scan_version = 0 WHERE id = ?1")
+            .bind(ids[0])
+            .execute(pool)
+            .await
+            .unwrap();
+        ing.ensure_scanned(ids[0]).await.unwrap();
+        assert_eq!(problem(ids[0]).await.unwrap(), failed);
     }
 }

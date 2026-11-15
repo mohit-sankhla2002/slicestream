@@ -2,7 +2,8 @@
 //!
 //! A [`Series`] is built from index rows on first use and cached. Each
 //! [`StoredEvent`](slicestream_store::StoredEvent) drops the affected entry, so
-//! newly stored slices are streamable at once.
+//! newly stored slices are streamable at once, and slices scanned after they
+//! were stored are read with their new frame table.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

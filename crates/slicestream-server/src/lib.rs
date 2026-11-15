@@ -37,6 +37,11 @@ pub mod stream;
 pub use catalog::SeriesCatalog;
 use config::{Config, DicomwebConfig, HttpConfig};
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../slicestream-core/examples/make_phantom.rs"]
+mod phantom;
+
 pub struct AppState {
     pub catalog: Arc<SeriesCatalog>,
     pub ingestor: Arc<Ingestor>,
@@ -229,7 +234,11 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
 
     // Instances stored before scanning existed are scanned in the
     // background; until then they are scanned when a request needs them.
-    let backfill = tokio::spawn(backfill_metadata(Arc::clone(&ingestor), shutdown.clone()));
+    let backfill = tokio::spawn(backfill_metadata(
+        Arc::clone(&ingestor),
+        shutdown.clone(),
+        BACKFILL_RETRY,
+    ));
     if config.dicomweb.enabled && !http_addr.ip().is_loopback() {
         tracing::warn!(
             "DICOMweb read routes are unauthenticated: anyone who can reach {http_addr} can read patient data (see SECURITY.md)"
@@ -368,11 +377,15 @@ fn no_delay(
 
 /// Instances scanned per backfill batch.
 const BACKFILL_BATCH: i64 = 64;
+/// How long the backfill waits after a failed batch before trying again.
+const BACKFILL_RETRY: Duration = Duration::from_secs(5);
 
 /// Scan instances stored before scanning existed (or at an older scan
 /// version), batch by batch, until none are left or shutdown starts. The
-/// next start continues where this one stopped.
-async fn backfill_metadata(ingestor: Arc<Ingestor>, shutdown: CancellationToken) {
+/// next start continues where this one stopped. A failed batch (the index
+/// cannot be read, or none of its rows could be recorded) is logged and
+/// tried again after `retry`.
+async fn backfill_metadata(ingestor: Arc<Ingestor>, shutdown: CancellationToken, retry: Duration) {
     let mut scanned = 0;
     while !shutdown.is_cancelled() {
         match ingestor.backfill_batch(BACKFILL_BATCH).await {
@@ -385,11 +398,15 @@ async fn backfill_metadata(ingestor: Arc<Ingestor>, shutdown: CancellationToken)
                 tracing::info!(scanned, "metadata backfill progress");
             }
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     scanned,
-                    "metadata backfill stopped: {e}; it resumes at the next start"
+                    "metadata backfill batch failed: {e}; retrying in {} s",
+                    retry.as_secs_f32()
                 );
-                return;
+                tokio::select! {
+                    _ = tokio::time::sleep(retry) => {}
+                    _ = shutdown.cancelled() => {}
+                }
             }
         }
     }
@@ -474,5 +491,101 @@ mod tests {
             "TCP_NODELAY is off on an accepted connection"
         );
         client.await.unwrap().unwrap();
+    }
+
+    async fn unscanned_store(dir: &Path, n: usize) -> Arc<Ingestor> {
+        let src = dir.join("src");
+        phantom::write_phantom(&src, n, 16).unwrap();
+        let root = dir.join("store");
+        let ingestor = Ingestor::open(slicestream_store::StorageConfig {
+            root: root.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for i in 1..=n {
+            ingestor
+                .import_file(&src.join(format!("IM{i:05}.dcm")))
+                .await
+                .unwrap();
+        }
+        let pool = index_pool(&root).await;
+        for q in [
+            "DELETE FROM instance_data",
+            "UPDATE instances SET scan_version = 0",
+        ] {
+            sqlx::query(q).execute(&pool).await.unwrap();
+        }
+        ingestor
+    }
+
+    async fn index_pool(root: &Path) -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
+            .await
+            .unwrap()
+    }
+
+    /// A failing batch is retried after the delay until it succeeds; the
+    /// backfill does not give up until the next start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_retries_after_failed_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = unscanned_store(dir.path(), 2).await;
+        let pool = index_pool(&dir.path().join("store")).await;
+        // Every write to `instances` fails, as with a locked database.
+        sqlx::query(
+            "CREATE TRIGGER no_writes BEFORE UPDATE ON instances
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(backfill_metadata(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            Duration::from_millis(50),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "the backfill gave up");
+        assert_eq!(ingestor.index().unscanned(10).await.unwrap().len(), 2);
+
+        sqlx::query("DROP TRIGGER no_writes")
+            .execute(&pool)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the backfill finishes once writes work")
+            .unwrap();
+        assert!(ingestor.index().unscanned(10).await.unwrap().is_empty());
+    }
+
+    /// Shutdown stops a backfill that is waiting to retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_retry_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = unscanned_store(dir.path(), 1).await;
+        let pool = index_pool(&dir.path().join("store")).await;
+        sqlx::query(
+            "CREATE TRIGGER no_writes BEFORE UPDATE ON instances
+             BEGIN SELECT RAISE(ABORT, 'injected'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(backfill_metadata(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            Duration::from_secs(3600),
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "the backfill gave up");
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("shutdown ends the wait")
+            .unwrap();
     }
 }
