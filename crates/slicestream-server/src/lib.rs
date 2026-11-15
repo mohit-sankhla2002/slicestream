@@ -14,6 +14,7 @@ use axum::handler::HandlerWithoutStateExt;
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use slicestream_core::SchedulerConfig;
 use slicestream_dimse::StoreScp;
 use slicestream_store::Ingestor;
@@ -281,7 +282,7 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
     let token = shutdown.clone();
     let mut http = tokio::spawn(async move {
         axum::serve(
-            listener,
+            no_delay(listener),
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(token.cancelled_owned())
@@ -348,6 +349,20 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         http_addr,
         dimse_addr,
         task,
+    })
+}
+
+/// Set `TCP_NODELAY` on every accepted HTTP connection. Without it, a small
+/// write that follows another one (the stream's first `series` message after
+/// the 101 response) waits for the client's delayed ACK, about 40 ms on
+/// Linux.
+fn no_delay(
+    listener: tokio::net::TcpListener,
+) -> axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)> {
+    listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!("cannot set TCP_NODELAY: {e}");
+        }
     })
 }
 
@@ -439,4 +454,25 @@ pub(crate) async fn list_dir(
         }
     }
     (dirs, files)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::serve::Listener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_connections_have_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut listener = no_delay(listener);
+        let client = tokio::spawn(tokio::net::TcpStream::connect(addr));
+        let (io, _) = listener.accept().await;
+        assert!(
+            io.nodelay().unwrap(),
+            "TCP_NODELAY is off on an accepted connection"
+        );
+        client.await.unwrap().unwrap();
+    }
 }
