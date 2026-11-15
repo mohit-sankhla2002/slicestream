@@ -1,12 +1,15 @@
 #[allow(dead_code)]
 #[path = "../../slicestream-core/examples/make_phantom.rs"]
 mod phantom;
+mod support;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use slicestream_store::{
-    BlobHash, DuplicatePolicy, Index, InstanceHeader, InstanceRecord, NiftiMeta, StorageCounts,
-    StudyInfo, UploadCounts, UpsertOutcome, read_header,
+    BlobHash, DuplicatePolicy, FrameTable, Index, InstanceData, InstanceHeader, InstanceRecord,
+    MetadataState, NiftiMeta, SCAN_VERSION, Scope, StorageCounts, StudyInfo, UploadCounts,
+    UpsertOutcome, fold_name, read_header, scan_instance,
 };
 
 fn phantom_headers(dir: &std::path::Path, n: usize) -> Vec<InstanceHeader> {
@@ -23,7 +26,28 @@ fn record(header: InstanceHeader, fill: u8) -> InstanceRecord {
         size_bytes: 1234,
         source: "dimse".into(),
         calling_ae: Some("MODALITY1".into()),
+        data: no_data(),
+        scanned: false,
     }
+}
+
+fn no_data() -> InstanceData {
+    InstanceData {
+        metadata: None,
+        frames: None,
+        bulk: vec![],
+        offsets_valid: false,
+        problem: None,
+    }
+}
+
+/// A record built from scanning `path`, marked as scanned.
+fn scanned_record(path: &Path, fill: u8) -> InstanceRecord {
+    let scan = scan_instance(path).unwrap();
+    let mut r = record(scan.header, fill);
+    r.data = scan.data;
+    r.scanned = true;
+    r
 }
 
 #[tokio::test]
@@ -406,4 +430,414 @@ async fn study_info_by_fk() {
         }
     );
     assert!(idx.study_info(9999).await.unwrap().is_none());
+}
+
+async fn open(dir: &Path) -> Index {
+    Index::open(&dir.join("index.db")).await.unwrap()
+}
+
+async fn sql_pool(dir: &Path) -> sqlx::SqlitePool {
+    use sqlx::sqlite::SqliteConnectOptions;
+    sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new()
+            .filename(dir.join("index.db"))
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn upsert_writes_instance_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let file = support::native(&dir.path().join("a"), 2, 4, 4, 8);
+    let r = scanned_record(&file, 1);
+    assert!(r.data.metadata.is_some() && r.data.frames.is_some());
+    idx.upsert_instance(&r, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+
+    let found = idx
+        .find_instances(&Scope::Study(support::STUDY_UID.into()))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found[0].scanned);
+    let stored = idx.stored_data(found[0].id).await.unwrap().unwrap();
+    assert_eq!(stored.frames, r.data.frames);
+    assert_eq!(stored.bulk, r.data.bulk);
+    assert!(stored.offsets_valid);
+    assert_eq!(stored.problem, None);
+    let meta = idx.metadata_batch(&[found[0].id]).await.unwrap();
+    assert_eq!(
+        meta,
+        vec![(
+            found[0].id,
+            MetadataState::Ready(r.data.metadata.clone().unwrap())
+        )]
+    );
+
+    let pool = sql_pool(dir.path()).await;
+    let version: i64 = sqlx::query_scalar("SELECT scan_version FROM instances")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, SCAN_VERSION);
+    let (name, folded, series_pps): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT st.patient_name, st.patient_name_folded, s.performed_procedure_step_start_date
+         FROM studies st JOIN series s ON s.study_fk = st.id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(name, "SCAN^TEST");
+    assert_eq!(folded, fold_name("SCAN^TEST"));
+    assert_eq!(series_pps, None);
+}
+
+#[tokio::test]
+async fn duplicate_keeps_instance_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let first = support::native(&dir.path().join("a"), 2, 4, 4, 8);
+    let second = support::native(&dir.path().join("b"), 3, 4, 4, 8);
+    let a = scanned_record(&first, 1);
+    idx.upsert_instance(&a, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let b = scanned_record(&second, 2);
+    assert!(matches!(
+        idx.upsert_instance(&b, DuplicatePolicy::Keep)
+            .await
+            .unwrap(),
+        UpsertOutcome::Duplicate { .. }
+    ));
+    let id = idx.unscanned(10).await.unwrap();
+    assert!(id.is_empty());
+    let found = idx
+        .find_instances(&Scope::Study(support::STUDY_UID.into()))
+        .await
+        .unwrap();
+    let stored = idx.stored_data(found[0].id).await.unwrap().unwrap();
+    assert_eq!(stored.frames.unwrap().count(), 2);
+    assert_eq!(found[0].blob, a.blob);
+}
+
+#[tokio::test]
+async fn overwrite_replaces_instance_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let a = scanned_record(&support::native(&dir.path().join("a"), 2, 4, 4, 8), 1);
+    let b = scanned_record(&support::native(&dir.path().join("b"), 3, 4, 4, 8), 2);
+    idx.upsert_instance(&a, DuplicatePolicy::Overwrite)
+        .await
+        .unwrap();
+    assert!(matches!(
+        idx.upsert_instance(&b, DuplicatePolicy::Overwrite)
+            .await
+            .unwrap(),
+        UpsertOutcome::Replaced { .. }
+    ));
+    let found = idx
+        .find_instances(&Scope::Study(support::STUDY_UID.into()))
+        .await
+        .unwrap();
+    assert_eq!(found[0].blob, b.blob);
+    let stored = idx.stored_data(found[0].id).await.unwrap().unwrap();
+    assert_eq!(stored.frames, b.data.frames);
+    assert_eq!(stored.frames.unwrap().count(), 3);
+    let meta = idx.metadata_batch(&[found[0].id]).await.unwrap();
+    assert_eq!(
+        meta[0].1,
+        MetadataState::Ready(b.data.metadata.clone().unwrap())
+    );
+
+    // Replacing with an unscanned record clears the old scan.
+    let c = record(b.header.clone(), 3);
+    idx.upsert_instance(&c, DuplicatePolicy::Overwrite)
+        .await
+        .unwrap();
+    assert!(idx.stored_data(found[0].id).await.unwrap().is_none());
+    assert_eq!(idx.unscanned(10).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn study_patient_attrs_per_study_without_patient_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let mut hs = phantom_headers(&dir.path().join("p"), 2);
+    for (i, (h, name)) in hs.iter_mut().zip(["A^ONE", "B^TWO"]).enumerate() {
+        h.patient_id = None;
+        h.patient_name = Some(name.into());
+        h.study_instance_uid = format!("2.25.77{i}");
+        h.series_instance_uid = format!("2.25.88{i}");
+        idx.upsert_instance(&record(h.clone(), i as u8), DuplicatePolicy::Keep)
+            .await
+            .unwrap();
+    }
+    let pool = sql_pool(dir.path()).await;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT patient_name, patient_name_folded FROM studies ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("A^ONE".to_string(), "a^one".to_string()),
+            ("B^TWO".to_string(), "b^two".to_string())
+        ]
+    );
+    let patients: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM patients")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(patients, 1);
+}
+
+#[tokio::test]
+async fn opens_store_created_before_0003() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("old-migrations");
+    std::fs::create_dir(&old).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for name in ["0001_init.sql", "0002_uploads_nifti.sql"] {
+        std::fs::copy(src.join(name), old.join(name)).unwrap();
+    }
+    let pool = sql_pool(dir.path()).await;
+    sqlx::migrate::Migrator::new(old.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    let hash = "ab".repeat(32);
+    for sql in [
+        "INSERT INTO patients (id, patient_id) VALUES (1, 'P1')",
+        "INSERT INTO studies (id, study_instance_uid, patient_fk, created_at, updated_at)
+         VALUES (1, '2.25.1', 1, 't', 't')",
+        "INSERT INTO series (id, series_instance_uid, study_fk, created_at, updated_at)
+         VALUES (1, '2.25.2', 1, 't', 't')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO instances (sop_instance_uid, series_fk, sop_class_uid, number_of_frames,
+                                transfer_syntax, blob_sha256, size_bytes, source, received_at)
+         VALUES ('2.25.3', 1, '1.2', 1, '1.2.840.10008.1.2.1', ?1, 10, 'stow', 't')",
+    )
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let idx = open(dir.path()).await;
+    let pending = idx.unscanned(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1, "2.25.3");
+    assert_eq!(pending[0].2.to_hex(), hash);
+    let found = idx
+        .find_instances(&Scope::Study("2.25.1".into()))
+        .await
+        .unwrap();
+    assert!(!found[0].scanned);
+    assert!(idx.stored_data(found[0].id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn find_instances_scopes_and_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (idx, hs) = seeded_index(dir.path()).await;
+    let (st, se0, se2) = (
+        hs[0].study_instance_uid.clone(),
+        hs[0].series_instance_uid.clone(),
+        hs[2].series_instance_uid.clone(),
+    );
+    let study = idx.find_instances(&Scope::Study(st.clone())).await.unwrap();
+    assert_eq!(study.len(), 3);
+    assert_eq!(
+        study
+            .iter()
+            .map(|i| i.series_uid.as_str())
+            .collect::<Vec<_>>(),
+        [&se0, &se0, &se2]
+    );
+    assert!(
+        study
+            .iter()
+            .all(|i| i.study_uid == st && i.frame_info.is_some())
+    );
+
+    let series = idx
+        .find_instances(&Scope::Series(st.clone(), se2.clone()))
+        .await
+        .unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0].sop_uid, hs[2].sop_instance_uid);
+
+    let inst = idx
+        .find_instances(&Scope::Instance(
+            st.clone(),
+            se0.clone(),
+            hs[1].sop_instance_uid.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(inst.len(), 1);
+    assert_eq!(inst[0].sop_class_uid, hs[1].sop_class_uid);
+    assert_eq!(inst[0].number_of_frames, 1);
+
+    // The instance lives in series se2, not se0 (and not in another study).
+    let wrong_series = Scope::Instance(st.clone(), se0, hs[2].sop_instance_uid.clone());
+    assert!(idx.find_instances(&wrong_series).await.unwrap().is_empty());
+    let wrong_study = Scope::Series("2.25.404".into(), se2);
+    assert!(idx.find_instances(&wrong_study).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn metadata_batch_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let ready = scanned_record(&support::native(&dir.path().join("a"), 1, 4, 4, 8), 1);
+    idx.upsert_instance(&ready, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let hs = phantom_headers(&dir.path().join("p"), 2);
+    idx.upsert_instance(&record(hs[0].clone(), 2), DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let mut failed = record(hs[1].clone(), 3);
+    failed.scanned = true;
+    failed.data.problem = Some("metadata too large".into());
+    idx.upsert_instance(&failed, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for (st, sop) in [
+        (support::STUDY_UID, support::SOP_UID),
+        (
+            hs[0].study_instance_uid.as_str(),
+            hs[0].sop_instance_uid.as_str(),
+        ),
+        (
+            hs[1].study_instance_uid.as_str(),
+            hs[1].sop_instance_uid.as_str(),
+        ),
+    ] {
+        let found = idx.find_instances(&Scope::Study(st.into())).await.unwrap();
+        ids.push(found.iter().find(|i| i.sop_uid == sop).unwrap().id);
+    }
+    assert_eq!(ids.len(), 3);
+    let mut query = ids.clone();
+    query.push(9999);
+    let states = idx.metadata_batch(&query).await.unwrap();
+    assert_eq!(states.len(), 3);
+    assert_eq!(
+        states[0],
+        (
+            ids[0],
+            MetadataState::Ready(ready.data.metadata.clone().unwrap())
+        )
+    );
+    assert_eq!(states[1], (ids[1], MetadataState::Unscanned));
+    assert_eq!(
+        states[2],
+        (
+            ids[2],
+            MetadataState::Unavailable("metadata too large".into())
+        )
+    );
+    assert!(idx.metadata_batch(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn write_scan_skips_changed_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let file = support::native(&dir.path().join("a"), 2, 4, 4, 8);
+    let scan = scan_instance(&file).unwrap();
+    let pending = record(scan.header.clone(), 1);
+    idx.upsert_instance(&pending, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let (id, uid, blob) = idx.unscanned(10).await.unwrap().remove(0);
+    assert_eq!((uid.as_str(), blob), (support::SOP_UID, pending.blob));
+
+    // A scan of some other blob is dropped.
+    let stale = BlobHash([9; 32]);
+    assert!(!idx.write_scan(id, &stale, &scan).await.unwrap());
+    assert!(!idx.write_scan_failure(id, &stale, "x").await.unwrap());
+    assert_eq!(idx.unscanned(10).await.unwrap().len(), 1);
+    assert!(idx.stored_data(id).await.unwrap().is_none());
+
+    // The matching blob is written, and fills the study columns.
+    assert!(idx.write_scan(id, &blob, &scan).await.unwrap());
+    assert!(idx.unscanned(10).await.unwrap().is_empty());
+    let stored = idx.stored_data(id).await.unwrap().unwrap();
+    assert_eq!(stored.frames, scan.data.frames);
+    let pool = sql_pool(dir.path()).await;
+    let name: Option<String> = sqlx::query_scalar("SELECT patient_name_folded FROM studies")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name.as_deref(), Some("scan^test"));
+}
+
+#[tokio::test]
+async fn write_scan_failure_marks_scanned_without_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let h = phantom_headers(&dir.path().join("p"), 1).remove(0);
+    let r = record(h, 1);
+    idx.upsert_instance(&r, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let (id, _, blob) = idx.unscanned(10).await.unwrap().remove(0);
+    assert!(
+        idx.write_scan_failure(id, &blob, "bad pixel data")
+            .await
+            .unwrap()
+    );
+    assert!(idx.unscanned(10).await.unwrap().is_empty());
+    let stored = idx.stored_data(id).await.unwrap().unwrap();
+    assert_eq!(stored.frames, None);
+    assert!(stored.bulk.is_empty() && !stored.offsets_valid);
+    assert_eq!(stored.problem.as_deref(), Some("bad pixel data"));
+}
+
+#[tokio::test]
+async fn series_slices_carry_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = open(dir.path()).await;
+    let r = scanned_record(&support::native(&dir.path().join("a"), 2, 4, 4, 8), 1);
+    idx.upsert_instance(&r, DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let slices = idx.series_slices(support::SERIES_UID).await.unwrap();
+    assert_eq!(slices.len(), 1);
+    assert!(matches!(
+        slices[0].frames,
+        Some(FrameTable::Native { count: 2, .. })
+    ));
+
+    // Without valid offsets the table is not offered.
+    let pool = sql_pool(dir.path()).await;
+    sqlx::query("UPDATE instance_data SET offsets_valid = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let slices = idx.series_slices(support::SERIES_UID).await.unwrap();
+    assert_eq!(slices[0].frames, None);
+
+    // Unscanned instances have none either.
+    let h = phantom_headers(&dir.path().join("p"), 1).remove(0);
+    let series = h.series_instance_uid.clone();
+    idx.upsert_instance(&record(h, 2), DuplicatePolicy::Keep)
+        .await
+        .unwrap();
+    let slices = idx.series_slices(&series).await.unwrap();
+    assert_eq!(slices[0].frames, None);
 }

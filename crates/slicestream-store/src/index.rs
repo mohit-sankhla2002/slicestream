@@ -19,7 +19,9 @@ use sqlx::sqlite::{
 };
 use tracing::warn;
 
-use crate::{BlobHash, InstanceHeader};
+use crate::{
+    BlobHash, BulkValue, FrameTable, InstanceData, InstanceHeader, InstanceScan, SCAN_VERSION,
+};
 
 /// Everything needed to index one stored instance.
 #[derive(Debug, Clone)]
@@ -30,6 +32,63 @@ pub struct InstanceRecord {
     /// Transport the instance arrived on (e.g. `"dimse"`, `"stow"`).
     pub source: String,
     pub calling_ae: Option<String>,
+    /// What the instance scan derived (DICOM JSON, frame table, bulk offsets).
+    pub data: InstanceData,
+    /// True when `data` came from a scan: the row is then marked with
+    /// [`SCAN_VERSION`]. False leaves the row unscanned (`scan_version` 0) so
+    /// the background scan picks it up, and `data` is ignored.
+    pub scanned: bool,
+}
+
+/// Lower-case `s` for case-insensitive matching (`patient_name_folded`,
+/// `referring_physician_name_folded` and the query values compared with them).
+pub fn fold_name(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// Which instances a DICOMweb request addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    Study(String),
+    /// Study UID, series UID.
+    Series(String, String),
+    /// Study UID, series UID, SOP Instance UID.
+    Instance(String, String, String),
+}
+
+/// One instance found by [`Index::find_instances`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceRef {
+    pub id: i64,
+    pub study_uid: String,
+    pub series_uid: String,
+    pub sop_uid: String,
+    pub sop_class_uid: String,
+    pub blob: BlobHash,
+    pub transfer_syntax: String,
+    pub number_of_frames: u32,
+    pub frame_info: Option<FrameInfo>,
+    /// Scanned at the current [`SCAN_VERSION`].
+    pub scanned: bool,
+}
+
+/// DICOM JSON availability of one instance, from [`Index::metadata_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataState {
+    Ready(Vec<u8>),
+    /// Not scanned yet.
+    Unscanned,
+    /// Scanned, but there is no metadata (over the size cap, or the scan failed).
+    Unavailable(String),
+}
+
+/// What the scan stored beside the metadata, from [`Index::stored_data`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredData {
+    pub frames: Option<FrameTable>,
+    pub bulk: Vec<BulkValue>,
+    pub offsets_valid: bool,
+    pub problem: Option<String>,
 }
 
 /// What to do when a SOP Instance UID is already indexed with a different blob.
@@ -179,6 +238,8 @@ pub struct SliceRow {
     pub instance_number: Option<i64>,
     pub slice_position: Option<f64>,
     pub frame_info: FrameInfo,
+    /// `None` unless the instance was scanned with valid offsets.
+    pub frames: Option<FrameTable>,
 }
 
 /// Handle to the SQLite index. Cheap to clone (wraps a connection pool).
@@ -256,9 +317,25 @@ impl Index {
 
         let (study_id, study_patient): (i64, i64) = sqlx::query_as(
             "INSERT INTO studies (study_instance_uid, patient_fk, study_date, study_description,
-                                  accession_number, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-             ON CONFLICT(study_instance_uid) DO UPDATE SET updated_at = excluded.updated_at
+                                  accession_number, created_at, updated_at, study_time, study_id,
+                                  referring_physician_name, referring_physician_name_folded,
+                                  patient_name, patient_name_folded, patient_birth_date,
+                                  patient_sex)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(study_instance_uid) DO UPDATE SET
+               updated_at = excluded.updated_at,
+               study_time = COALESCE(studies.study_time, excluded.study_time),
+               study_id = COALESCE(studies.study_id, excluded.study_id),
+               referring_physician_name = COALESCE(studies.referring_physician_name,
+                                                   excluded.referring_physician_name),
+               referring_physician_name_folded = COALESCE(studies.referring_physician_name_folded,
+                                                   excluded.referring_physician_name_folded),
+               patient_name = COALESCE(studies.patient_name, excluded.patient_name),
+               patient_name_folded = COALESCE(studies.patient_name_folded,
+                                              excluded.patient_name_folded),
+               patient_birth_date = COALESCE(studies.patient_birth_date,
+                                             excluded.patient_birth_date),
+               patient_sex = COALESCE(studies.patient_sex, excluded.patient_sex)
              RETURNING id, patient_fk",
         )
         .bind(&h.study_instance_uid)
@@ -267,6 +344,14 @@ impl Index {
         .bind(&h.study_description)
         .bind(&h.accession_number)
         .bind(&ts)
+        .bind(&h.study_time)
+        .bind(&h.study_id)
+        .bind(&h.referring_physician_name)
+        .bind(h.referring_physician_name.as_deref().map(fold_name))
+        .bind(&h.patient_name)
+        .bind(h.patient_name.as_deref().map(fold_name))
+        .bind(&h.patient_birth_date)
+        .bind(&h.patient_sex)
         .fetch_one(&mut *tx)
         .await?;
         if study_patient != patient_id {
@@ -279,9 +364,18 @@ impl Index {
 
         let (series_id, series_study): (i64, i64) = sqlx::query_as(
             "INSERT INTO series (series_instance_uid, study_fk, modality, series_number,
-                                 series_description, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-             ON CONFLICT(series_instance_uid) DO UPDATE SET updated_at = excluded.updated_at
+                                 series_description, created_at, updated_at,
+                                 performed_procedure_step_start_date,
+                                 performed_procedure_step_start_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)
+             ON CONFLICT(series_instance_uid) DO UPDATE SET
+               updated_at = excluded.updated_at,
+               performed_procedure_step_start_date =
+                 COALESCE(series.performed_procedure_step_start_date,
+                          excluded.performed_procedure_step_start_date),
+               performed_procedure_step_start_time =
+                 COALESCE(series.performed_procedure_step_start_time,
+                          excluded.performed_procedure_step_start_time)
              RETURNING id, study_fk",
         )
         .bind(&h.series_instance_uid)
@@ -290,6 +384,8 @@ impl Index {
         .bind(h.series_number)
         .bind(&h.series_description)
         .bind(&ts)
+        .bind(&h.performed_procedure_step_start_date)
+        .bind(&h.performed_procedure_step_start_time)
         .fetch_one(&mut *tx)
         .await?;
         if series_study != study_id {
@@ -326,6 +422,8 @@ impl Index {
             == 1;
 
         let outcome = if inserted {
+            self.write_instance_data(&mut tx, &h.sop_instance_uid, rec)
+                .await?;
             UpsertOutcome::Inserted
         } else {
             let existing_hex: String =
@@ -359,11 +457,46 @@ impl Index {
                 .bind(&ts)
                 .execute(&mut *tx)
                 .await?;
+                self.write_instance_data(&mut tx, &h.sop_instance_uid, rec)
+                    .await?;
                 UpsertOutcome::Replaced { previous: existing }
             }
         };
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// Store (or clear) the scan result of the instance just inserted or
+    /// replaced in `tx`.
+    async fn write_instance_data(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        sop_uid: &str,
+        rec: &InstanceRecord,
+    ) -> Result<(), sqlx::Error> {
+        let id: i64 = sqlx::query_scalar("SELECT id FROM instances WHERE sop_instance_uid = ?1")
+            .bind(sop_uid)
+            .fetch_one(&mut *tx)
+            .await?;
+        if rec.scanned {
+            put_scan_data(tx, id, &rec.data).await?;
+            sqlx::query("UPDATE instances SET scan_version = ?2, scan_problem = ?3 WHERE id = ?1")
+                .bind(id)
+                .bind(SCAN_VERSION)
+                .bind(&rec.data.problem)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM instance_data WHERE instance_fk = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE instances SET scan_version = 0, scan_problem = NULL WHERE id = ?1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Every blob hash referenced by an `instances` or `nifti_volumes` row.
@@ -738,9 +871,10 @@ impl Index {
     pub async fn series_slices(&self, series_uid: &str) -> Result<Vec<SliceRow>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT i.blob_sha256, i.number_of_frames, i.instance_number, i.slice_position,
-                    i.frame_info
+                    i.frame_info, d.frames
              FROM instances i
              JOIN series s ON s.id = i.series_fk
+             LEFT JOIN instance_data d ON d.instance_fk = i.id AND d.offsets_valid = 1
              WHERE s.series_instance_uid = ?1 AND i.frame_info IS NOT NULL
              ORDER BY i.slice_position, i.instance_number, i.id",
         )
@@ -748,6 +882,249 @@ impl Index {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(slice_row).collect()
+    }
+
+    /// Instances addressed by `scope`, in series, slice position, instance
+    /// number order. The UIDs must belong together; an empty list means not
+    /// found.
+    pub async fn find_instances(&self, scope: &Scope) -> Result<Vec<InstanceRef>, sqlx::Error> {
+        let (filter, binds): (&str, Vec<&str>) = match scope {
+            Scope::Study(st) => ("st.study_instance_uid = ?1", vec![st]),
+            Scope::Series(st, se) => (
+                "st.study_instance_uid = ?1 AND s.series_instance_uid = ?2",
+                vec![st, se],
+            ),
+            Scope::Instance(st, se, sop) => (
+                "st.study_instance_uid = ?1 AND s.series_instance_uid = ?2
+                 AND i.sop_instance_uid = ?3",
+                vec![st, se, sop],
+            ),
+        };
+        let sql = format!(
+            "SELECT i.id, st.study_instance_uid, s.series_instance_uid, i.sop_instance_uid,
+                    i.sop_class_uid, i.blob_sha256, i.transfer_syntax, i.number_of_frames,
+                    i.frame_info, i.scan_version
+             FROM instances i
+             JOIN series s ON s.id = i.series_fk
+             JOIN studies st ON st.id = s.study_fk
+             WHERE {filter}
+             ORDER BY s.id, i.slice_position, i.instance_number, i.id"
+        );
+        let mut q = sqlx::query(&sql);
+        for b in binds {
+            q = q.bind(b);
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|r| {
+                let frames: i64 = r.try_get(7)?;
+                let info: Option<&str> = r.try_get(8)?;
+                let version: i64 = r.try_get(9)?;
+                Ok(InstanceRef {
+                    id: r.try_get(0)?,
+                    study_uid: r.try_get(1)?,
+                    series_uid: r.try_get(2)?,
+                    sop_uid: r.try_get(3)?,
+                    sop_class_uid: r.try_get(4)?,
+                    blob: parse_hash(r.try_get(5)?)?,
+                    transfer_syntax: r.try_get(6)?,
+                    number_of_frames: u32::try_from(frames)
+                        .map_err(|_| decode_err(format!("invalid number_of_frames {frames}")))?,
+                    frame_info: info
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|e| decode_err(format!("invalid frame_info JSON: {e}")))?,
+                    scanned: version >= SCAN_VERSION,
+                })
+            })
+            .collect()
+    }
+
+    /// DICOM JSON state of each instance in `ids` (callers chunk by 128).
+    /// Unknown ids are left out; the rest keep the order of `ids`.
+    pub async fn metadata_batch(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, MetadataState)>, sqlx::Error> {
+        let list = serde_json::to_string(ids).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let rows = sqlx::query(
+            "SELECT i.id, i.scan_version, i.scan_problem, d.metadata
+             FROM instances i
+             LEFT JOIN instance_data d ON d.instance_fk = i.id
+             WHERE i.id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(list)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut found = std::collections::HashMap::new();
+        for r in &rows {
+            let version: i64 = r.try_get(1)?;
+            let problem: Option<String> = r.try_get(2)?;
+            let metadata: Option<Vec<u8>> = r.try_get(3)?;
+            let state = match metadata {
+                Some(m) => MetadataState::Ready(m),
+                None if version < SCAN_VERSION => MetadataState::Unscanned,
+                None => MetadataState::Unavailable(
+                    problem.unwrap_or_else(|| "no metadata was stored".into()),
+                ),
+            };
+            found.insert(r.try_get::<i64, _>(0)?, state);
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| found.remove(id).map(|s| (*id, s)))
+            .collect())
+    }
+
+    /// Frame table and bulk offsets of instance `id`. `None` when the
+    /// instance is unknown or not scanned yet; a failed scan gives an empty
+    /// result carrying the problem.
+    pub async fn stored_data(&self, id: i64) -> Result<Option<StoredData>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT i.scan_version, i.scan_problem, d.frames, d.bulk, d.offsets_valid
+             FROM instances i
+             LEFT JOIN instance_data d ON d.instance_fk = i.id
+             WHERE i.id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(r) = row else { return Ok(None) };
+        let version: i64 = r.try_get(0)?;
+        if version < SCAN_VERSION {
+            return Ok(None);
+        }
+        let frames = match r.try_get::<Option<&[u8]>, _>(2)? {
+            Some(b) => Some(
+                FrameTable::decode(b).ok_or_else(|| decode_err("invalid frame table".into()))?,
+            ),
+            None => None,
+        };
+        let bulk = match r.try_get::<Option<&str>, _>(3)? {
+            Some(b) => serde_json::from_str(b)
+                .map_err(|e| decode_err(format!("invalid bulk JSON: {e}")))?,
+            None => Vec::new(),
+        };
+        Ok(Some(StoredData {
+            frames,
+            bulk,
+            offsets_valid: r.try_get::<Option<bool>, _>(4)?.unwrap_or(false),
+            problem: r.try_get(1)?,
+        }))
+    }
+
+    /// Up to `limit` instances not scanned at [`SCAN_VERSION`] yet, in id
+    /// order, as `(id, SOP Instance UID, blob)`.
+    pub async fn unscanned(&self, limit: i64) -> Result<Vec<(i64, String, BlobHash)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT id, sop_instance_uid, blob_sha256 FROM instances
+             WHERE scan_version < ?1 ORDER BY id LIMIT ?2",
+        )
+        .bind(SCAN_VERSION)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?, parse_hash(r.try_get(2)?)?)))
+            .collect()
+    }
+
+    /// Record the scan of instance `id`, but only if it still points at
+    /// `blob` (an overwrite may have replaced it meanwhile). Fills empty
+    /// study and series columns. Returns whether anything was written.
+    pub async fn write_scan(
+        &self,
+        id: i64,
+        blob: &BlobHash,
+        scan: &InstanceScan,
+    ) -> Result<bool, sqlx::Error> {
+        let h = &scan.header;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
+            "UPDATE instances SET scan_version = ?3, scan_problem = ?4
+             WHERE id = ?1 AND blob_sha256 = ?2",
+        )
+        .bind(id)
+        .bind(blob.to_hex())
+        .bind(SCAN_VERSION)
+        .bind(&scan.data.problem)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        put_scan_data(&mut tx, id, &scan.data).await?;
+        sqlx::query(
+            "UPDATE studies SET
+               study_time = COALESCE(study_time, ?2),
+               study_id = COALESCE(study_id, ?3),
+               referring_physician_name = COALESCE(referring_physician_name, ?4),
+               referring_physician_name_folded = COALESCE(referring_physician_name_folded, ?5),
+               patient_name = COALESCE(patient_name, ?6),
+               patient_name_folded = COALESCE(patient_name_folded, ?7),
+               patient_birth_date = COALESCE(patient_birth_date, ?8),
+               patient_sex = COALESCE(patient_sex, ?9)
+             WHERE id = (SELECT s.study_fk FROM instances i JOIN series s ON s.id = i.series_fk
+                         WHERE i.id = ?1)",
+        )
+        .bind(id)
+        .bind(&h.study_time)
+        .bind(&h.study_id)
+        .bind(&h.referring_physician_name)
+        .bind(h.referring_physician_name.as_deref().map(fold_name))
+        .bind(&h.patient_name)
+        .bind(h.patient_name.as_deref().map(fold_name))
+        .bind(&h.patient_birth_date)
+        .bind(&h.patient_sex)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE series SET
+               performed_procedure_step_start_date =
+                 COALESCE(performed_procedure_step_start_date, ?2),
+               performed_procedure_step_start_time =
+                 COALESCE(performed_procedure_step_start_time, ?3)
+             WHERE id = (SELECT series_fk FROM instances WHERE id = ?1)",
+        )
+        .bind(id)
+        .bind(&h.performed_procedure_step_start_date)
+        .bind(&h.performed_procedure_step_start_time)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Record that scanning instance `id` failed, so it is not retried. Only
+    /// applies if the row still points at `blob`. Returns whether it did.
+    pub async fn write_scan_failure(
+        &self,
+        id: i64,
+        blob: &BlobHash,
+        problem: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query(
+            "UPDATE instances SET scan_version = ?3, scan_problem = ?4
+             WHERE id = ?1 AND blob_sha256 = ?2",
+        )
+        .bind(id)
+        .bind(blob.to_hex())
+        .bind(SCAN_VERSION)
+        .bind(problem)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM instance_data WHERE instance_fk = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn instance(
@@ -788,5 +1165,30 @@ fn slice_row(r: &SqliteRow) -> Result<SliceRow, sqlx::Error> {
         slice_position: r.try_get(3)?,
         frame_info: serde_json::from_str(info)
             .map_err(|e| decode_err(format!("invalid frame_info JSON: {e}")))?,
+        // An unreadable table falls back to reading frames by header.
+        frames: r
+            .try_get::<Option<&[u8]>, _>(5)?
+            .and_then(FrameTable::decode),
     })
+}
+
+/// `INSERT OR REPLACE` the `instance_data` row of instance `id`.
+async fn put_scan_data(
+    tx: &mut sqlx::SqliteConnection,
+    id: i64,
+    data: &InstanceData,
+) -> Result<(), sqlx::Error> {
+    let bulk = serde_json::to_string(&data.bulk).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    sqlx::query(
+        "INSERT OR REPLACE INTO instance_data (instance_fk, metadata, frames, bulk, offsets_valid)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(&data.metadata)
+    .bind(data.frames.as_ref().map(FrameTable::encode))
+    .bind(bulk)
+    .bind(data.offsets_valid)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
 }

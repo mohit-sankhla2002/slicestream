@@ -26,9 +26,9 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{error, warn};
 
 use crate::{
-    BlobHash, BlobKind, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceHeader,
-    InstanceRecord, NiftiMeta, SpoolError, SpooledBlob, StorageConfig, TempBlob, UpsertOutcome,
-    read_header,
+    BlobHash, BlobKind, DuplicatePolicy, FsBlobStore, HeaderError, Index, InstanceData,
+    InstanceHeader, InstanceRecord, NiftiMeta, SpoolError, SpooledBlob, StorageConfig, TempBlob,
+    UpsertOutcome, read_header,
 };
 
 /// Capacity of the [`StoredEvent`] broadcast channel.
@@ -664,6 +664,15 @@ impl Ingestor {
             size_bytes: spooled.len,
             source: source.as_str().to_owned(),
             calling_ae,
+            // Until the ingest path runs the scan, the background scan fills this in.
+            data: InstanceData {
+                metadata: None,
+                frames: None,
+                bulk: Vec::new(),
+                offsets_valid: false,
+                problem: None,
+            },
+            scanned: false,
         };
         let shared = Arc::clone(&self.shared);
         tokio::spawn(shared.store(spooled, rec))

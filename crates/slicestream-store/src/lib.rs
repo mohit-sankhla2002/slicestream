@@ -22,9 +22,9 @@ pub use config::StorageConfig;
 pub use frames::FrameTable;
 pub use header::{HeaderError, InstanceHeader, read_header};
 pub use index::{
-    CONSOLE_SERIES_LIMIT, ConsoleSeriesRow, DuplicatePolicy, Index, InstanceRecord,
-    InstanceSummary, NiftiMeta, NiftiRow, SeriesRow, SliceRow, StorageCounts, StudyInfo,
-    UploadCounts, UploadRow, UpsertOutcome,
+    CONSOLE_SERIES_LIMIT, ConsoleSeriesRow, DuplicatePolicy, Index, InstanceRecord, InstanceRef,
+    InstanceSummary, MetadataState, NiftiMeta, NiftiRow, Scope, SeriesRow, SliceRow, StorageCounts,
+    StoredData, StudyInfo, UploadCounts, UploadRow, UpsertOutcome, fold_name,
 };
 pub use ingest::{
     Expectations, IngestError, IngestFailure, IngestSource, Ingestor, RecoveryReport, Stored,
