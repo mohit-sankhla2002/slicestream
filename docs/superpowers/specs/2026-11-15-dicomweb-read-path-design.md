@@ -220,7 +220,16 @@ the first rule that applies:
    answers 500 with the reason "frame boundaries unknown". A warning is
    logged at ingest.
 
-**Deflated transfer syntax** (`1.2.840.10008.1.2.1.99`). File offsets do not
+**Deflated transfer syntax** (`1.2.840.10008.1.2.1.99`).
+
+> **Changed during implementation:** deflated support was turned on and then
+> reverted after the final review, because unbounded decompression on open
+> read routes was the bigger risk. Deflated data sets are rejected at ingest
+> exactly as before M1, and `offsets_valid` is true for every stored
+> instance. The rest of this paragraph describes the design that was not
+> shipped.
+
+File offsets do not
 map to data set bytes. The scan still produces metadata and QIDO attributes
 through the inflating reader, but it records no frame or bulk offsets. Frames
 and bulk values for these instances use the whole-file parse path.
@@ -251,7 +260,8 @@ New columns, filled by the scan:
 
 New table `instance_data`, one row per instance, keyed by the instance id:
 the metadata JSON, the frame table, the bulk-value table, and whether file
-offsets are valid (false for deflated). It is written in the same
+offsets are valid (false for deflated; see the note above, deflated data
+sets are not stored). It is written in the same
 transaction as the instance row, and replaced when `on_duplicate =
 "overwrite"` replaces the instance.
 
@@ -510,7 +520,7 @@ max_results = 1000    # QIDO limit: default and maximum
   InlineBinary, nested sequences).
 - **Store integration**: scanning the phantom, synthetic encapsulated
   multi-frame data (Basic Offset Table, Extended Offset Table, one fragment
-  per frame, markers, ambiguous), big-endian, deflated, Bits Allocated = 1,
+  per frame, markers, ambiguous), big-endian, deflated (rejected at ingest), Bits Allocated = 1,
   and nested sequences. A store created with migrations 0001 and 0002 only
   is opened and backfilled. Encapsulated fixtures can hold arbitrary bytes
   under a JPEG transfer syntax UID, because offsets do not depend on the

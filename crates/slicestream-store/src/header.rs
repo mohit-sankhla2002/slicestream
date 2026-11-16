@@ -147,8 +147,9 @@ pub(crate) fn read_header_with_stats(
 pub(crate) struct DataSetSource {
     pub decoder: DynStatefulDecoder<Box<dyn Read>>,
     pub transfer_syntax: String,
-    /// False when the data set is deflated: decoder positions are then not
-    /// file offsets.
+    /// False when the data set is read through a codec, so decoder
+    /// positions are not file offsets. No such codec is enabled (deflated
+    /// data sets are rejected as unsupported), so this is true in practice.
     pub offsets_valid: bool,
     /// File size, when the file system reports it.
     pub file_len: Option<u64>,
@@ -157,7 +158,8 @@ pub(crate) struct DataSetSource {
 }
 
 /// Open `path`, read its preamble and file meta group, and set up a decoder
-/// whose `position()` is a file offset (for non-deflated data sets).
+/// whose `position()` is a file offset (unless a data set codec is in use,
+/// see [`DataSetSource::offsets_valid`]).
 pub(crate) fn open_data_set(path: &Path) -> Result<DataSetSource, HeaderError> {
     let file = File::open(path).map_err(unparseable)?;
     let file_len = file.metadata().ok().map(|m| m.len());
