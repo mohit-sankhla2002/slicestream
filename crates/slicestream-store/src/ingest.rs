@@ -44,6 +44,28 @@ const SCAN_FAILED: &str = "the scan failed";
 /// Scan problem recorded when the scan result could not be written. The
 /// details are logged.
 const SCAN_NOT_RECORDED: &str = "the scan could not be recorded";
+/// Whether `e`, from writing one row's scan, is caused by that row's data
+/// (too big, refused by a constraint, an unencodable value), so that writing
+/// it again would fail the same way. Anything else (a full disk, a busy or
+/// locked database, an I/O error, a closed pool) can pass, so the row is
+/// left unscanned for a later batch instead of being recorded as a problem.
+fn rejects_row(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Encode(_) => true,
+        sqlx::Error::Database(db) => {
+            // SQLite extended result codes keep the primary code in the low
+            // byte: SQLITE_TOOBIG 18, SQLITE_CONSTRAINT 19, SQLITE_MISMATCH 20,
+            // SQLITE_RANGE 25.
+            let primary = db
+                .code()
+                .and_then(|c| c.parse::<i32>().ok())
+                .map(|c| c & 0xff);
+            matches!(primary, Some(18 | 19 | 20 | 25))
+        }
+        _ => false,
+    }
+}
+
 /// Lock file under the storage root, held exclusively by the owning process.
 const LOCK_FILE: &str = "LOCK";
 
@@ -509,10 +531,13 @@ impl Shared {
                     }
                     return Ok(());
                 }
-                Err(e) => {
+                Err(e) if rejects_row(&e) => {
                     error!(id, blob = %blob.to_hex(), error = %e, "cannot record scan");
                     SCAN_NOT_RECORDED.to_owned()
                 }
+                // A full disk, a busy database or a lost connection is not a
+                // problem of this row: leave it unscanned for a later try.
+                Err(e) => return Err(IngestError::Index(e)),
             },
             Ok(Err(e)) => format!("cannot scan stored blob: {e}"),
             Err(e) => {
@@ -792,10 +817,11 @@ impl Ingestor {
     /// older scan version), two at a time. Returns how many rows it recorded;
     /// 0 means nothing is left to scan.
     ///
-    /// A row that fails in any way (unreadable blob, panicking scan, a scan
-    /// result the index will not take) is recorded as a scan problem, so it
-    /// does not come back, and the batch goes on. A row for which even that
-    /// cannot be written is logged and left for a later batch. `Err` when
+    /// A row that fails because of itself (unreadable blob, panicking scan,
+    /// a scan result the index will not take) is recorded as a scan problem,
+    /// so it does not come back, and the batch goes on. A row that fails
+    /// because of the database (full disk, busy, I/O error) is logged and
+    /// left unscanned for a later batch. `Err` when
     /// the rows cannot be listed, or when the batch recorded none of its
     /// rows, so the caller can wait before trying again.
     pub async fn backfill_batch(&self, limit: i64) -> Result<usize, IngestError> {

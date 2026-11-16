@@ -961,13 +961,50 @@ async fn scan_problem(root: &Path, id: i64) -> Option<String> {
 }
 
 #[tokio::test]
+async fn backfill_leaves_rows_unscanned_when_the_database_fails() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("store");
+    let ing = Ingestor::open(config(&root)).await.unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 3).await;
+    unscan_all(&root).await;
+    // A failure that is not caused by any row (here the table is missing;
+    // a full disk or a busy database behaves the same) must not be recorded
+    // as a permanent scan problem.
+    exec(
+        &root,
+        "ALTER TABLE instance_data RENAME TO instance_data_away",
+    )
+    .await;
+
+    assert!(ing.backfill_batch(10).await.is_err());
+    assert_eq!(ing.index().unscanned(10).await.unwrap().len(), 3);
+    for &id in &ids {
+        assert_eq!(scan_problem(&root, id).await, None);
+    }
+
+    // Once the database works again, the next batch scans every row.
+    exec(
+        &root,
+        "ALTER TABLE instance_data_away RENAME TO instance_data",
+    )
+    .await;
+    assert_eq!(ing.backfill_batch(10).await.unwrap(), 3);
+    for &id in &ids {
+        let data = ing.index().stored_data(id).await.unwrap().expect("scanned");
+        assert!(data.frames.is_some(), "{id}");
+        assert_eq!(scan_problem(&root, id).await, None);
+    }
+}
+
+#[tokio::test]
 async fn backfill_continues_past_a_row_whose_write_fails() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("store");
     let ing = Ingestor::open(config(&root)).await.unwrap();
     let ids = ingest_slices(&ing, &d.path().join("src"), 3).await;
     unscan_all(&root).await;
-    // Writing the scan of the first row fails, as SQLITE_TOOBIG would.
+    // Writing the scan of the first row is refused by a constraint, as a
+    // row the index will never take (SQLITE_TOOBIG, a constraint) would be.
     exec(
         &root,
         &format!(
