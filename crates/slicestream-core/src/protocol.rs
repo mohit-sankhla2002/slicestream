@@ -31,7 +31,10 @@ pub enum ClientMessage {
     Evicted { indices: Vec<usize> },
     /// Total binary message PAYLOAD bytes received so far (flow control).
     /// Excludes the `SLS1` header, matching what the server passes to
-    /// `FlowWindow::on_sent`.
+    /// `FlowWindow::on_sent`. A progressive client sends one after every
+    /// binary message it receives (it may coalesce the acks of messages it
+    /// handles in one event-loop turn); acking less often can stall the
+    /// stream with bytes unacknowledged.
     Ack { bytes: u64 },
 }
 

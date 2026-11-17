@@ -485,6 +485,33 @@ mod tests {
         assert!(sim.sent >= 45 * 12_500_000 / 2, "sent only {}", sim.sent);
     }
 
+    /// Probing at FLOOR caps unacked bytes at 64 KiB: a 64 KiB part cannot
+    /// follow 40 KiB unacked, so a client acking only every 64 KiB would
+    /// stall here. An ack after every message drains the pipe and the part
+    /// goes out.
+    #[test]
+    fn per_message_ack_opens_the_floor_probe() {
+        let mut sim = Sim::new(12_500_000, 1);
+        sim.part = 16_384;
+        while !sim.f.probing {
+            sim.run(1, true);
+            assert!(sim.t < 15_000, "no probe started");
+        }
+        assert_eq!(sim.f.window(), FLOOR);
+        assert_eq!(sim.f.probe_cap, FLOOR / 2);
+        // Settle the messages in flight, keeping the probe on.
+        let f = &mut sim.f;
+        let at = ms(sim.t);
+        f.acked = f.sent;
+        f.sends.clear();
+        f.probe_target = None;
+        f.on_sent(40_960, at);
+        assert!(f.probing);
+        assert!(!f.can_send(65_536), "64 KiB does not fit next to 40 KiB");
+        f.on_ack(f.sent, at + ms(2));
+        assert!(f.can_send(65_536));
+    }
+
     #[test]
     fn window_stays_initial_until_two_samples() {
         let mut f = FlowWindow::new();

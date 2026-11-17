@@ -51,6 +51,10 @@ struct Harness {
 
 impl Harness {
     async fn start(mode: Htj2kMode) -> Harness {
+        Harness::start_with(mode, PREVIEW_SIZE).await
+    }
+
+    async fn start_with(mode: Htj2kMode, preview_size: u32) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let ingestor = Ingestor::open(StorageConfig {
             root: dir.path().join("store"),
@@ -74,7 +78,7 @@ impl Harness {
             dicomweb: Default::default(),
             htj2k: Htj2kConfig {
                 mode,
-                preview_size: PREVIEW_SIZE,
+                preview_size,
                 ..Htj2kConfig::default()
             },
             metrics: None,
@@ -248,8 +252,8 @@ async fn ack(ws: &mut Ws, bytes: u64) {
 }
 
 /// What a progressive client has received: it checks that parts arrive in
-/// order and acks as the protocol asks (every 64 KiB and on every completed
-/// frame) once `acking` is set.
+/// order and, once `acking` is set, acks as the protocol asks: after every
+/// binary message.
 struct Collected {
     /// Payload messages in arrival order.
     messages: Vec<(FrameHeader, Vec<u8>)>,
@@ -278,10 +282,9 @@ impl Collected {
         let msg = binary(ws).await;
         let (header, payload) = decode_frame(&msg).expect("valid frame");
         self.received += payload.len() as u64;
-        let complete = match header.part {
+        match header.part {
             None => {
                 self.frames.insert(header.index, payload.to_vec());
-                true
             }
             Some(part) => {
                 let buf = self.partial.entry(header.index).or_default();
@@ -295,18 +298,21 @@ impl Collected {
                 if part.offset + payload.len() as u64 == part.total {
                     let whole = self.partial.remove(&header.index).unwrap();
                     self.frames.insert(header.index, whole);
-                    true
-                } else {
-                    false
                 }
             }
-        };
+        }
         self.messages.push((header.clone(), payload.to_vec()));
-        if self.acking && (complete || self.received - self.acked >= PART_MAX as u64) {
+        if self.acking {
             ack(ws, self.received).await;
             self.acked = self.received;
         }
         (header, payload.len() as u64)
+    }
+
+    /// Drop what was received of slice `index` (the client evicts it).
+    fn forget(&mut self, index: usize) {
+        self.partial.remove(&index);
+        self.frames.remove(&index);
     }
 
     /// Receive until `slices` frames are complete.
@@ -607,7 +613,7 @@ async fn unknown_progressive_value_is_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn off_mode_ignores_progressive() {
+async fn off_mode_refuses_progressive() {
     let h = Harness::start(Htj2kMode::Off).await;
     h.import_phantom(1).await;
     let (status, body) = h.refused(PHANTOM_SERIES, "?progressive=htj2k").await;
@@ -624,4 +630,155 @@ async fn off_mode_ignores_progressive() {
             .part
             .is_none()
     );
+}
+
+/// A series mixing an eligible native instance and an RLE one completes
+/// with a client that acks after every message: parts and whole frames
+/// interleave without a stall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_series_completes_with_per_message_acks() {
+    let h = Harness::start(Htj2kMode::Background).await;
+    let pixels = h.import_noise().await;
+    let rle: Vec<Vec<Vec<u8>>> = (0..4u8).map(|k| vec![vec![k; 300_000]]).collect();
+    h.import(
+        "rle.dcm",
+        &encapsulated_image(&image_sop(2), &rle, true, RLE),
+    )
+    .await;
+    h.make_copies().await;
+
+    let slices = NOISE_FRAMES as usize + rle.len();
+    let (mut ws, _) = h.connect(IMAGE_SERIES, "?progressive=htj2k").await;
+    cursor(&mut ws, slices / 2).await;
+    let c = collect(&mut ws, slices).await;
+    let (mut parts, mut whole) = (0, 0);
+    for (header, payload) in &c.messages {
+        match header.part {
+            Some(_) => parts += 1,
+            None => {
+                whole += 1;
+                assert_eq!(header.info.transfer_syntax, RLE);
+                assert_eq!(payload.len(), 300_000);
+            }
+        }
+    }
+    assert_eq!(whole, rle.len());
+    assert!(parts > NOISE_FRAMES as usize);
+    let native: Vec<_> = c.frames.values().filter(|f| f.len() != 300_000).collect();
+    assert_eq!(native.len(), pixels.len());
+}
+
+/// A preview larger than 64 KiB goes out in several parts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_preview_is_split_into_parts() {
+    let h = Harness::start_with(Htj2kMode::Background, 256).await;
+    h.import_noise_sized(2, 512).await;
+    h.make_copies().await;
+    let copy = h.copy_codestream(IMAGE_SERIES, 1).await;
+
+    let (mut ws, _) = h.connect(IMAGE_SERIES, "?progressive=htj2k").await;
+    cursor(&mut ws, 1).await;
+    let c = collect(&mut ws, 2).await;
+    assert!(c.messages.iter().all(|(_, p)| p.len() <= PART_MAX));
+    // 512 x 512 has 3 levels; the 256 px preview ends with level 2.
+    let level = preview_level(512, 512, 256) as u32;
+    assert_eq!(level, 2);
+    let preview: Vec<_> = c
+        .messages
+        .iter()
+        .take_while(|(h, _)| h.index == 1 && h.part.unwrap().level <= level)
+        .collect();
+    let preview_len: usize = preview.iter().map(|(_, p)| p.len()).sum();
+    assert!(preview_len > PART_MAX, "preview of {preview_len} bytes");
+    assert!(
+        preview.len() >= 2,
+        "the preview came in {} part(s)",
+        preview.len()
+    );
+    assert_eq!(preview.last().unwrap().0.part.unwrap().level, level);
+    assert!(c.frames[&1] == copy);
+}
+
+/// `evicted` while a slice's final is under way: the slice starts over with
+/// its preview at offset 0 and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evicted_mid_final_starts_over() {
+    let h = Harness::start(Htj2kMode::Background).await;
+    h.import_noise_sized(2, 512).await;
+    h.make_copies().await;
+
+    let (mut ws, _) = h.connect(IMAGE_SERIES, "?progressive=htj2k").await;
+    cursor(&mut ws, 0).await;
+    let mut c = Collected::new();
+    c.acking = false;
+    // Preview and the first final part of slice 0, unacknowledged.
+    while c.received < PART_MAX as u64 {
+        let (header, _) = c.receive(&mut ws).await;
+        assert_eq!(header.index, 0);
+    }
+    assert!(c.partial.contains_key(&0), "slice 0 is mid-final");
+    send(
+        &mut ws,
+        serde_json::json!({"type": "evicted", "indices": [0]}),
+    )
+    .await;
+    cursor(&mut ws, 0).await;
+    ack(&mut ws, c.received).await;
+    c.acking = true;
+    c.forget(0);
+    // Parts of slice 0 sent before the eviction was applied still arrive;
+    // then slice 0 starts over at offset 0.
+    loop {
+        let msg = binary(&mut ws).await;
+        let (header, payload) = decode_frame(&msg).unwrap();
+        c.received += payload.len() as u64;
+        ack(&mut ws, c.received).await;
+        assert_eq!(header.index, 0);
+        if header.part.unwrap().offset == 0 {
+            c.partial.insert(0, payload.to_vec());
+            break;
+        }
+    }
+    c.until_complete(&mut ws, 2).await;
+    for i in 0..2 {
+        assert!(
+            c.frames[&i] == h.copy_codestream(IMAGE_SERIES, i).await,
+            "slice {i}"
+        );
+    }
+}
+
+/// A copy file that cannot be read is encoded again: the stream goes on
+/// with the same bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_copy_is_encoded_again() {
+    let h = Harness::start(Htj2kMode::Background).await;
+    let pixels = h.import_noise().await;
+    h.make_copies().await;
+    let mut copies = Vec::new();
+    for frame in 0..NOISE_FRAMES as usize {
+        copies.push(h.copy_codestream(IMAGE_SERIES, frame).await);
+    }
+    let rows = h
+        .ingestor
+        .index()
+        .series_slices(IMAGE_SERIES)
+        .await
+        .unwrap();
+    let (_, path) = h
+        .ingestor
+        .copy_frames(rows[0].id, &rows[0].blob)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+
+    let (mut ws, _) = h.connect(IMAGE_SERIES, "?progressive=htj2k").await;
+    cursor(&mut ws, 0).await;
+    let c = collect(&mut ws, NOISE_FRAMES as usize).await;
+    assert!(c.messages.iter().all(|(h, _)| h.part.is_some()));
+    for (index, codestream) in &c.frames {
+        assert!(*codestream == copies[*index], "slice {index}");
+    }
+    assert_eq!(c.frames.len(), pixels.len());
 }
