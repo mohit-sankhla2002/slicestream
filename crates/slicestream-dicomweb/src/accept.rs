@@ -7,6 +7,11 @@ const DICOM: &str = "application/dicom";
 const DICOM_JSON: &str = "application/dicom+json";
 const BE_EXPLICIT: &str = "1.2.840.10008.1.2.2";
 const LE_EXPLICIT: &str = "1.2.840.10008.1.2.1";
+const JPHC: &str = "image/jphc";
+/// HTJ2K Lossless RPCL: the transfer syntax of HTJ2K copies.
+const HTJ2K_RPCL: &str = "1.2.840.10008.1.2.4.202";
+/// HTJ2K Lossless Only, which an RPCL codestream also satisfies.
+const HTJ2K_LOSSLESS: &str = "1.2.840.10008.1.2.4.201";
 
 /// One entry of an `Accept` header.
 #[derive(Debug, Clone, PartialEq)]
@@ -205,6 +210,12 @@ pub struct FrameSource<'a> {
     pub transfer_syntax: &'a str,
     pub encapsulated: bool,
     pub bits_allocated: u16,
+    /// An HTJ2K copy (`1.2.840.10008.1.2.4.202`) can be served: the frames
+    /// are eligible and copies are not turned off.
+    pub copy_possible: bool,
+    /// `transfer-syntax=*`, `*/*` and no `Accept` select the copy
+    /// (`[htj2k] prefer_for_wildcard`).
+    pub prefer_copy_for_wildcard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +225,8 @@ pub struct PartPlan {
     pub part_content_type: String,
     /// Swap each 16- or 32-bit word (big-endian source, little-endian wanted).
     pub byte_swap: bool,
+    /// Serve the HTJ2K copy instead of the stored frames.
+    pub use_copy: bool,
 }
 
 /// Negotiates frames and Pixel Data bulk. `part_count` is the number of parts
@@ -237,11 +250,22 @@ pub fn negotiate_frames(
             continue;
         }
         let ts = r.transfer_syntax.as_deref();
+        if src.copy_possible
+            && let Some(copy_media) = copy_media(r, media, ts, src.prefer_copy_for_wildcard)
+        {
+            return Ok(PartPlan {
+                single_part: single,
+                part_content_type: format!("{copy_media}; transfer-syntax={HTJ2K_RPCL}"),
+                byte_swap: false,
+                use_copy: true,
+            });
+        }
         let ts_ok = ts.is_none_or(|t| t == "*" || t == stored);
         let plan = |content_type: String, byte_swap: bool| PartPlan {
             single_part: single,
             part_content_type: content_type,
             byte_swap,
+            use_copy: false,
         };
         let as_stored = |media: &str| plan(format!("{media}; transfer-syntax={stored}"), false);
         let found = match media {
@@ -271,6 +295,33 @@ pub fn negotiate_frames(
     )))
 }
 
+/// The part media type when range `r` (requesting `media` in transfer
+/// syntax `ts`) selects the HTJ2K copy; `None` when it does not.
+/// `image/jphc` with no syntax, `*`, `.201` or `.202`, and
+/// `application/octet-stream` with `.202`, always select it; wildcards
+/// only when `prefer_wildcard`.
+fn copy_media(
+    r: &MediaRange,
+    media: &str,
+    ts: Option<&str>,
+    prefer_wildcard: bool,
+) -> Option<&'static str> {
+    let wildcard_ts = ts.is_none_or(|t| t == "*");
+    match media {
+        JPHC if matches!(ts, None | Some("*" | HTJ2K_RPCL | HTJ2K_LOSSLESS)) => Some(JPHC),
+        OCTET if ts == Some(HTJ2K_RPCL) => Some(OCTET),
+        OCTET if ts == Some("*") && prefer_wildcard => Some(OCTET),
+        "*/*" if ts == Some(HTJ2K_RPCL) || (wildcard_ts && prefer_wildcard) => {
+            Some(if r.essence == "application/*" {
+                OCTET
+            } else {
+                JPHC
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,8 +336,21 @@ mod tests {
             transfer_syntax: ts,
             encapsulated: enc,
             bits_allocated: bits,
+            copy_possible: false,
+            prefer_copy_for_wildcard: false,
         }
     }
+
+    /// Native little-endian 16-bit frames with a copy available.
+    fn copyable(prefer: bool) -> FrameSource<'static> {
+        FrameSource {
+            copy_possible: true,
+            prefer_copy_for_wildcard: prefer,
+            ..src(LE, false, 16)
+        }
+    }
+
+    const RPCL: &str = "1.2.840.10008.1.2.4.202";
 
     fn frames(h: &str, s: &FrameSource, n: usize) -> Result<PartPlan, NotAcceptable> {
         negotiate_frames(&parse_accept(Some(h)), s, n)
@@ -512,6 +576,120 @@ mod tests {
         )
         .unwrap();
         assert!(!p.single_part);
+    }
+
+    #[test]
+    fn jphc_selects_copy() {
+        let want = format!("image/jphc; transfer-syntax={RPCL}");
+        for h in [
+            "multipart/related; type=\"image/jphc\"".to_owned(),
+            format!("multipart/related; type=image/jphc; transfer-syntax={RPCL}"),
+            "multipart/related; type=image/jphc; transfer-syntax=1.2.840.10008.1.2.4.201"
+                .to_owned(),
+            "multipart/related; type=image/jphc; transfer-syntax=*".to_owned(),
+        ] {
+            let p = frames(&h, &copyable(false), 3).unwrap();
+            assert!(p.use_copy && !p.single_part && !p.byte_swap, "{h}");
+            assert_eq!(p.part_content_type, want, "{h}");
+        }
+        let p = frames("image/jphc", &copyable(false), 1).unwrap();
+        assert!(p.use_copy && p.single_part);
+        assert_eq!(p.part_content_type, want);
+        // Another HTJ2K syntax is not what the copy holds.
+        let h = "multipart/related; type=image/jphc; transfer-syntax=1.2.840.10008.1.2.4.203";
+        assert!(frames(h, &copyable(false), 1).is_err());
+        // A preferred range that cannot be served gives way to the next.
+        let h = "multipart/related; type=image/jpeg, multipart/related; type=image/jphc;q=0.5";
+        assert!(frames(h, &copyable(false), 1).unwrap().use_copy);
+    }
+
+    #[test]
+    fn octet_202_selects_copy() {
+        let h =
+            format!("multipart/related; type=\"application/octet-stream\"; transfer-syntax={RPCL}");
+        let p = frames(&h, &copyable(false), 2).unwrap();
+        assert!(p.use_copy && !p.single_part);
+        assert_eq!(
+            p.part_content_type,
+            format!("{OCTET}; transfer-syntax={RPCL}")
+        );
+        let h = format!("application/octet-stream; transfer-syntax={RPCL}");
+        let p = frames(&h, &copyable(false), 1).unwrap();
+        assert!(p.use_copy && p.single_part);
+        // Without a copy, as today: the stored syntax must match.
+        assert!(frames(&h, &src(LE, false, 16), 1).is_err());
+        // Plain octet-stream stays native little-endian.
+        let p = frames(DWC, &copyable(true), 1).unwrap();
+        assert!(!p.use_copy);
+        assert_eq!(
+            p.part_content_type,
+            format!("{OCTET}; transfer-syntax={LE}")
+        );
+    }
+
+    #[test]
+    fn wildcard_keeps_stored_by_default() {
+        for h in [OHIF, OHIF_Q, "*/*", BROWSER] {
+            let p = frames(h, &copyable(false), 1).unwrap();
+            assert!(!p.use_copy, "{h}");
+            assert_eq!(
+                p.part_content_type,
+                format!("{OCTET}; transfer-syntax={LE}"),
+                "{h}"
+            );
+        }
+        let p = negotiate_frames(&parse_accept(None), &copyable(false), 1).unwrap();
+        assert!(!p.use_copy);
+    }
+
+    #[test]
+    fn wildcard_prefers_copy_when_configured() {
+        for h in [OHIF, OHIF_Q] {
+            let p = frames(h, &copyable(true), 2).unwrap();
+            assert!(p.use_copy, "{h}");
+            assert_eq!(
+                p.part_content_type,
+                format!("{OCTET}; transfer-syntax={RPCL}")
+            );
+        }
+        for p in [
+            frames("*/*", &copyable(true), 2).unwrap(),
+            negotiate_frames(&parse_accept(None), &copyable(true), 2).unwrap(),
+            frames("image/*", &copyable(true), 2).unwrap(),
+        ] {
+            assert!(p.use_copy);
+            assert_eq!(
+                p.part_content_type,
+                format!("image/jphc; transfer-syntax={RPCL}")
+            );
+        }
+        // Not possible: as stored.
+        let p = frames(OHIF, &src(LE, false, 16), 1).unwrap();
+        assert!(!p.use_copy);
+        // A specific stored syntax is still served as stored.
+        let h =
+            format!("multipart/related; type=\"application/octet-stream\"; transfer-syntax={LE}");
+        assert!(!frames(&h, &copyable(true), 1).unwrap().use_copy);
+    }
+
+    #[test]
+    fn jphc_without_copy_is_406() {
+        // RGB or off: no copy.
+        assert!(frames("multipart/related; type=image/jphc", &src(LE, false, 8), 1).is_err());
+        let h =
+            format!("multipart/related; type=\"application/octet-stream\"; transfer-syntax={RPCL}");
+        assert!(frames(&h, &src(LE, false, 8), 1).is_err());
+    }
+
+    #[test]
+    fn stored_htj2k_as_stored() {
+        let stored = src(RPCL, true, 16);
+        let p = frames("multipart/related; type=image/jphc", &stored, 1).unwrap();
+        assert!(!p.use_copy);
+        assert_eq!(
+            p.part_content_type,
+            format!("image/jphc; transfer-syntax={RPCL}")
+        );
     }
 
     #[test]
