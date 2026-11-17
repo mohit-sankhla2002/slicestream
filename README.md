@@ -312,12 +312,18 @@ retrieve configuration OHIF gives Cornerstone for stack viewports.
 `minChunkSize` defaults to 128 KiB, which is most of a lossless CT frame,
 so without it no preview would show. This was checked with the
 `ohif/app:v3.13.14` image (Cornerstone 5.6.8) through a simulated 10 Mbit/s,
-80 ms link: the frames came back as `image/jphc`, a preview was drawn
-before the full image, the final pixels in Cornerstone's cache equalled the
-stored ones, there were no console errors, and the phantom's first image
-was drawn about 0.27 s after its frame was requested, against about 0.55 s
-with the entry above (see `scripts/bench-slowlink.sh` for the stream's
-numbers).
+80 ms link: the frames came back as `image/jphc`, the final pixels in
+Cornerstone's cache equalled the stored ones, and there were no console
+errors. On a real CT series a preview was drawn before the full image every
+time; the phantom's frames are so small (about 25 KB) that they sometimes
+arrive whole before a preview is drawn. The phantom's first image was drawn
+about 0.27 s after its frame was requested, against about 0.55 s with the
+M1 entry (the one in "Use with OHIF" above). The stream's numbers are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (M4).
+
+The other keys are those of the M1 entry. Its
+`omitQuotationForMultipartRequest: false` and `singlepart` variants were
+not tested with this entry.
 
 Byte ranges instead of streaming also work, with one catch. Cornerstone
 5.6.8 sends range requests with a fixed

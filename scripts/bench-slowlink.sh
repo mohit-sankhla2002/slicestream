@@ -34,6 +34,17 @@ done
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER="$ROOT_DIR/target/release/slicestream-server"
 BASE="http://127.0.0.1:$HTTP_PORT"
+
+# Something already listening would answer in place of the server or the
+# proxy, and the numbers would be for the wrong endpoint.
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+for port in "$HTTP_PORT" "$PROXY_PORT"; do
+  if port_in_use "$port"; then
+    echo "error: port $port is in use; stop what listens there or set HTTP_PORT / PROXY_PORT" >&2
+    exit 2
+  fi
+done
+
 cd "$ROOT_DIR"
 cargo build -q --release -p slicestream-server
 
@@ -47,6 +58,18 @@ cleanup() {
   rm -rf "$TMP"
 }
 trap cleanup EXIT
+
+# Print an error with the end of the logs, then exit (cleanup runs on EXIT).
+fail() {
+  echo "error: $1" >&2
+  for log in import.log server.log proxy.log; do
+    if [ -s "$TMP/$log" ]; then
+      echo "--- last lines of $log:" >&2
+      tail -n 20 "$TMP/$log" >&2
+    fi
+  done
+  exit 1
+}
 
 cat > "$TMP/slicestream.toml" <<CFG
 [storage]
@@ -65,17 +88,22 @@ mode = "background"
 CFG
 
 echo "== import $SERIES_DIR"
-"$SERVER" --config "$TMP/slicestream.toml" import "$SERIES_DIR" 2>"$TMP/import.log" | tee "$TMP/import.out" | sed 's/^/   /'
+if ! NO_COLOR=1 "$SERVER" --config "$TMP/slicestream.toml" import "$SERIES_DIR" 2>"$TMP/import.log" \
+  | tee "$TMP/import.out" | sed 's/^/   /'; then
+  fail "import failed"
+fi
 STORED="$(awk '$1 == "stored" { print $2 }' "$TMP/import.out")"
-[ -n "$STORED" ] && [ "$STORED" -gt 0 ] || { echo "error: nothing was stored" >&2; exit 1; }
+[ -n "$STORED" ] && [ "$STORED" -gt 0 ] || fail "nothing was stored"
 
 NO_COLOR=1 "$SERVER" --config "$TMP/slicestream.toml" serve >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
+ready=""
 for _ in $(seq 1 100); do
-  if curl -sf "$BASE/api/series" >/dev/null 2>&1; then break; fi
-  kill -0 "$SERVER_PID" 2>/dev/null || { cat "$TMP/server.log" >&2; exit 1; }
+  if curl -sf "$BASE/api/series" >/dev/null 2>&1; then ready=1; break; fi
+  kill -0 "$SERVER_PID" 2>/dev/null || fail "the server exited"
   sleep 0.1
 done
+[ -n "$ready" ] || fail "the server did not answer on port $HTTP_PORT within 10 s"
 
 # The copy worker logs its running total after every batch that wrote rows
 # (one row per instance, also for one that cannot have a copy).
@@ -83,8 +111,8 @@ echo "== waiting for the copy worker ($STORED instances)"
 t0=$SECONDS
 copied=0
 while [ "$copied" -lt "$STORED" ]; do
-  [ $((SECONDS - t0)) -lt 1800 ] || { echo "error: copies not done after 30 min" >&2; exit 1; }
-  kill -0 "$SERVER_PID" 2>/dev/null || { cat "$TMP/server.log" >&2; exit 1; }
+  [ $((SECONDS - t0)) -lt 1800 ] || fail "copies not done after 30 min ($copied of $STORED)"
+  kill -0 "$SERVER_PID" 2>/dev/null || fail "the server exited"
   sleep 0.5
   copied="$(sed -n 's/.*HTJ2K copy progress copied=\([0-9]*\).*/\1/p' "$TMP/server.log" | tail -1)"
   copied="${copied:-0}"
@@ -96,20 +124,24 @@ SERIES_UID="$(curl -sf "$BASE/api/series" | node -e '
     const list = JSON.parse(s);
     if (list.length !== 1) { console.error(`expected one series, found ${list.length}`); process.exit(1); }
     console.log(list[0].uid);
-  });')"
+  });')" || fail "cannot list the series"
 
 node scripts/slowlink-proxy.mjs --listen "$PROXY_PORT" --target "127.0.0.1:$HTTP_PORT" \
   --mbit "$MBIT" --rtt-ms "$RTT_MS" --buffer "$BUFFER" 2>"$TMP/proxy.log" &
 PROXY_PID=$!
+ready=""
 for _ in $(seq 1 50); do
-  if curl -sf "http://127.0.0.1:$PROXY_PORT/api/series" >/dev/null 2>&1; then break; fi
+  kill -0 "$PROXY_PID" 2>/dev/null || fail "the proxy exited"
+  if curl -sf "http://127.0.0.1:$PROXY_PORT/api/series" >/dev/null 2>&1; then ready=1; break; fi
   sleep 0.1
 done
+[ -n "$ready" ] || fail "the proxy did not answer on port $PROXY_PORT within 5 s"
 
 URL="ws://127.0.0.1:$PROXY_PORT/api/series/$SERIES_UID/stream"
 echo "== streaming $STORED slices at $MBIT Mbit/s, $RTT_MS ms RTT, proxy buffer $BUFFER B; jump $JUMP"
-PLAIN="$(node scripts/slowlink-client.mjs "$URL" --jump "$JUMP")"
-PROG="$(node scripts/slowlink-client.mjs "$URL" --progressive --jump "$JUMP")"
+PLAIN="$(node scripts/slowlink-client.mjs "$URL" --jump "$JUMP")" || fail "the plain stream run failed"
+PROG="$(node scripts/slowlink-client.mjs "$URL" --progressive --jump "$JUMP")" ||
+  fail "the progressive stream run failed"
 
 node -e '
   const plain = JSON.parse(process.argv[1]);

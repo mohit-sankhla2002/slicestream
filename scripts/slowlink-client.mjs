@@ -16,6 +16,8 @@
 // resolution) or the first whole frame. `--jump i@t` sends `cursor` for slice
 // i at t ms; `jumpPreviewMs` is the time from that message until slice i has
 // a preview (or is whole). All lossless means every slice is complete.
+// `--preview-size` must match the server's `[htj2k] preview_size` (default
+// 256), or the client counts a different resolution as the preview.
 
 function usage(msg) {
   console.error(`error: ${msg}`);

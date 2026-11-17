@@ -118,7 +118,8 @@ at 1 s, its first image after 4,665 ms as stored, 197 ms progressive. The
 phantom compresses about 20:1 losslessly, real CT about 3:1, so on real CT
 the lossless total shrinks less. In OHIF on the same link, the "slow links"
 entry drew the phantom's first image about 0.27 s after its frame request
-(a preview, then the full image) against about 0.55 s with the M1 entry.
+against about 0.55 s with the M1 entry (a preview first when one is drawn:
+small phantom frames sometimes arrive whole before it is).
 
 The encoder is `openjph-core` 0.1.0, a pure Rust port of OpenJPH. It is
 vendored in `vendor/openjph-core` and wired in with `[patch.crates-io]`. Two

@@ -479,6 +479,8 @@ async fn copy_worker(
             Ok(0) => idle,
             Ok(n) => {
                 copied += n;
+                // scripts/bench-slowlink.sh waits for this message and its
+                // `copied` field; keep them in step with the script.
                 tracing::info!(copied, "HTJ2K copy progress");
                 continue;
             }
