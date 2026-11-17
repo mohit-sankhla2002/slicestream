@@ -30,6 +30,7 @@ pub mod dicomweb;
 pub mod hosts;
 pub mod linking;
 pub mod metrics;
+mod progressive;
 pub mod routes;
 pub mod stow;
 pub mod stream;
@@ -384,16 +385,27 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
     })
 }
 
+/// Unsent bytes the kernel queues per socket before a write waits
+/// (`TCP_NOTSENT_LOWAT`), so a re-planned stream is not stuck behind a deep
+/// socket buffer on a direct connection.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NOTSENT_LOWAT: u32 = 131_072;
+
 /// Set `TCP_NODELAY` on every accepted HTTP connection. Without it, a small
 /// write that follows another one (the stream's first `series` message after
 /// the 101 response) waits for the client's delayed ACK, about 40 ms on
-/// Linux.
+/// Linux. Where `socket2` offers it (Linux, Android), also set
+/// `TCP_NOTSENT_LOWAT`.
 fn no_delay(
     listener: tokio::net::TcpListener,
 ) -> axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)> {
     listener.tap_io(|tcp| {
         if let Err(e) = tcp.set_nodelay(true) {
             tracing::debug!("cannot set TCP_NODELAY: {e}");
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Err(e) = socket2::SockRef::from(&*tcp).set_tcp_notsent_lowat(NOTSENT_LOWAT) {
+            tracing::debug!("cannot set TCP_NOTSENT_LOWAT: {e}");
         }
     })
 }
@@ -559,6 +571,11 @@ mod tests {
         assert!(
             io.nodelay().unwrap(),
             "TCP_NODELAY is off on an accepted connection"
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            socket2::SockRef::from(&io).tcp_notsent_lowat().unwrap(),
+            NOTSENT_LOWAT
         );
         client.await.unwrap().unwrap();
     }

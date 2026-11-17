@@ -18,6 +18,7 @@ rar = ["slicestream-archive/rar"]
 
 [dependencies]
 slicestream-archive = { path = "../slicestream-archive", version = "0.1.0", default-features = false }
+slicestream-codec = { path = "../slicestream-codec", version = "0.1.0" }
 slicestream-core = { path = "../slicestream-core", version = "0.1.0" }
 slicestream-dicomweb = { path = "../slicestream-dicomweb", version = "0.1.0" }
 dicom-core = "0.10.1"
@@ -43,6 +44,10 @@ rand = "0.9"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 fs4 = "1.1.0"
 slicestream-dimse = { version = "0.1.0", path = "../slicestream-dimse" }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# `TCP_NOTSENT_LOWAT` on accepted sockets (safe API only).
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
 dicom-dictionary-std = "0.10.1"
