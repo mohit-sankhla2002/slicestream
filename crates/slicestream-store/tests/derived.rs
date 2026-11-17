@@ -343,7 +343,7 @@ fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
 async fn worker_makes_copies_that_decode_to_originals() {
     let d = tempfile::tempdir().unwrap();
     let (ing, ids, idx) = open(d.path(), DuplicatePolicy::Keep).await;
-    assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 3);
+    assert_eq!(ing.copy_batch(10, 2, || false).await.unwrap(), 3);
     assert!(idx.copy_candidates(10).await.unwrap().is_empty());
     for id in ids {
         let pairs = originals_and_copies(&ing, id).await;
@@ -352,7 +352,21 @@ async fn worker_makes_copies_that_decode_to_originals() {
             assert_eq!(original, decoded);
         }
     }
-    assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 0);
+    assert_eq!(ing.copy_batch(10, 2, || false).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn copy_batch_stops_between_groups() {
+    let d = tempfile::tempdir().unwrap();
+    let (ing, _ids, idx) = open(d.path(), DuplicatePolicy::Keep).await;
+    // Asked before each group of one instance: the first passes, the rest stop.
+    let asked = std::cell::Cell::new(0);
+    let stop = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+    assert_eq!(ing.copy_batch(10, 1, stop).await.unwrap(), 1);
+    assert_eq!(idx.copy_candidates(10).await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -364,7 +378,7 @@ async fn ineligible_instance_recorded_with_reason() {
     ing.import_file(&support::rgb_instance(&d.path().join("src")))
         .await
         .unwrap();
-    assert_eq!(ing.copy_batch(10, 1).await.unwrap(), 1);
+    assert_eq!(ing.copy_batch(10, 1, || false).await.unwrap(), 1);
     let id = ing.index().copy_candidates(10).await.unwrap();
     assert!(id.is_empty(), "not retried");
     let pool = index_pool(&ing.config().root).await;
@@ -387,7 +401,7 @@ async fn transient_errors_leave_no_row() {
         .execute(&pool)
         .await
         .unwrap();
-    assert!(ing.copy_batch(10, 2).await.is_err());
+    assert!(ing.copy_batch(10, 2, || false).await.is_err());
     assert!(ing.make_copy(ids[0]).await.is_err());
     assert_eq!(copy_blobs(&ing.config().root), 0);
     sqlx::query("ALTER TABLE derived_away RENAME TO derived_htj2k")
@@ -395,7 +409,7 @@ async fn transient_errors_leave_no_row() {
         .await
         .unwrap();
     assert_eq!(copy_rows(&ing).await, 0);
-    assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 3);
+    assert_eq!(ing.copy_batch(10, 2, || false).await.unwrap(), 3);
     assert_eq!(copy_rows(&ing).await, 3);
     assert!(idx.copy_candidates(10).await.unwrap().is_empty());
 }
@@ -409,12 +423,12 @@ async fn prioritized_instance_goes_first() {
     let ids = ingest_slices(&ing, &d.path().join("src"), 5).await;
     ing.prioritize_copy(ids[0]);
     ing.prioritize_copy(ids[0]);
-    assert_eq!(ing.copy_batch(1, 1).await.unwrap(), 1);
+    assert_eq!(ing.copy_batch(1, 1, || false).await.unwrap(), 1);
     let source = source_of(&ing, ids[0]).await;
     assert!(ing.copy_frames(ids[0], &source).await.unwrap().is_some());
     assert_eq!(copy_rows(&ing).await, 1);
     // Queued once only: the next batch takes the newest.
-    assert_eq!(ing.copy_batch(1, 1).await.unwrap(), 1);
+    assert_eq!(ing.copy_batch(1, 1, || false).await.unwrap(), 1);
     let source = source_of(&ing, ids[4]).await;
     assert!(ing.copy_frames(ids[4], &source).await.unwrap().is_some());
 }
@@ -434,7 +448,7 @@ async fn transient_encode_stores_nothing() {
     assert!(ing.encode_transient(ids[0], &[2]).await.is_err());
     assert!(ing.encode_transient(ids[0], &[0]).await.is_err());
     // Prioritized: the first batch of one makes it, not the newest.
-    assert_eq!(ing.copy_batch(1, 1).await.unwrap(), 1);
+    assert_eq!(ing.copy_batch(1, 1, || false).await.unwrap(), 1);
     let source = source_of(&ing, ids[0]).await;
     assert!(ing.copy_frames(ids[0], &source).await.unwrap().is_some());
 }
@@ -479,7 +493,7 @@ async fn multi_frame_copy_offsets() {
     ing.import_file(&support::native_multiframe(&d.path().join("src"), 4))
         .await
         .unwrap();
-    assert_eq!(ing.copy_batch(10, 1).await.unwrap(), 1);
+    assert_eq!(ing.copy_batch(10, 1, || false).await.unwrap(), 1);
     let id = sqlx::query_scalar::<_, i64>("SELECT id FROM instances")
         .fetch_one(&index_pool(&ing.config().root).await)
         .await

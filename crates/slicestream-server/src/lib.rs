@@ -351,23 +351,28 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
             }
             drop(jobs);
         }
-        // Let the sampler and the backfill release the storage lock before
-        // reporting stopped. The backfill stops after its current batch.
+        // Let the sampler, the backfill and the copy worker release the
+        // storage lock before reporting stopped. The workers stop after
+        // their current batch or group; both are joined under one grace.
         if let Some(h) = sampler {
             let _ = h.await;
         }
-        if tokio::time::timeout(HTTP_SHUTDOWN_GRACE, backfill)
+        let workers = async {
+            let (backfill, copier) = tokio::join!(backfill, async {
+                match copier {
+                    Some(c) => c.await.map(Some),
+                    None => Ok(None),
+                }
+            });
+            drop((backfill, copier));
+        };
+        if tokio::time::timeout(HTTP_SHUTDOWN_GRACE, workers)
             .await
             .is_err()
         {
-            tracing::warn!("metadata backfill still running after the grace period");
-        }
-        if let Some(copier) = copier
-            && tokio::time::timeout(HTTP_SHUTDOWN_GRACE, copier)
-                .await
-                .is_err()
-        {
-            tracing::warn!("HTJ2K copy worker still running after the grace period");
+            tracing::warn!(
+                "metadata backfill or HTJ2K copy worker still running after the grace period"
+            );
         }
         http_result.and(dimse_result)
     });
@@ -440,7 +445,8 @@ const COPY_IDLE: Duration = Duration::from_secs(10);
 
 /// Make HTJ2K copies in batches until shutdown, `parallel` instances at a
 /// time. A batch that wrote nothing waits `idle` (new instances may have
-/// arrived); a failed batch waits `retry`. Stops after its current batch.
+/// arrived); a failed batch waits `retry`. Shutdown ends a batch after the
+/// group of instances in flight.
 async fn copy_worker(
     ingestor: Arc<Ingestor>,
     shutdown: CancellationToken,
@@ -450,7 +456,10 @@ async fn copy_worker(
 ) {
     let mut copied = 0;
     while !shutdown.is_cancelled() {
-        let wait = match ingestor.copy_batch(COPY_BATCH, parallel).await {
+        let wait = match ingestor
+            .copy_batch(COPY_BATCH, parallel, || shutdown.is_cancelled())
+            .await
+        {
             Ok(0) => idle,
             Ok(n) => {
                 copied += n;
@@ -552,6 +561,34 @@ mod tests {
             "TCP_NODELAY is off on an accepted connection"
         );
         client.await.unwrap().unwrap();
+    }
+
+    /// Shutdown mid-batch stops the worker promptly and releases the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_stops_mid_batch_and_releases_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = unscanned_store(dir.path(), 8).await;
+        ingestor.backfill_batch(10).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(copy_worker(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            1,
+        ));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the worker stops promptly")
+            .unwrap();
+        drop(ingestor);
+        Ingestor::open(slicestream_store::StorageConfig {
+            root: dir.path().join("store"),
+            ..Default::default()
+        })
+        .await
+        .expect("the storage lock is released");
     }
 
     /// The worker copies every eligible phantom instance.

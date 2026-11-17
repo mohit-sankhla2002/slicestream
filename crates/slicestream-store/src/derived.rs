@@ -316,8 +316,16 @@ impl Ingestor {
     /// many rows were written. A row that fails on the database's side
     /// is logged and left for a later batch; `Err` when the candidates
     /// cannot be listed, or when every instance of the batch failed that
-    /// way, so the caller can wait before trying again.
-    pub async fn copy_batch(&self, limit: i64, parallel: usize) -> Result<usize, IngestError> {
+    /// way, so the caller can wait before trying again. `stop` is asked
+    /// before each group of `parallel` instances; once it returns `true`
+    /// the batch ends after the group in flight, whose tasks are all
+    /// awaited, so none outlives the call.
+    pub async fn copy_batch(
+        &self,
+        limit: i64,
+        parallel: usize,
+        stop: impl Fn() -> bool,
+    ) -> Result<usize, IngestError> {
         let wanted = usize::try_from(limit).unwrap_or(0);
         let mut ids: Vec<i64> = {
             let mut queue = self.shared.copy_queue.lock().unwrap();
@@ -343,6 +351,9 @@ impl Ingestor {
         }
         let mut recorded = 0;
         for chunk in ids.chunks(parallel.max(1)) {
+            if stop() {
+                break;
+            }
             let tasks: Vec<_> = chunk
                 .iter()
                 .map(|id| (*id, tokio::spawn(Arc::clone(&self.shared).make_copy(*id))))
@@ -497,7 +508,7 @@ mod tests {
             .unwrap()
             .push(ids[1]);
 
-        assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 3);
+        assert_eq!(ing.copy_batch(10, 2, || false).await.unwrap(), 3);
         let index = ing.index();
         let state = |id: i64| async move {
             let (_, source) = index.instance_blob(id).await.unwrap().unwrap();

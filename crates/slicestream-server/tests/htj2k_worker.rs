@@ -34,20 +34,15 @@ async fn populated(n: usize) -> tempfile::TempDir {
     dir
 }
 
-/// Run a server in `mode` for `run`, then count the instances with a copy.
-async fn copies_after(mode: Htj2kMode, run: Duration) -> (usize, usize) {
-    let dir = populated(2).await;
-    let srv = TestServer::start_in(dir, |c| c.htj2k.mode = mode).await;
-    tokio::time::sleep(run).await;
-    let dir = srv.stop_keep_dir().await;
+/// Instances of the store at `dir` that have a copy, and the total.
+async fn copy_counts(dir: &std::path::Path) -> (usize, usize) {
     let ingestor = Ingestor::open(StorageConfig {
-        root: dir.path().join("store"),
+        root: dir.join("store"),
         ..Default::default()
     })
     .await
     .unwrap();
-    let mut with_copy = 0;
-    let mut total = 0;
+    let (mut with_copy, mut total) = (0, 0);
     for s in ingestor.index().list_series().await.unwrap() {
         for r in ingestor
             .index()
@@ -62,16 +57,39 @@ async fn copies_after(mode: Htj2kMode, run: Duration) -> (usize, usize) {
     (with_copy, total)
 }
 
+/// Rows of `derived_htj2k`, read next to the running server.
+async fn copy_rows(dir: &std::path::Path) -> i64 {
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}?mode=ro",
+        dir.join("store").join("index.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    let n = sqlx::query_scalar("SELECT count(*) FROM derived_htj2k")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+    pool.close().await;
+    n
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn worker_makes_copies_in_background() {
-    let (copies, total) = copies_after(Htj2kMode::Background, Duration::from_secs(3)).await;
-    assert_eq!(total, 2);
-    assert_eq!(copies, 2);
+async fn server_makes_copies_in_background() {
+    let srv = TestServer::start_in(populated(2).await, |_| {}).await;
+    let root = srv.root().parent().unwrap().to_path_buf();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while copy_rows(&root).await < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "no copies in 15 s");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let dir = srv.stop_keep_dir().await;
+    assert_eq!(copy_counts(dir.path()).await, (2, 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn off_mode_makes_no_copies() {
-    let (copies, total) = copies_after(Htj2kMode::Off, Duration::from_secs(2)).await;
-    assert_eq!(total, 2);
-    assert_eq!(copies, 0);
+    let srv = TestServer::start_in(populated(2).await, |c| c.htj2k.mode = Htj2kMode::Off).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let dir = srv.stop_keep_dir().await;
+    assert_eq!(copy_counts(dir.path()).await, (0, 2));
 }
