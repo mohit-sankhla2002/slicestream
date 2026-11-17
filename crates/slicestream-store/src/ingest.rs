@@ -49,7 +49,7 @@ const SCAN_NOT_RECORDED: &str = "the scan could not be recorded";
 /// it again would fail the same way. Anything else (a full disk, a busy or
 /// locked database, an I/O error, a closed pool) can pass, so the row is
 /// left unscanned for a later batch instead of being recorded as a problem.
-fn rejects_row(e: &sqlx::Error) -> bool {
+pub(crate) fn rejects_row(e: &sqlx::Error) -> bool {
     match e {
         sqlx::Error::Encode(_) => true,
         sqlx::Error::Database(db) => {
@@ -333,7 +333,7 @@ struct ScanTask {
 #[derive(Debug)]
 pub struct Ingestor {
     cfg: StorageConfig,
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 /// Create `root` and take an exclusive advisory lock on `root/LOCK`. The lock
@@ -360,9 +360,9 @@ fn lock_root(root: &Path) -> Result<std::fs::File, IngestError> {
 /// State used by the commit → index → cleanup critical section, which runs
 /// in its own task and therefore needs owned (`Arc`) access.
 #[derive(Debug)]
-struct Shared {
-    blobs: FsBlobStore,
-    index: Index,
+pub(crate) struct Shared {
+    pub(crate) blobs: FsBlobStore,
+    pub(crate) index: Index,
     on_duplicate: DuplicatePolicy,
     events: broadcast::Sender<StoredEvent>,
     stats: crate::stats::Stats,
@@ -375,16 +375,18 @@ struct Shared {
     /// These locks are per process. They are sufficient only because this
     /// process is the sole writer of the storage root (see `_root_lock`).
     locks: Box<[Mutex<()>]>,
+    /// Instances to copy before the rest; see [`Ingestor::prioritize_copy`].
+    pub(crate) copy_queue: std::sync::Mutex<std::collections::VecDeque<i64>>,
     /// Exclusive lock on `<root>/LOCK`, held for the life of the ingestor.
     _root_lock: std::fs::File,
     #[cfg(test)]
-    hooks: TestHooks,
+    pub(crate) hooks: TestHooks,
 }
 
 /// Fault-injection and pause points for deterministic unit tests.
 #[cfg(test)]
 #[derive(Debug, Default)]
-struct TestHooks {
+pub(crate) struct TestHooks {
     /// Make the next `upsert_instance` call fail.
     fail_next_upsert: std::sync::atomic::AtomicBool,
     /// One-shot pause inside the blob-delete closure: signal `.0`, then block
@@ -395,6 +397,8 @@ struct TestHooks {
     panic_in_scan: std::sync::Mutex<Vec<i64>>,
     /// Instance ids whose scan task panics outside the blocking scan.
     panic_in_task: std::sync::Mutex<Vec<i64>>,
+    /// Instance ids whose copy encoder panics.
+    pub(crate) panic_in_encode: std::sync::Mutex<Vec<i64>>,
 }
 
 #[cfg(test)]
@@ -404,7 +408,7 @@ impl TestHooks {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn panics(list: &std::sync::Mutex<Vec<i64>>, id: i64) -> bool {
+    pub(crate) fn panics(list: &std::sync::Mutex<Vec<i64>>, id: i64) -> bool {
         list.lock().unwrap().contains(&id)
     }
 
@@ -418,7 +422,7 @@ impl TestHooks {
 }
 
 impl Shared {
-    fn lock_for(&self, sop_instance_uid: &str) -> &Mutex<()> {
+    pub(crate) fn lock_for(&self, sop_instance_uid: &str) -> &Mutex<()> {
         let mut h = std::hash::DefaultHasher::new();
         sop_instance_uid.hash(&mut h);
         &self.locks[(h.finish() % self.locks.len() as u64) as usize]
@@ -612,7 +616,7 @@ impl Shared {
     /// references the hash. Failures are logged, not returned: the outcome is
     /// already decided, and any blob left behind is an orphan that
     /// [`Ingestor::recover`] removes.
-    async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash, kind: BlobKind) {
+    pub(crate) async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash, kind: BlobKind) {
         match self.index.blob_in_use(&hash).await {
             Ok(false) => {
                 let shared = Arc::clone(self);
@@ -660,6 +664,7 @@ impl Ingestor {
             events,
             stats: Default::default(),
             locks,
+            copy_queue: Default::default(),
             _root_lock: root_lock,
             #[cfg(test)]
             hooks: TestHooks::default(),

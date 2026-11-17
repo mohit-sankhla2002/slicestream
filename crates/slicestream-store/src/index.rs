@@ -1223,6 +1223,22 @@ impl Index {
         }))
     }
 
+    /// The frame description stored for instance `id`; `None` when the
+    /// instance is unknown or is not an image.
+    pub async fn frame_info(&self, id: i64) -> Result<Option<FrameInfo>, sqlx::Error> {
+        let info: Option<Option<String>> =
+            sqlx::query_scalar("SELECT frame_info FROM instances WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        info.flatten()
+            .map(|j| {
+                serde_json::from_str(&j)
+                    .map_err(|e| decode_err(format!("invalid frame_info JSON: {e}")))
+            })
+            .transpose()
+    }
+
     /// SOP Instance UID and blob of instance `id`; `None` when unknown.
     pub async fn instance_blob(&self, id: i64) -> Result<Option<(String, BlobHash)>, sqlx::Error> {
         let row = sqlx::query("SELECT sop_instance_uid, blob_sha256 FROM instances WHERE id = ?1")

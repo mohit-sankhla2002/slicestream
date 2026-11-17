@@ -275,3 +275,226 @@ async fn migration_0004_on_old_store() {
     assert_eq!(c[0].2.to_hex(), hash);
     assert!(idx.blob_hashes().await.unwrap().len() == 1);
 }
+
+// ---- copy maker ----
+
+use slicestream_codec::{decode_full, samples};
+use slicestream_core::frame::read_frame_at;
+
+async fn source_of(ing: &Ingestor, id: i64) -> BlobHash {
+    ing.index().instance_blob(id).await.unwrap().unwrap().1
+}
+
+/// Per frame: the samples of the original and the decoded copy.
+async fn originals_and_copies(ing: &Ingestor, id: i64) -> Vec<(Vec<i32>, Vec<i32>)> {
+    let source = source_of(ing, id).await;
+    let (copy, path) = ing.copy_frames(id, &source).await.unwrap().expect("a copy");
+    let bytes = std::fs::read(path).unwrap();
+    let info = ing.index().frame_info(id).await.unwrap().unwrap();
+    let table = ing
+        .index()
+        .stored_data(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .frames
+        .unwrap();
+    let original = ing.blobs().path_of(&source, BlobKind::Dicom);
+    copy.0
+        .iter()
+        .enumerate()
+        .map(|(k, f)| {
+            let raw = read_frame_at(&original, &table.location(k as u32).unwrap()).unwrap();
+            let end = (f.offset + f.len) as usize;
+            let decoded = decode_full(&bytes[f.offset as usize..end]).unwrap();
+            (samples(&raw, &info).unwrap(), decoded)
+        })
+        .collect()
+}
+
+async fn copy_rows(ing: &Ingestor) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM derived_htj2k")
+        .fetch_one(&index_pool(&ing.config().root).await)
+        .await
+        .unwrap()
+}
+
+fn copy_blobs(root: &Path) -> usize {
+    walkdir(&root.join("objects"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "j2cs"))
+        .count()
+}
+
+fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walkdir(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn worker_makes_copies_that_decode_to_originals() {
+    let d = tempfile::tempdir().unwrap();
+    let (ing, ids, idx) = open(d.path(), DuplicatePolicy::Keep).await;
+    assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 3);
+    assert!(idx.copy_candidates(10).await.unwrap().is_empty());
+    for id in ids {
+        let pairs = originals_and_copies(&ing, id).await;
+        assert_eq!(pairs.len(), 1);
+        for (original, decoded) in pairs {
+            assert_eq!(original, decoded);
+        }
+    }
+    assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn ineligible_instance_recorded_with_reason() {
+    let d = tempfile::tempdir().unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store"), DuplicatePolicy::Keep))
+        .await
+        .unwrap();
+    ing.import_file(&support::rgb_instance(&d.path().join("src")))
+        .await
+        .unwrap();
+    assert_eq!(ing.copy_batch(10, 1).await.unwrap(), 1);
+    let id = ing.index().copy_candidates(10).await.unwrap();
+    assert!(id.is_empty(), "not retried");
+    let pool = index_pool(&ing.config().root).await;
+    let (state, problem): (String, String) =
+        sqlx::query_as("SELECT state, problem FROM derived_htj2k")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "not_eligible");
+    assert!(problem.contains("samples per pixel"), "{problem}");
+    assert_eq!(copy_blobs(&ing.config().root), 0);
+}
+
+#[tokio::test]
+async fn transient_errors_leave_no_row() {
+    let d = tempfile::tempdir().unwrap();
+    let (ing, ids, idx) = open(d.path(), DuplicatePolicy::Keep).await;
+    let pool = index_pool(&ing.config().root).await;
+    sqlx::query("ALTER TABLE derived_htj2k RENAME TO derived_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(ing.copy_batch(10, 2).await.is_err());
+    assert!(ing.make_copy(ids[0]).await.is_err());
+    assert_eq!(copy_blobs(&ing.config().root), 0);
+    sqlx::query("ALTER TABLE derived_away RENAME TO derived_htj2k")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(copy_rows(&ing).await, 0);
+    assert_eq!(ing.copy_batch(10, 2).await.unwrap(), 3);
+    assert_eq!(copy_rows(&ing).await, 3);
+    assert!(idx.copy_candidates(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn prioritized_instance_goes_first() {
+    let d = tempfile::tempdir().unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store"), DuplicatePolicy::Keep))
+        .await
+        .unwrap();
+    let ids = ingest_slices(&ing, &d.path().join("src"), 5).await;
+    ing.prioritize_copy(ids[0]);
+    ing.prioritize_copy(ids[0]);
+    assert_eq!(ing.copy_batch(1, 1).await.unwrap(), 1);
+    let source = source_of(&ing, ids[0]).await;
+    assert!(ing.copy_frames(ids[0], &source).await.unwrap().is_some());
+    assert_eq!(copy_rows(&ing).await, 1);
+    // Queued once only: the next batch takes the newest.
+    assert_eq!(ing.copy_batch(1, 1).await.unwrap(), 1);
+    let source = source_of(&ing, ids[4]).await;
+    assert!(ing.copy_frames(ids[4], &source).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn transient_encode_stores_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let (ing, ids, _) = open(d.path(), DuplicatePolicy::Keep).await;
+    let out = ing.encode_transient(ids[0], &[1]).await.unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(copy_rows(&ing).await, 0);
+    assert_eq!(copy_blobs(&ing.config().root), 0);
+    assert!(ing.encode_transient(ids[0], &[2]).await.is_err());
+    assert!(ing.encode_transient(ids[0], &[0]).await.is_err());
+    // Prioritized: the first batch of one makes it, not the newest.
+    assert_eq!(ing.copy_batch(1, 1).await.unwrap(), 1);
+    let source = source_of(&ing, ids[0]).await;
+    assert!(ing.copy_frames(ids[0], &source).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn transient_encode_of_ineligible_instance_is_unparseable() {
+    let d = tempfile::tempdir().unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store"), DuplicatePolicy::Keep))
+        .await
+        .unwrap();
+    ing.import_file(&support::rgb_instance(&d.path().join("src")))
+        .await
+        .unwrap();
+    let id = sqlx::query_scalar::<_, i64>("SELECT id FROM instances")
+        .fetch_one(&index_pool(&ing.config().root).await)
+        .await
+        .unwrap();
+    let err = ing.encode_transient(id, &[1]).await.unwrap_err();
+    assert!(
+        matches!(&err, slicestream_store::IngestError::Unparseable(r) if r.contains("samples per pixel")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn make_copy_is_not_repeated() {
+    let d = tempfile::tempdir().unwrap();
+    let (ing, ids, _) = open(d.path(), DuplicatePolicy::Keep).await;
+    let (a, b) = tokio::join!(ing.make_copy(ids[0]), ing.make_copy(ids[0]));
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(copy_rows(&ing).await, 1);
+    assert_eq!(copy_blobs(&ing.config().root), 1);
+}
+
+#[tokio::test]
+async fn multi_frame_copy_offsets() {
+    let d = tempfile::tempdir().unwrap();
+    let ing = Ingestor::open(config(&d.path().join("store"), DuplicatePolicy::Keep))
+        .await
+        .unwrap();
+    ing.import_file(&support::native_multiframe(&d.path().join("src"), 4))
+        .await
+        .unwrap();
+    assert_eq!(ing.copy_batch(10, 1).await.unwrap(), 1);
+    let id = sqlx::query_scalar::<_, i64>("SELECT id FROM instances")
+        .fetch_one(&index_pool(&ing.config().root).await)
+        .await
+        .unwrap();
+    let source = source_of(&ing, id).await;
+    let (copy, path) = ing.copy_frames(id, &source).await.unwrap().unwrap();
+    assert_eq!(copy.0.len(), 4);
+    let mut at = 0;
+    for f in &copy.0 {
+        assert_eq!(f.offset, at);
+        assert!(f.len > 0 && f.ends.last().is_none_or(|e| u64::from(*e) <= f.len));
+        at += f.len;
+    }
+    assert_eq!(at, std::fs::metadata(path).unwrap().len());
+    for (k, (original, decoded)) in originals_and_copies(&ing, id).await.iter().enumerate() {
+        assert_eq!(original, decoded, "frame {k}");
+        let expected: Vec<i32> = (0..64 * 64)
+            .map(|i| i32::from(support::multiframe_sample(k as u32, i)))
+            .collect();
+        assert_eq!(*original, expected);
+    }
+}
