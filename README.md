@@ -59,7 +59,9 @@ for now.
   records where each frame and each large value sits in the file, and stores
   the instance's DICOM JSON.
 - `slicestream-dicomweb`: QIDO-RS query parsing, `Accept` negotiation,
-  the `multipart/related` writer and URL helpers.
+  the `multipart/related` writer, `Range` parsing and URL helpers.
+- `slicestream-codec`: lossless HTJ2K (RPCL) encoding of native monochrome
+  frames, with a sample-by-sample check of every copy.
 - `slicestream-archive`: opens ZIP, 7z, RAR, tar, tar.gz and plain gzip
   files (nested in any combination) and finds DICOM and NIfTI files inside,
   with limits against zip bombs.
@@ -238,6 +240,36 @@ authentication yet; see [SECURITY.md](SECURITY.md).
 
 ![OHIF showing the synthetic phantom from slicestream](docs/images/ohif.png)
 
+### Slow links: progressive HTJ2K
+
+For viewing over a slow connection, slicestream keeps a lossless HTJ2K copy
+of each eligible instance (native, monochrome, 8 or 16 bit) next to the
+original, and serves its frames as `image/jphc` with HTTP `Range`, so a
+viewer shows a low-resolution image from the first bytes and sharpens it.
+Originals are never changed, and a copy is served only after it decodes to
+exactly the original pixels. Settings, with their defaults, are in the
+`[htj2k]` section of `slicestream.example.toml`:
+
+```toml
+[htj2k]
+mode = "background"          # background | on-demand | off
+workers = 0                  # 0 = half the cores, at least 1
+preview_size = 256           # long side of the first preview, in pixels
+preview_ahead = 32           # slices ahead of the viewer that get a copy first
+prefer_for_wildcard = false  # true: */* and transfer-syntax=* get HTJ2K too
+```
+
+The rules for what is served, and `Range`, are in
+[docs/CONFORMANCE.md](docs/CONFORMANCE.md). The WebSocket stream has an
+opt-in progressive mode (`?progressive=htj2k`), described in
+[docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+A second OHIF data source entry for this setup (the exact option keys that
+make Cornerstone ask for HTJ2K and use ranges):
+
+<!-- TODO(Task 11): replace this line with the verified OHIF "slow links" data source entry. -->
+_OHIF "slow links" data source keys: to be added after they are tested against OHIF._
+
 To try it without patient data, store the phantom and a synthetic RLE
 multi-frame instance, then serve with a `slicestream.toml` that holds the
 `cors_allowed_origins` line above:
@@ -284,6 +316,7 @@ crates/slicestream-core     transport-agnostic library (index, frames, scheduler
 crates/slicestream-store    ingest pipeline, blob store, SQLite index and instance scan
 crates/slicestream-dicomweb QIDO-RS parsing, Accept negotiation, multipart writer
 crates/slicestream-archive  archive walking (ZIP/7z/RAR/tar/gzip), NIfTI header parsing
+crates/slicestream-codec    lossless HTJ2K encoding and verification (vendored openjph-core)
 crates/slicestream-dimse    DIMSE C-STORE / C-ECHO storage SCP
 crates/slicestream-server   reference HTTP + WebSocket server (axum/tokio)
 slicestream.example.toml    configuration with every default

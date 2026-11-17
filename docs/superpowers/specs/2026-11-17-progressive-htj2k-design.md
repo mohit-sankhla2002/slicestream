@@ -324,6 +324,11 @@ level `r`. In CI the oracle is Cornerstone's decoder (see Testing), because
   queue"); without them the server stops after the first window.
 - **Part size.** A final stage is cut into parts of at most 64 KiB, so a
   cursor change can take effect between parts of a large frame.
+
+  > **Changed during implementation (preview parts).** Every part, the
+  > preview included, carries at most 65,536 payload bytes. A preview larger
+  > than that is sent as several parts. Each part's `level` is the highest
+  > resolution whose end is at or before the part's end.
 - `docs/PROTOCOL.md` documents the parameter and the `part` field. The magic
   stays `SLS1`: the change is opt-in and only adds a JSON field.
 
@@ -338,6 +343,14 @@ lives in the protocol, in progressive mode only:
 - The client acknowledges what it has received:
   `{"type":"ack","bytes":<total binary payload bytes received so far>}`,
   sent at least every 64 KiB received and on every completed frame.
+
+  > **Changed during implementation (ack cadence).** The client acks after
+  > every binary message it receives (it may coalesce acks for messages it
+  > handles in the same event-loop turn). "Every 64 KiB" could leave a
+  > client holding less than 64 KiB unacknowledged, with the server waiting
+  > for room: a stall. Acking every message lets the unacknowledged bytes
+  > always drain to zero, which guarantees progress. The cost is one small
+  > text message per binary message.
 - The server keeps the unacknowledged bytes at or below a window. The window
   starts at 256 KiB and adapts to the measured delivery rate: it is set to
   twice the bytes acknowledged over the last round trip (measured from ack
@@ -345,6 +358,15 @@ lives in the protocol, in progressive mode only:
   throttled.
 - Parts are chosen only when the window has room, so after a cursor change
   at most one window of old priorities is still on its way.
+
+  > **Changed during implementation (sender rule).** The sender asks
+  > `FlowWindow::can_send(len)`: a message goes out when nothing is
+  > unacknowledged, or when unacknowledged bytes plus `len` fit the current
+  > limit (the probe cap while probing, else the window). The earlier rule
+  > "room is at least the part size, capped by the window" could never admit
+  > a message larger than the probe cap (a preview or a whole frame), and
+  > stalled for good. One message may now be in flight past the limit after
+  > an idle gap.
 
 This brings the M6 roadmap item "credit-based flow control" forward, for the
 progressive mode. The non-progressive stream is unchanged.
@@ -368,7 +390,18 @@ The server crate forbids `unsafe`, so only `socket2`'s safe API is used.
 - **Range.** A single-frame request with one `Range: bytes=a-b` (or `a-`)
   over HTJ2K answers 206 with `Content-Range: bytes a-b/<frame length>`
   and only those codestream bytes, in the same body format as the full
-  answer. More than one range, or a range on several frames, ignores `Range`
+  answer.
+
+  > **Changed during implementation (Range on multipart).** For a
+  > `multipart/related` answer, the range applies to the whole multipart body
+  > (boundaries and part headers included), and `Content-Range` gives that
+  > body's length. The boundary is derived from the stored instance and the
+  > frame number, so it is the same on every request. This is what RFC 9110
+  > says (a range selects part of the representation) and what Cornerstone's
+  > range reader, which joins ranges from separate requests, needs. Bare
+  > (single-part) answers are ranged over the codestream as written here.
+  > Also: `image/jphc; transfer-syntax=*` and `*/*;
+  > transfer-syntax=1.2.840.10008.1.2.4.202` select the copy too. More than one range, or a range on several frames, ignores `Range`
   and answers 200 with the whole body (allowed by RFC 9110). An
   unsatisfiable range answers 416. `Accept-Ranges: bytes` is sent on HTJ2K
   frame answers.
