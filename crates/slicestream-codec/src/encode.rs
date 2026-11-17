@@ -32,18 +32,13 @@ pub fn encode(samples: &[i32], info: &FrameInfo) -> Result<Encoded, CodecError> 
     }
     let levels = decomposition_levels(info.rows, info.columns);
     let mut cs = Codestream::new();
-    // openjph-core 0.1.0 does not round-trip unsigned 16-bit data through the
-    // 5/3 transform (the DC shift leaves no headroom). Declaring one more bit
-    // is lossless and decodes to the same sample values.
-    let precision =
-        info.bits_stored + u16::from(info.bits_stored == 16 && info.pixel_representation == 0);
     let siz = cs.access_siz_mut();
     siz.set_image_extent(Point::new(w, h));
     siz.set_num_components(1);
     siz.set_comp_info(
         0,
         Point::new(1, 1),
-        precision as u32,
+        info.bits_stored as u32,
         info.pixel_representation == 1,
     );
     siz.set_tile_size(Size::new(w, h));
@@ -171,17 +166,16 @@ mod tests {
     #[test]
     fn round_trip_signed_16() {
         let i = info(512, 512, true);
-        // CT-like: a signed ramp (HU -1000..2000) with a little noise.
-        let noise = noisy_frame(512 * 512);
-        let frame: Vec<u8> = (0..512 * 512)
-            .flat_map(|k| {
-                let (x, y) = (k % 512, k / 512);
-                let hu = ((x * 7 + y * 3) % 3000) as i16 - 1000 + (noise[k * 2] % 48) as i16;
-                hu.to_le_bytes()
-            })
-            .collect();
+        let frame = noisy_frame(512 * 512);
         let e = encode_verified(&frame, &i).unwrap();
         assert_eq!(e.ends.len(), 4);
+    }
+
+    #[test]
+    fn round_trip_unsigned_16_full_range() {
+        let i = info(256, 256, false);
+        let e = encode_verified(&noisy_frame(256 * 256), &i).unwrap();
+        assert_eq!(e.ends.len(), 3);
     }
 
     #[test]
