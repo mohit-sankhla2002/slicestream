@@ -22,7 +22,11 @@ impl Multipart {
         Self::with_boundary(format!("{:032x}", rand::random::<u128>()))
     }
 
-    fn with_boundary(boundary: String) -> Self {
+    /// A writer with `boundary`, which must be 1 to 70 characters of the
+    /// RFC 2046 `bchars` set (letters and digits are always fine) and must
+    /// not occur in any part. A fixed boundary makes the same parts give the
+    /// same bytes on every request.
+    pub fn with_boundary(boundary: String) -> Self {
         Self {
             boundary,
             started: AtomicBool::new(false),

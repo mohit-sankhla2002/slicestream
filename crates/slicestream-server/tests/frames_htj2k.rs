@@ -20,7 +20,8 @@ use support::{IMAGE_SERIES, IMAGE_STUDY, Reply, http_get, image_sop, native_imag
 use tokio_util::sync::CancellationToken;
 
 const EXPLICIT_LE: &str = "1.2.840.10008.1.2.1";
-const SIZE: u16 = 128;
+/// Large enough that a frame's multipart answer is over 64 KiB.
+const SIZE: u16 = 256;
 const FRAMES: u32 = 2;
 const ORIGIN: &str = "https://viewer.example";
 const JPHC: &str = "multipart/related; type=\"image/jphc\"";
@@ -140,6 +141,64 @@ impl Harness {
         Some(all[f.offset as usize..(f.offset + f.len) as usize].to_vec())
     }
 
+    /// The copy file of the noise instance.
+    async fn copy_file(&self) -> std::path::PathBuf {
+        let rows = self
+            .ingestor
+            .index()
+            .series_slices(IMAGE_SERIES)
+            .await
+            .unwrap();
+        let copy = self
+            .ingestor
+            .copy_frames(rows[0].id, &rows[0].blob)
+            .await
+            .unwrap();
+        copy.expect("a copy").1
+    }
+
+    /// Rewrite the noise instance's copy row as `state` with `problem`, as
+    /// the copier records one that cannot be made.
+    async fn set_copy_row(&self, state: &str, problem: &str) {
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            self.dir.path().join("store").join("index.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        let n = sqlx::query(
+            "UPDATE derived_htj2k SET state = ?1, problem = ?2, blob_sha256 = NULL, frames = NULL",
+        )
+        .bind(state)
+        .bind(problem)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(n, 1);
+        pool.close().await;
+    }
+
+    /// Whether a request queued the noise instance for its copy (as an
+    /// encode does). Forgets its copy row and imports a newer instance,
+    /// then makes one copy: the noise instance only when it was queued.
+    async fn copy_was_prioritized(&self) -> bool {
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            self.dir.path().join("store").join("index.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM derived_htj2k")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        self.import_phantom().await;
+        assert_eq!(self.ingestor.copy_batch(1, 1, || false).await.unwrap(), 1);
+        self.copy_codestream(0).await.is_some()
+    }
+
     async fn get(&self, list: &str, headers: &[(&str, &str)]) -> Reply {
         let path = format!(
             "/dicom-web/studies/{IMAGE_STUDY}/series/{IMAGE_SERIES}/instances/{}/frames/{list}",
@@ -250,16 +309,21 @@ async fn range_206_with_content_range() {
     let len = full.len();
     assert!(len > 1024, "codestream of {len} bytes");
 
+    // Multipart: the range is over the whole multipart body.
+    let whole = h.get("1", &[("Accept", JPHC)]).await;
+    assert_eq!(whole.status, 200);
     let r = h
         .get("1", &[("Accept", JPHC), ("Range", "bytes=0-1023")])
         .await;
     assert_eq!(r.status, 206, "{}", r.text());
     assert_eq!(
         r.header("content-range"),
-        Some(format!("bytes 0-1023/{len}").as_str())
+        Some(format!("bytes 0-1023/{}", whole.body.len()).as_str())
     );
     assert_eq!(r.header("accept-ranges"), Some("bytes"));
-    assert!(one_part(&r) == full[..1024]);
+    assert_eq!(r.header("content-type"), whole.header("content-type"));
+    assert_eq!(r.header("content-length"), Some("1024"));
+    assert!(r.body == whole.body[..1024]);
 
     // Bare single part: `first-` and a suffix.
     let r = h
@@ -288,14 +352,26 @@ async fn range_416() {
     let h = Harness::start(BACKGROUND).await;
     h.import_noise().await;
     h.make_copies().await;
+    // Bare single part: over the codestream.
     let len = h.copy_codestream(0).await.unwrap().len();
-
     let range = format!("bytes={len}-");
-    let r = h.get("1", &[("Accept", JPHC), ("Range", &range)]).await;
+    let r = h
+        .get("1", &[("Accept", "image/jphc"), ("Range", &range)])
+        .await;
     assert_eq!(r.status, 416, "{}", r.text());
     assert_eq!(
         r.header("content-range"),
         Some(format!("bytes */{len}").as_str())
+    );
+
+    // Multipart: over the whole multipart body.
+    let total = h.get("1", &[("Accept", JPHC)]).await.body.len();
+    let range = format!("bytes={total}-");
+    let r = h.get("1", &[("Accept", JPHC), ("Range", &range)]).await;
+    assert_eq!(r.status, 416, "{}", r.text());
+    assert_eq!(
+        r.header("content-range"),
+        Some(format!("bytes */{total}").as_str())
     );
 }
 
@@ -372,11 +448,12 @@ async fn missing_copy_is_encoded_on_demand() {
     assert_eq!(r.header("accept-ranges"), Some("bytes"));
     let served = one_part(&r);
     assert!(decodes_to(&served, &pixels[1]));
+    let whole = r.body;
     let r = h
         .get("2", &[("Accept", JPHC), ("Range", "bytes=0-99")])
         .await;
     assert_eq!(r.status, 206, "{}", r.text());
-    assert!(one_part(&r) == served[..100]);
+    assert!(r.body == whole[..100]);
     assert!(h.copy_codestream(0).await.is_none(), "nothing was stored");
 
     // Prioritized: a batch of one copies this instance, not the newest.
@@ -463,4 +540,179 @@ async fn jphc_with_copies_off_is_406() {
     // Wildcards are served as stored.
     let r = h.get("1", &[("Accept", OHIF)]).await;
     assert!(parts(&r)[0].1 == pixels[0]);
+}
+
+/// Cornerstone's range reader: `bytes=0-65535`, then `bytes=65536-`, the
+/// bodies concatenated and split as multipart. The first range is encoded
+/// now, the second read from the copy made in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ranges_concatenate_to_the_whole_multipart_body() {
+    let h = Harness::start(Options {
+        mode: Htj2kMode::OnDemand,
+        prefer_for_wildcard: false,
+    })
+    .await;
+    let pixels = h.import_noise().await;
+
+    let a = h
+        .get("1", &[("Accept", JPHC), ("Range", "bytes=0-65535")])
+        .await;
+    assert_eq!(a.status, 206, "{}", a.text());
+    assert_eq!(a.body.len(), 65_536);
+    h.make_copies().await;
+    assert!(h.copy_codestream(0).await.is_some());
+    let b = h
+        .get("1", &[("Accept", JPHC), ("Range", "bytes=65536-")])
+        .await;
+    assert_eq!(b.status, 206, "{}", b.text());
+
+    let whole = h.get("1", &[("Accept", JPHC)]).await;
+    assert_eq!(whole.status, 200);
+    let total = whole.body.len();
+    assert!(total > 65_536, "multipart body of {total} bytes");
+    assert_eq!(
+        a.header("content-range"),
+        Some(format!("bytes 0-65535/{total}").as_str())
+    );
+    assert_eq!(
+        b.header("content-range"),
+        Some(format!("bytes 65536-{}/{total}", total - 1).as_str())
+    );
+    assert_eq!(a.header("content-type"), whole.header("content-type"));
+    let mut joined = a.body.clone();
+    joined.extend_from_slice(&b.body);
+    assert!(joined == whole.body, "the ranges join into the whole body");
+    let joined = Reply {
+        status: 200,
+        headers: a.headers.clone(),
+        body: joined,
+    };
+    assert!(decodes_to(&one_part(&joined), &pixels[0]));
+
+    // Stable: the same frame gives the same bytes on every request.
+    let again = h.get("1", &[("Accept", JPHC)]).await;
+    assert!(again.body == whole.body);
+    assert_eq!(again.header("content-type"), whole.header("content-type"));
+}
+
+/// A recorded failure is not encoded again: a wildcard gets the stored
+/// frames, an HTJ2K-only request a 406.
+#[tokio::test]
+async fn failed_copy_is_not_encoded_again() {
+    let h = Harness::start(Options {
+        mode: Htj2kMode::Background,
+        prefer_for_wildcard: true,
+    })
+    .await;
+    let pixels = h.import_noise().await;
+    h.make_copies().await;
+    h.set_copy_row("failed", "verify failed at /secret/path")
+        .await;
+
+    let r = h.get("1", &[("Accept", OHIF)]).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let p = parts(&r);
+    assert_eq!(
+        p[0].0,
+        format!("application/octet-stream; transfer-syntax={EXPLICIT_LE}")
+    );
+    assert!(p[0].1 == pixels[0]);
+    assert_eq!(r.header("accept-ranges"), None);
+    let r = h.get("1", &[]).await;
+    assert_eq!(r.status, 200);
+    assert!(parts(&r)[0].1 == pixels[0]);
+
+    let r = h.get("1", &[("Accept", JPHC)]).await;
+    assert_eq!(r.status, 406, "{}", r.text());
+    assert!(!r.text().contains("/secret"), "{}", r.text());
+    assert!(!h.copy_was_prioritized().await, "no encode was attempted");
+}
+
+#[tokio::test]
+async fn not_eligible_copy_is_406_with_reason() {
+    let h = Harness::start(BACKGROUND).await;
+    let pixels = h.import_noise().await;
+    h.make_copies().await;
+    h.set_copy_row("not_eligible", "no frame table").await;
+
+    let r = h.get("1", &[("Accept", JPHC)]).await;
+    assert_eq!(r.status, 406, "{}", r.text());
+    assert!(r.text().contains("no frame table"), "{}", r.text());
+    // A later acceptable range is served as stored.
+    let accept = format!("{JPHC}, multipart/related; type=\"application/octet-stream\";q=0.5");
+    let r = h.get("1", &[("Accept", &accept)]).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(parts(&r)[0].1 == pixels[0]);
+    assert!(!h.copy_was_prioritized().await, "no encode was attempted");
+}
+
+/// A copy file that cannot be read before the answer starts is replaced
+/// by an encode.
+#[tokio::test]
+async fn missing_copy_file_is_encoded_now() {
+    let h = Harness::start(BACKGROUND).await;
+    let pixels = h.import_noise().await;
+    h.make_copies().await;
+    let copy = h.copy_codestream(0).await.unwrap();
+    std::fs::remove_file(h.copy_file().await).unwrap();
+
+    let r = h.get("1", &[("Accept", JPHC)]).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let served = one_part(&r);
+    assert!(served == copy);
+    assert!(decodes_to(&served, &pixels[0]));
+}
+
+/// No validators are sent, so `If-Range` never matches: the whole answer.
+#[tokio::test]
+async fn if_range_ignores_range() {
+    let h = Harness::start(BACKGROUND).await;
+    h.import_noise().await;
+    h.make_copies().await;
+    let full = h.copy_codestream(0).await.unwrap();
+
+    for if_range in ["\"x\"", "Wed, 21 Oct 2015 07:28:00 GMT"] {
+        let r = h
+            .get(
+                "1",
+                &[
+                    ("Accept", "image/jphc"),
+                    ("Range", "bytes=0-9"),
+                    ("If-Range", if_range),
+                ],
+            )
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.header("content-range"), None);
+        assert!(r.body == full);
+    }
+}
+
+#[tokio::test]
+async fn cors_preflight_allows_range() {
+    let h = Harness::start(BACKGROUND).await;
+    h.import_noise().await;
+    let path = format!(
+        "/dicom-web/studies/{IMAGE_STUDY}/series/{IMAGE_SERIES}/instances/{}/frames/1",
+        image_sop(1)
+    );
+    let r = support::http_options(
+        h.addr,
+        &path,
+        &[
+            ("Origin", ORIGIN),
+            ("Access-Control-Request-Method", "GET"),
+            ("Access-Control-Request-Headers", "accept, range"),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, 200, "{:?}", r.headers);
+    assert_eq!(r.header("access-control-allow-origin"), Some(ORIGIN));
+    let allowed = r
+        .header("access-control-allow-headers")
+        .unwrap()
+        .to_ascii_lowercase();
+    let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+    assert!(allowed.contains(&"range"), "{allowed:?}");
+    assert!(allowed.contains(&"accept"), "{allowed:?}");
 }

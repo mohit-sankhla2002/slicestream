@@ -5,7 +5,10 @@
 //! not scanned yet are parsed whole instead. HTJ2K frames come from the copy
 //! file, or are encoded now when the copy is not made yet. Each frame is
 //! read when its part is sent, so a request holds one frame in memory at a
-//! time. A single HTJ2K frame honours one HTTP `Range`.
+//! time. A single HTJ2K frame honours one HTTP `Range`, over the
+//! codestream of a bare answer or over the whole multipart body, whose
+//! boundary is fixed per frame so that ranges from separate requests fit
+//! together.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,9 +23,12 @@ use slicestream_core::frame::{
     FrameLocation, read_frame_at, read_frame_bytes, swap_to_little_endian,
 };
 use slicestream_core::{Error as FrameError, FrameInfo};
-use slicestream_dicomweb::{FrameSource, Multipart, negotiate_frames, parse_range, resolve};
+use slicestream_dicomweb::{
+    ByteRange, FrameSource, Multipart, negotiate_frames, parse_range, resolve,
+};
 use slicestream_store::{
-    BlobHash, BlobKind, CopyFrames, FrameTable, IngestError, Ingestor, InstanceRef, StoredData,
+    BlobHash, BlobKind, CopyFrames, CopyState, FrameTable, IngestError, Ingestor, InstanceRef,
+    StoredData,
 };
 
 use super::{accept_ranges, find_instance_data, plain};
@@ -146,12 +152,12 @@ pub(super) async fn respond(
         }
         Wanted::All => (Box::new(1..=total), total as usize),
     };
-    let source = match frame_source(data) {
+    let stored = match frame_source(data) {
         Ok(s) => s,
         Err(r) => return *r,
     };
     let (transfer_syntax, encapsulated) = served_syntax(&inst.transfer_syntax);
-    let src = FrameSource {
+    let mut src = FrameSource {
         transfer_syntax,
         encapsulated,
         bits_allocated: info.bits_allocated,
@@ -162,78 +168,83 @@ pub(super) async fn respond(
             && eligibility(info).is_ok(),
         prefer_copy_for_wildcard: state.htj2k.prefer_for_wildcard,
     };
-    let plan = match negotiate_frames(&accept_ranges(headers), &src, count) {
+    let accept = accept_ranges(headers);
+    let mut plan = match negotiate_frames(&accept, &src, count) {
         Ok(p) => p,
         Err(e) => return plain(StatusCode::NOT_ACCEPTABLE, e.0),
     };
-    let dicom_path = state.ingestor.blobs().path_of(&inst.blob, BlobKind::Dicom);
-    let reader = if plan.use_copy {
-        // The copy made from the blob being served, never another one.
-        let (path, source) = match state.ingestor.copy_frames(inst.id, &inst.blob).await {
-            Ok(Some((frames, path))) => (path, Source::Copy(frames)),
-            Ok(None) => (
-                dicom_path,
-                Source::Transient {
-                    ingestor: Arc::clone(&state.ingestor),
-                    id: inst.id,
-                    blob: inst.blob,
-                },
-            ),
-            Err(e) => return encode_failed(e),
-        };
-        FrameReader {
-            path,
-            source,
-            info: info.clone(),
-            big_endian: false,
-            swap: false,
-        }
-    } else {
-        FrameReader {
-            path: dicom_path,
-            source,
-            info: info.clone(),
-            big_endian: inst.transfer_syntax == EXPLICIT_BE,
-            swap: plan.byte_swap,
-        }
-    };
-    let reader = Arc::new(reader);
-
-    // Read the first frame now, so a failure is a status code rather than
-    // a broken body.
     let mut numbers = numbers.peekable();
     let Some(&first_number) = numbers.peek() else {
         return plain(StatusCode::NOT_FOUND, "the instance has no frames".into());
     };
-    let mut first = match reader.read(first_number).await {
-        Ok(f) => f,
-        Err(ReadError::Frame(e)) => return read_failed(&reader, &e),
-        Err(ReadError::Encode(e)) => return encode_failed(e),
-        Err(ReadError::Replaced) => return replaced(),
-    };
 
-    // `Range` applies to a single HTJ2K frame only; elsewhere it is ignored.
-    let mut content_range = None;
-    if plan.use_copy && count == 1 {
-        let frame_len = first.len() as u64;
-        match single_range(headers).map(|r| resolve(&r, frame_len)) {
-            Some(Some((start, end))) => {
-                first = first.slice(start as usize..end as usize);
-                content_range = Some(format!("bytes {start}-{}/{frame_len}", end - 1));
+    // Read the first frame now, so a failure is a status code rather than
+    // a broken body.
+    let mut copied = None;
+    if plan.use_copy {
+        match copy_first_frame(state, inst, info, first_number).await {
+            Ok(found) => copied = Some(found),
+            Err(CopyFailure::Response(r)) => return *r,
+            Err(CopyFailure::Unavailable(reason)) => {
+                // Answer as if no copy could exist: a wildcard gets the
+                // stored frames, an HTJ2K-only request a 406.
+                src.copy_possible = false;
+                plan = match negotiate_frames(&accept, &src, count) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return plain(
+                            StatusCode::NOT_ACCEPTABLE,
+                            format!("the frames cannot be served as HTJ2K: {reason}"),
+                        );
+                    }
+                };
             }
-            Some(None) => return unsatisfiable(frame_len),
-            None => {}
         }
     }
+    let (reader, first) = match copied {
+        Some(found) => found,
+        None => {
+            let reader = Arc::new(FrameReader {
+                path: state.ingestor.blobs().path_of(&inst.blob, BlobKind::Dicom),
+                source: stored,
+                info: info.clone(),
+                big_endian: inst.transfer_syntax == EXPLICIT_BE,
+                swap: plan.byte_swap,
+            });
+            match reader.read(first_number).await {
+                Ok(f) => (reader, f),
+                Err(e) => return read_error(&reader, e),
+            }
+        }
+    };
 
     if plan.single_part {
-        let len = first.len();
-        let mut res = Response::new(Body::from(first));
-        if let Ok(v) = HeaderValue::from_str(&plan.part_content_type) {
-            res.headers_mut().insert(header::CONTENT_TYPE, v);
-        }
-        res.headers_mut().insert(header::CONTENT_LENGTH, len.into());
-        return with_range_headers(res, plan.use_copy, content_range);
+        // `Range` over the codestream (HTJ2K only).
+        let range = if plan.use_copy {
+            single_range(headers)
+        } else {
+            None
+        };
+        return whole_or_range(first, &plan.part_content_type, plan.use_copy, range);
+    }
+    if plan.use_copy && count == 1 {
+        // The whole multipart body, the same bytes on every request for this
+        // frame (copy or encoded now), so `Range` can select from it.
+        let boundary = format!("{}{first_number:08x}", &inst.blob.to_hex()[..24]);
+        let multipart = Multipart::with_boundary(boundary);
+        let content_type = multipart.content_type(essence(&plan.part_content_type));
+        let head = multipart.part_header(&plan.part_content_type);
+        let close = multipart.close();
+        let mut body = Vec::with_capacity(head.len() + first.len() + close.len());
+        body.extend_from_slice(&head);
+        body.extend_from_slice(&first);
+        body.extend_from_slice(&close);
+        return whole_or_range(
+            Bytes::from(body),
+            &content_type,
+            true,
+            single_range(headers),
+        );
     }
 
     let multipart = Multipart::new();
@@ -250,12 +261,133 @@ pub(super) async fn respond(
     if let Ok(v) = HeaderValue::from_str(&content_type) {
         res.headers_mut().insert(header::CONTENT_TYPE, v);
     }
-    with_range_headers(res, plan.use_copy, content_range)
+    if plan.use_copy {
+        res.headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    res
+}
+
+/// Why the HTJ2K copy of a frame cannot be served.
+enum CopyFailure {
+    /// No copy can be had: the recorded state says so, or the encode
+    /// found the frames unfit. The text is safe to send.
+    Unavailable(String),
+    /// Something else failed; this is the answer.
+    Response(Box<Response>),
+}
+
+/// The reader of `inst`'s HTJ2K frames and frame `number` read with it:
+/// from the copy made from `inst.blob`, else encoded now when no copy is
+/// recorded or the copy file cannot be read.
+async fn copy_first_frame(
+    state: &Arc<AppState>,
+    inst: &InstanceRef,
+    info: &FrameInfo,
+    number: u32,
+) -> Result<(Arc<FrameReader>, Bytes), CopyFailure> {
+    let htj2k_reader = |path, source| {
+        Arc::new(FrameReader {
+            path,
+            source,
+            info: info.clone(),
+            big_endian: false,
+            swap: false,
+        })
+    };
+    // The copy made from the blob being served, never another one.
+    let copy = state.ingestor.index().copy_for(inst.id, &inst.blob).await;
+    match copy.map_err(|e| CopyFailure::Response(Box::new(encode_failed(IngestError::Index(e)))))? {
+        Some(CopyState::Ready { blob, frames }) => {
+            let path = state.ingestor.blobs().path_of(&blob, BlobKind::Htj2k);
+            let reader = htj2k_reader(path, Source::Copy(frames));
+            match reader.read(number).await {
+                Ok(f) => return Ok((reader, f)),
+                Err(e) => tracing::warn!(
+                    path = %reader.path.display(),
+                    "HTJ2K copy unreadable, encoding the frames now: {e}"
+                ),
+            }
+        }
+        Some(CopyState::NotEligible(reason)) => return Err(CopyFailure::Unavailable(reason)),
+        Some(CopyState::Failed(reason)) => {
+            // The reason may name paths: log it, do not send it.
+            tracing::debug!(id = inst.id, "the HTJ2K copy failed: {reason}");
+            return Err(CopyFailure::Unavailable(ENCODE_FAILED.into()));
+        }
+        None => {}
+    }
+    let reader = htj2k_reader(
+        state.ingestor.blobs().path_of(&inst.blob, BlobKind::Dicom),
+        Source::Transient {
+            ingestor: Arc::clone(&state.ingestor),
+            id: inst.id,
+            blob: inst.blob,
+        },
+    );
+    match reader.read(number).await {
+        Ok(f) => Ok((reader, f)),
+        Err(ReadError::Encode(IngestError::Unparseable(reason))) => {
+            tracing::debug!(id = inst.id, "no HTJ2K encode: {reason}");
+            Err(CopyFailure::Unavailable(ENCODE_FAILED.into()))
+        }
+        Err(e) => Err(CopyFailure::Response(Box::new(read_error(&reader, e)))),
+    }
+}
+
+/// The 406 reason when encoding, rather than eligibility, ruled HTJ2K out.
+const ENCODE_FAILED: &str = "the frames could not be encoded";
+
+/// The response for a first frame that could not be read.
+fn read_error(reader: &FrameReader, e: ReadError) -> Response {
+    match e {
+        ReadError::Frame(e) => read_failed(reader, &e),
+        ReadError::Encode(e) => encode_failed(e),
+        ReadError::Replaced => replaced(),
+    }
+}
+
+/// `body` in full (200), or the part `range` selects (206; 416 when it
+/// selects nothing). `Accept-Ranges: bytes` when `ranges`.
+fn whole_or_range(
+    body: Bytes,
+    content_type: &str,
+    ranges: bool,
+    range: Option<ByteRange>,
+) -> Response {
+    let total = body.len() as u64;
+    let (body, content_range) = match range.map(|r| resolve(&r, total)) {
+        None => (body, None),
+        Some(None) => return unsatisfiable(total),
+        Some(Some((start, end))) => (
+            body.slice(start as usize..end as usize),
+            Some(format!("bytes {start}-{}/{total}", end - 1)),
+        ),
+    };
+    let len = body.len();
+    let mut res = Response::new(Body::from(body));
+    let h = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(content_type) {
+        h.insert(header::CONTENT_TYPE, v);
+    }
+    h.insert(header::CONTENT_LENGTH, len.into());
+    if ranges {
+        h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    if let Some(v) = content_range.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        h.insert(header::CONTENT_RANGE, v);
+        *res.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
+    res
 }
 
 /// The one byte range of the request's `Range`; `None` when there is no
-/// `Range`, more than one, or it is malformed.
-fn single_range(headers: &HeaderMap) -> Option<slicestream_dicomweb::ByteRange> {
+/// `Range`, more than one, it is malformed, or the request has `If-Range`
+/// (no validators are sent, so none can match: RFC 9110 13.1.5).
+fn single_range(headers: &HeaderMap) -> Option<ByteRange> {
+    if headers.contains_key(header::IF_RANGE) {
+        return None;
+    }
     let mut values = headers.get_all(header::RANGE).iter();
     let value = values.next()?;
     if values.next().is_some() {
@@ -267,29 +399,11 @@ fn single_range(headers: &HeaderMap) -> Option<slicestream_dicomweb::ByteRange> 
     }
 }
 
-/// `Accept-Ranges: bytes` on an HTJ2K answer, and 206 with
-/// `Content-Range` when a range was served.
-fn with_range_headers(
-    mut res: Response,
-    use_copy: bool,
-    content_range: Option<String>,
-) -> Response {
-    if use_copy {
-        res.headers_mut()
-            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    }
-    if let Some(v) = content_range.and_then(|v| HeaderValue::from_str(&v).ok()) {
-        *res.status_mut() = StatusCode::PARTIAL_CONTENT;
-        res.headers_mut().insert(header::CONTENT_RANGE, v);
-    }
-    res
-}
-
-/// 416 for a range outside a frame of `len` bytes.
+/// 416 for a range outside a representation of `len` bytes.
 fn unsatisfiable(len: u64) -> Response {
     let mut res = plain(
         StatusCode::RANGE_NOT_SATISFIABLE,
-        format!("the range is outside the frame's {len} bytes"),
+        format!("the range is outside the {len} bytes of the answer"),
     );
     if let Ok(v) = HeaderValue::from_str(&format!("bytes */{len}")) {
         res.headers_mut().insert(header::CONTENT_RANGE, v);

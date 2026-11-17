@@ -169,8 +169,9 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
             .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::HEAD])
             // `Accept` with quoted parameters is not CORS-safelisted, so
-            // DICOMweb clients send a preflight for it.
-            .allow_headers([header::ACCEPT])
+            // DICOMweb clients send a preflight for it; `Range` is only
+            // safelisted in its simplest forms, and not by every browser.
+            .allow_headers([header::ACCEPT, header::RANGE])
             // `Content-Range` gives the size of a ranged HTJ2K frame.
             .expose_headers([
                 HeaderName::from_static("x-slicestream-frame-info"),
