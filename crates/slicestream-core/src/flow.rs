@@ -30,13 +30,17 @@
 //! pipe last went from empty to non-empty (an idle gap): the interval then
 //! spans the gap. Increases always apply.
 //!
-//! RTT probing: a standing queue raises every sample, so expiring the minimum by
-//! age alone would let it drift up with the window. Every `PROBE_INTERVAL` (10 s) the sender is held
-//! to `FLOOR` unacked bytes until a byte sent under that cap is acked; that
-//! sample sees a near-empty queue and replaces the minimum. The adaptive
-//! window is untouched while probing (and no probe runs at `FLOOR`, which
-//! already is the smallest queue), and decreases wait for a base sample
-//! taken after the probe.
+//! RTT probing: a standing queue raises every sample, so expiring the minimum
+//! by age alone would let it drift up with the window. Every `PROBE_INTERVAL`
+//! (10 s) the sender is held to `FLOOR` unacked bytes (`FLOOR / 2` when the
+//! window is already at `FLOOR`) until a byte sent under that cap is acked;
+//! that sample sees a short queue and replaces the minimum. The adaptive
+//! window is untouched while probing, and decreases wait for a base sample
+//! taken one round trip after the probe.
+//!
+//! Limitation: on a very slow link a probe takes as long as the capped queue
+//! needs to drain (e.g. about 52 s at 10 kbit/s for `FLOOR / 2`), during which
+//! the minimum is not refreshed.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -56,11 +60,14 @@ pub struct FlowWindow {
     sends: VecDeque<(Duration, u64)>,
     /// `(ack time, total acked, limited_sends)`, oldest first.
     acks: VecDeque<(Duration, u64, u64)>,
-    /// `(sample time, rtt)` with strictly increasing rtt: a sliding-window minimum.
-    rtts: VecDeque<(Duration, Duration)>,
+    /// Smallest RTT sample since the last probe (or the connection start).
+    min_rtt: Option<Duration>,
     /// When the pipe last went from empty to non-empty.
     busy_since: Duration,
-    /// Probing: the unacked cap is `FLOOR` until `probe_target` is acked.
+    /// Unacked cap while probing: `FLOOR`, or `FLOOR / 2` when the window is
+    /// already at `FLOOR`.
+    probe_cap: u64,
+    /// Probing: the unacked cap is `probe_cap` until `probe_target` is acked.
     probing: bool,
     /// Cumulative bytes sent once the probe's first part left; acked ends it.
     probe_target: Option<u64>,
@@ -83,9 +90,10 @@ impl FlowWindow {
             acked: 0,
             sends: VecDeque::new(),
             acks: VecDeque::new(),
-            rtts: VecDeque::new(),
+            min_rtt: None,
             busy_since: Duration::ZERO,
             probing: false,
+            probe_cap: FLOOR,
             probe_target: None,
             next_probe: PROBE_INTERVAL,
             limited_sends: 0,
@@ -118,12 +126,12 @@ impl FlowWindow {
         while self.sends.front().is_some_and(|&(_, cum)| cum < total) {
             self.sends.pop_front();
         }
-        if let Some(&(sent_at, _)) = self.sends.front() {
-            let sample = now.saturating_sub(sent_at);
-            while self.rtts.back().is_some_and(|&(_, r)| r >= sample) {
-                self.rtts.pop_back();
-            }
-            self.rtts.push_back((now, sample));
+        let sample = self
+            .sends
+            .front()
+            .map(|&(sent_at, _)| now.saturating_sub(sent_at));
+        if let Some(sample) = sample {
+            self.min_rtt = Some(self.min_rtt.map_or(sample, |m| m.min(sample)));
         }
         let mut probe_ended = false;
         if self.probing {
@@ -133,15 +141,19 @@ impl FlowWindow {
                 self.next_probe = now + PROBE_INTERVAL;
                 probe_ended = true;
                 // The probe sample is queue-free: it replaces older minima.
-                if let Some(&last) = self.rtts.back() {
-                    self.rtts.clear();
-                    self.rtts.push_back(last);
+                if sample.is_some() {
+                    self.min_rtt = sample;
                 }
             }
-        } else if now >= self.next_probe && self.window > FLOOR {
+        } else if now >= self.next_probe {
             self.probing = true;
+            self.probe_cap = if self.window > FLOOR {
+                FLOOR
+            } else {
+                FLOOR / 2
+            };
         }
-        let rtt = self.rtts.front().map_or(Duration::ZERO, |&(_, r)| r);
+        let rtt = self.min_rtt.unwrap_or_default();
         // Newest earlier sample that is at least one RTT old.
         let base = self
             .acks
@@ -156,7 +168,7 @@ impl FlowWindow {
         }
         if let (Some((t, acked, limited)), false) = (base, self.probing) {
             let candidate = (2 * (total - acked)).clamp(FLOOR, CEILING);
-            let steady = t >= self.busy_since && self.limited_sends > limited;
+            let steady = t > self.busy_since && self.limited_sends > limited;
             if candidate >= self.window || steady {
                 self.window = candidate;
             }
@@ -178,7 +190,11 @@ impl FlowWindow {
 
     /// Bytes that may still be sent: window minus unacked, saturating.
     pub fn room(&self) -> u64 {
-        let cap = if self.probing { FLOOR } else { self.window };
+        let cap = if self.probing {
+            self.probe_cap
+        } else {
+            self.window
+        };
         cap.saturating_sub(self.unacked())
     }
 }
@@ -204,6 +220,8 @@ mod tests {
         link_free_ms: f64,
         sent: u64,
         part: u64,
+        /// Sender is paused until the pipe drains, then resumes in that very tick.
+        gap: bool,
     }
 
     impl Sim {
@@ -217,6 +235,7 @@ mod tests {
                 link_free_ms: 0.0,
                 sent: 0,
                 part: PART,
+                gap: false,
             }
         }
 
@@ -231,7 +250,10 @@ mod tests {
                     self.f.on_ack(cum, ms(self.t));
                     self.inflight.pop_front();
                 }
-                while sending && self.f.room() >= self.part {
+                if self.gap && self.inflight.is_empty() {
+                    self.gap = false;
+                }
+                while sending && !self.gap && self.f.room() >= self.part {
                     self.f.on_sent(self.part, ms(self.t));
                     self.sent += self.part;
                     let start = self.link_free_ms.max(self.t as f64);
@@ -317,6 +339,46 @@ mod tests {
         sim.bytes_per_s = 125_000;
         sim.run(120_000, true);
         assert!(sim.f.window() <= 512 * 1024, "{}", sim.f.window());
+    }
+
+    #[test]
+    fn stale_ack_ignored() {
+        let mut f = FlowWindow::new();
+        f.on_sent(1000, ms(0));
+        f.on_ack(800, ms(10));
+        f.on_ack(500, ms(20));
+        assert_eq!(f.unacked(), 200);
+    }
+
+    #[test]
+    fn same_tick_restart_does_not_shrink_window() {
+        let mut sim = Sim::new(12_500_000, 80);
+        sim.run(5_000, true);
+        let before = sim.f.window();
+        sim.gap = true;
+        let mut min = u64::MAX;
+        for _ in 0..3_000 {
+            sim.run(1, true);
+            min = min.min(sim.f.window());
+        }
+        assert!(!sim.gap, "pipe never drained");
+        assert!(min >= before, "window fell to {min} (before: {before})");
+    }
+
+    #[test]
+    fn window_at_floor_regrows_after_rtt_rises() {
+        // Small parts and a 1 ms RTT pin the window at FLOOR; then the RTT
+        // rises 100x on the same fast link.
+        let mut sim = Sim::new(12_500_000, 1);
+        sim.part = 16_384;
+        sim.run(5_000, true);
+        assert_eq!(sim.f.window(), FLOOR);
+        sim.rtt_ms = 100;
+        sim.run(30_000, true);
+        let at = sim.sent;
+        sim.run(3_000, true);
+        let goodput = (sim.sent - at) as f64 / 3.0;
+        assert!(goodput >= 0.8 * 12_500_000.0, "goodput {goodput}");
     }
 
     #[test]
