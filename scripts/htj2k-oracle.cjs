@@ -17,16 +17,22 @@ function decode(M, bytes, level, signed) {
   try {
     d.getEncodedBuffer(bytes.length).set(bytes);
     d.readHeader();
+    const size = d.calculateSizeAtDecompositionLevel(level);
     if (level === 0) d.decode();
     else d.decodeSubResolution(level, 0);
     const out = d.getDecodedBuffer();
     const copy = new Uint8Array(out.length);
     copy.set(out);
     const buf = copy.buffer;
-    return signed ? new Int16Array(buf) : new Uint16Array(buf);
+    return { w: size.width, h: size.height, px: signed ? new Int16Array(buf) : new Uint16Array(buf) };
   } finally {
     d.delete();
   }
+}
+
+function isConstant(a) {
+  for (let i = 1; i < a.length; i++) if (a[i] !== a[0]) return false;
+  return true;
 }
 
 function sameSamples(a, b) {
@@ -50,17 +56,43 @@ factory({ print() {}, printErr() {} }).then((M) => {
     };
 
     const full = decode(M, j2c, 0, meta.signed);
-    if (!sameSamples(full, raw)) {
+    if (full.w !== meta.w || full.h !== meta.h || full.px.length !== meta.w * meta.h) {
+      fail(`full decode is ${full.w}x${full.h} (${full.px.length} samples), expected ${meta.w}x${meta.h}`);
+      continue;
+    }
+    if (!sameSamples(full.px, raw)) {
       fail('full decode differs from raw');
       continue;
     }
+    const rawConstant = isConstant(raw);
+    let negativeChecked = false;
     for (let r = 0; r <= L; r++) {
       const level = L - r;
       const whole = decode(M, j2c, level, meta.signed);
       const prefix = decode(M, j2c.subarray(0, meta.ends[r]), level, meta.signed);
-      if (!sameSamples(whole, prefix)) fail(`resolution ${r} (level ${level}): prefix ${meta.ends[r]} differs from whole`);
+      const where = `resolution ${r} (level ${level})`;
+      if (whole.w * whole.h === 0 || whole.px.length !== whole.w * whole.h) {
+        fail(`${where}: whole decode has ${whole.px.length} samples for ${whole.w}x${whole.h}`);
+        continue;
+      }
+      if (prefix.w !== whole.w || prefix.h !== whole.h || prefix.px.length !== whole.px.length) {
+        fail(`${where}: prefix decode is ${prefix.w}x${prefix.h} (${prefix.px.length}), whole is ${whole.w}x${whole.h}`);
+        continue;
+      }
+      if (!rawConstant && isConstant(whole.px)) fail(`${where}: whole decode is constant`);
+      if (!sameSamples(whole.px, prefix.px)) fail(`${where}: prefix ${meta.ends[r]} differs from whole`);
+      // Negative control: without resolution r's data the output must differ.
+      if (r > 0) {
+        const short = decode(M, j2c.subarray(0, meta.ends[r - 1]), level, meta.signed);
+        if (!sameSamples(short.px, whole.px)) negativeChecked = true;
+      }
     }
+    if (L > 0 && !negativeChecked) fail('no shorter prefix ever decoded differently (truncation not detected)');
+  }
+  if (names.length === 0) {
+    console.error('FAIL: no fixtures found');
+    process.exit(1);
   }
   if (failed) process.exit(1);
-  console.log(`${names.length} fixtures decoded`);
+  console.log(`htj2k interop: ${names.length} fixtures ok`);
 });

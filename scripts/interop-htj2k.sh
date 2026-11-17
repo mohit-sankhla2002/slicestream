@@ -20,6 +20,4 @@ cd "$ROOT_DIR"
 (cd "$TMP" && npm install --ignore-scripts --no-audit --no-fund "@cornerstonejs/codec-openjph@$OPENJPH_VERSION" >/dev/null)
 mkdir "$TMP/fixtures"
 cargo run -q -p slicestream-codec --example htj2k_fixtures -- "$TMP/fixtures"
-COUNT="$(ls "$TMP/fixtures"/*.json | wc -l | tr -d ' ')"
 node scripts/htj2k-oracle.cjs "$TMP/node_modules" "$TMP/fixtures"
-echo "htj2k interop: $COUNT fixtures ok"
