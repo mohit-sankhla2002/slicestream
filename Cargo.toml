@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/slicestream-archive", "crates/slicestream-core", "crates/slicestream-dicomweb", "crates/slicestream-dimse", "crates/slicestream-server", "crates/slicestream-store"]
+exclude = ["vendor/openjph-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,3 +11,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/mohit-sankhla2002/slicestream"
 keywords = ["dicom", "medical-imaging", "streaming", "websocket", "dicomweb"]
 categories = ["multimedia::images", "network-programming", "science"]
+
+[patch.crates-io]
+openjph-core = { path = "vendor/openjph-core" }
