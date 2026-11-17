@@ -153,6 +153,8 @@ pub enum IngestError {
     Unparseable(String),
     #[error("missing required attribute {0}")]
     MissingAttribute(&'static str),
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("{field} mismatch: expected {expected}, dataset has {actual}")]
     UidMismatch {
         field: &'static str,
@@ -177,7 +179,9 @@ impl IngestError {
     /// DIMSE C-STORE status (and STOW-RS FailureReason) for this error.
     pub fn status(&self) -> u16 {
         match self {
-            IngestError::Unparseable(_) | IngestError::MissingAttribute(_) => 0xC000,
+            IngestError::Unparseable(_)
+            | IngestError::MissingAttribute(_)
+            | IngestError::NotFound(_) => 0xC000,
             IngestError::UidMismatch { .. } => 0xA900,
             IngestError::StudyMismatch { .. } => 0xC409,
             IngestError::UnsupportedSopClass(_) => 0x0122,
@@ -376,6 +380,7 @@ pub(crate) struct Shared {
     /// process is the sole writer of the storage root (see `_root_lock`).
     locks: Box<[Mutex<()>]>,
     /// Instances to copy before the rest; see [`Ingestor::prioritize_copy`].
+    pub(crate) copy_inflight: std::sync::Mutex<HashSet<i64>>,
     pub(crate) copy_queue: std::sync::Mutex<std::collections::VecDeque<i64>>,
     /// Exclusive lock on `<root>/LOCK`, held for the life of the ingestor.
     _root_lock: std::fs::File,
@@ -399,6 +404,8 @@ pub(crate) struct TestHooks {
     panic_in_task: std::sync::Mutex<Vec<i64>>,
     /// Instance ids whose copy encoder panics.
     pub(crate) panic_in_encode: std::sync::Mutex<Vec<i64>>,
+    /// Make the next `write_copy` fail with this error.
+    pub(crate) fail_next_write_copy: std::sync::Mutex<Option<sqlx::Error>>,
 }
 
 #[cfg(test)]
@@ -665,6 +672,7 @@ impl Ingestor {
             stats: Default::default(),
             locks,
             copy_queue: Default::default(),
+            copy_inflight: Default::default(),
             _root_lock: root_lock,
             #[cfg(test)]
             hooks: TestHooks::default(),

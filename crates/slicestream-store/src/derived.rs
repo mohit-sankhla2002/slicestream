@@ -93,64 +93,116 @@ pub enum CopyState {
     Failed(String),
 }
 
-/// Read frame `frame` (0-based) of `source` and encode it, verified.
-/// Blocking.
+/// Why one frame could not be encoded.
+enum FrameFailure {
+    /// Reading the original failed in a way that can pass (I/O error).
+    Transient(std::io::Error),
+    /// The frame itself is bad, or encoding or verification failed.
+    Codec(CodecError),
+}
+
+/// Read frame `frame` (0-based) of the file at `path` and encode it,
+/// verified. Blocking.
 fn encode_frame(
     path: &std::path::Path,
     table: &FrameTable,
     frame: u32,
     info: &FrameInfo,
-) -> Result<Encoded, CodecError> {
+) -> Result<Encoded, FrameFailure> {
+    let bad = |m: String| FrameFailure::Codec(CodecError::BadFrame(m));
     let loc = table
         .location(frame)
-        .ok_or_else(|| CodecError::BadFrame(format!("no frame {}", frame + 1)))?;
-    let bytes = read_frame_at(path, &loc)
-        .map_err(|e| CodecError::BadFrame(format!("cannot read frame {}: {e}", frame + 1)))?;
-    encode_verified(&bytes, info)
+        .ok_or_else(|| bad(format!("no frame {}", frame + 1)))?;
+    let bytes = read_frame_at(path, &loc).map_err(|e| match e {
+        // A file that is gone or too short is this instance's problem.
+        slicestream_core::Error::Io { source, .. }
+            if !matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            FrameFailure::Transient(source)
+        }
+        e => bad(format!("cannot read frame {}: {e}", frame + 1)),
+    })?;
+    encode_verified(&bytes, info).map_err(FrameFailure::Codec)
+}
+
+/// Marks instance `id` as being copied; removed on drop.
+struct InFlight {
+    shared: Arc<Shared>,
+    id: i64,
+}
+
+impl InFlight {
+    fn start(shared: &Arc<Shared>, id: i64) -> Option<InFlight> {
+        shared
+            .copy_inflight
+            .lock()
+            .unwrap()
+            .insert(id)
+            .then(|| InFlight {
+                shared: Arc::clone(shared),
+                id,
+            })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.shared.copy_inflight.lock().unwrap().remove(&self.id);
+    }
 }
 
 impl Shared {
-    /// Make, verify and record the copy of instance `id`. Does nothing for a
-    /// unknown or unscanned instance, or one that has a current row. Holds
-    /// the instance's lock stripe throughout, so concurrent calls make one
-    /// copy.
+    /// Make, verify and record the copy of instance `id`; `true` when a row
+    /// was written. Does nothing (`false`) for an unknown or unscanned
+    /// instance, one that has a current row, one that is being copied by
+    /// another call, or one that was overwritten meanwhile.
+    ///
+    /// Encoding and verification run without the instance's lock stripe; the
+    /// stripe is held only to re-check the instance, commit the copy blob
+    /// and write the row. Copy blobs are content-addressed and may be shared
+    /// by several instances' rows, so a copy blob is never deleted here; a
+    /// leftover is an orphan for [`Ingestor::recover`].
     ///
     /// Everything that is the instance's own fault (not eligible, the
-    /// encoder or verification failed or panicked, an index row the database
-    /// refuses) is recorded, so the instance is not retried. `Err` only when
-    /// nothing could be recorded for a reason that can pass (full disk, busy
-    /// database); no row is left then.
-    pub(crate) async fn make_copy(self: Arc<Self>, id: i64) -> Result<(), IngestError> {
-        let Some((uid, _)) = self.index.instance_blob(id).await? else {
-            return Ok(());
-        };
-        let _guard = self.lock_for(&uid).lock().await;
-        // Re-read under the lock: an overwrite may have come first.
-        let Some((_, source)) = self.index.instance_blob(id).await? else {
-            return Ok(());
+    /// encoder or verification failed or panicked, a row the database
+    /// refuses) is recorded, so the instance is not retried. `Err` for
+    /// anything that can pass (I/O error, full disk, busy database,
+    /// cancellation); no row is left then.
+    pub(crate) async fn make_copy(self: Arc<Self>, id: i64) -> Result<bool, IngestError> {
+        let Some((uid, source)) = self.index.instance_blob(id).await? else {
+            return Ok(false);
         };
         if self.index.copy_for(id, &source).await?.is_some() {
-            return Ok(());
+            return Ok(false);
         }
+        let Some(_in_flight) = InFlight::start(&self, id) else {
+            return Ok(false);
+        };
         let table = match self.index.stored_data_for(id, &source).await? {
             StoredDataState::Ready(data) => data.frames,
             // Scanned later; recording a state now would be wrong.
-            StoredDataState::Unscanned | StoredDataState::Replaced => return Ok(()),
+            StoredDataState::Unscanned | StoredDataState::Replaced => return Ok(false),
         };
         let info = self.index.frame_info(id).await?;
         let (Some(table), Some(info)) = (table, info) else {
             let state = CopyState::NotEligible(NO_FRAME_TABLE.to_owned());
-            return self.record_copy(id, &source, state, None).await;
+            return self.record_copy(id, &source, state).await;
         };
         if let Err(reason) = eligibility(&info) {
             return self
-                .record_copy(id, &source, CopyState::NotEligible(reason.0), None)
+                .record_copy(id, &source, CopyState::NotEligible(reason.0))
                 .await;
         }
 
         let path = self.blobs.path_of(&source, BlobKind::Dicom);
-        let mut codestreams: Vec<u8> = Vec::new();
+        // Each codestream goes to the spool file as it is made; only the
+        // frame table stays in memory.
+        let mut temp = self.blobs.create_temp(u64::MAX)?;
         let mut frames = Vec::new();
+        let mut offset = 0u64;
         for frame in 0..table.count() {
             #[cfg(test)]
             let panics = crate::ingest::TestHooks::panics(&self.hooks.panic_in_encode, id);
@@ -165,82 +217,88 @@ impl Shared {
             .await;
             let failure = match encoded {
                 Ok(Ok(e)) => {
+                    temp.write_chunk(&e.codestream).await?;
+                    let len = e.codestream.len() as u64;
                     frames.push(CopyFrame {
-                        offset: codestreams.len() as u64,
-                        len: e.codestream.len() as u64,
+                        offset,
+                        len,
                         ends: e.ends,
                     });
-                    codestreams.extend_from_slice(&e.codestream);
+                    offset += len;
                     continue;
                 }
-                Ok(Err(CodecError::NotEligible(reason))) => CopyState::NotEligible(reason),
-                Ok(Err(e)) => CopyState::Failed(e.to_string()),
-                Err(e) => {
+                Ok(Err(FrameFailure::Transient(e))) => return Err(IngestError::Storage(e)),
+                Ok(Err(FrameFailure::Codec(CodecError::NotEligible(reason)))) => {
+                    CopyState::NotEligible(reason)
+                }
+                Ok(Err(FrameFailure::Codec(e))) => CopyState::Failed(e.to_string()),
+                Err(e) if e.is_panic() => {
                     error!(id, error = %e, "copy encoder failed");
                     CopyState::Failed(ENCODER_FAILED.to_owned())
                 }
+                // Cancelled: nothing is wrong with the instance.
+                Err(e) => return Err(IngestError::Storage(std::io::Error::other(e))),
             };
             warn!(id, ?failure, "recording copy failure");
-            return self.record_copy(id, &source, failure, None).await;
+            return self.record_copy(id, &source, failure).await;
         }
+        let spooled = temp.finish().await?;
 
+        let _guard = self.lock_for(&uid).lock().await;
+        // An overwrite or another writer may have come first.
+        match self.index.instance_blob(id).await? {
+            Some((_, current)) if current == source => {}
+            _ => return Ok(false),
+        }
+        if self.index.copy_for(id, &source).await?.is_some() {
+            return Ok(false);
+        }
         let blobs = self.blobs.clone();
-        let blob = tokio::task::spawn_blocking(move || {
-            let spooled = blobs
-                .spool_sync(&mut codestreams.as_slice(), u64::MAX)
-                .map_err(|e| match e {
-                    crate::SpoolError::Io(e) => e,
-                    other => std::io::Error::other(other),
-                })?;
-            blobs.commit(spooled, BlobKind::Htj2k)
-        })
-        .await
-        .map_err(|e| {
-            error!(id, error = %e, "copy commit task failed");
-            IngestError::Storage(std::io::Error::other(e))
-        })??;
+        let blob = tokio::task::spawn_blocking(move || blobs.commit(spooled, BlobKind::Htj2k))
+            .await
+            .map_err(|e| {
+                error!(id, error = %e, "copy commit task failed");
+                IngestError::Storage(std::io::Error::other(e))
+            })??;
         let state = CopyState::Ready {
             blob,
             frames: CopyFrames(frames),
         };
-        self.record_copy(id, &source, state, Some(blob)).await
+        self.record_copy(id, &source, state).await
     }
 
-    /// Write `state`. `copy_blob` is the blob just committed for it, if any:
-    /// it is removed again unless something else uses it, when the write is
-    /// refused or fails.
+    /// Write `state`; `true` when a row was written. A row the database
+    /// refuses is replaced by a `Failed` row.
     async fn record_copy(
-        self: &Arc<Self>,
+        &self,
         id: i64,
         source: &BlobHash,
         state: CopyState,
-        copy_blob: Option<BlobHash>,
-    ) -> Result<(), IngestError> {
-        let result = match self.index.write_copy(id, source, &state).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => Ok(()),
+    ) -> Result<bool, IngestError> {
+        #[cfg(test)]
+        let injected = self.hooks.fail_next_write_copy.lock().unwrap().take();
+        #[cfg(not(test))]
+        let injected: Option<sqlx::Error> = None;
+        let first = match injected {
+            Some(e) => Err(e),
+            None => self.index.write_copy(id, source, &state).await,
+        };
+        match first {
+            Ok(written) => Ok(written),
             Err(e) if rejects_row(&e) => {
                 error!(id, error = %e, "cannot record copy");
                 let state = CopyState::Failed(COPY_NOT_RECORDED.to_owned());
-                self.index
-                    .write_copy(id, source, &state)
-                    .await
-                    .map(|_| ())
-                    .map_err(IngestError::Index)
+                Ok(self.index.write_copy(id, source, &state).await?)
             }
             Err(e) => Err(IngestError::Index(e)),
-        };
-        if let Some(blob) = copy_blob {
-            self.discard_unreferenced(blob, BlobKind::Htj2k).await;
         }
-        result
     }
 }
 
 impl Ingestor {
     /// Make the HTJ2K copy of instance `id` now, scanning it first if
-    /// needed. See [`Shared::make_copy`] for what is recorded.
-    pub async fn make_copy(&self, id: i64) -> Result<(), IngestError> {
+    /// needed. `true` when a row was written; see [`Shared::make_copy`].
+    pub async fn make_copy(&self, id: i64) -> Result<bool, IngestError> {
         self.ensure_scanned(id).await?;
         let task = tokio::spawn(Arc::clone(&self.shared).make_copy(id));
         match task.await {
@@ -255,7 +313,7 @@ impl Ingestor {
     /// Make up to `limit` copies, at most `parallel` instances at a time:
     /// first the instances of [`prioritize_copy`](Self::prioritize_copy),
     /// then the newest instances without a current copy row. Returns how
-    /// many instances were handled. A row that fails on the database's side
+    /// many rows were written. A row that fails on the database's side
     /// is logged and left for a later batch; `Err` when the candidates
     /// cannot be listed, or when every instance of the batch failed that
     /// way, so the caller can wait before trying again.
@@ -291,7 +349,7 @@ impl Ingestor {
                 .collect();
             for (id, task) in tasks {
                 match task.await {
-                    Ok(Ok(())) => recorded += 1,
+                    Ok(Ok(written)) => recorded += usize::from(written),
                     Ok(Err(e)) => {
                         error!(id, error = %e, "cannot record the copy; the row is retried later");
                         last_error = Some(e);
@@ -336,8 +394,8 @@ impl Ingestor {
 
     /// Encode the 1-based frames `numbers` of instance `id` now, verified,
     /// without storing anything, and queue the instance for its copy.
-    /// [`IngestError::Unparseable`] when the instance, a frame or a frame
-    /// table does not exist, the instance is not eligible, or encoding fails.
+    /// [`IngestError::NotFound`] for an unknown instance;
+    /// [`IngestError::Unparseable`] when a frame or a frame table does not exist, the instance is not eligible, or encoding fails.
     pub async fn encode_transient(
         &self,
         id: i64,
@@ -347,7 +405,7 @@ impl Ingestor {
         self.ensure_scanned(id).await?;
         let index = &self.shared.index;
         let Some((_, source)) = index.instance_blob(id).await? else {
-            return Err(unparseable("unknown instance"));
+            return Err(IngestError::NotFound(format!("instance {id}")));
         };
         let table = match index.stored_data_for(id, &source).await? {
             StoredDataState::Ready(data) => data.frames,
@@ -372,7 +430,10 @@ impl Ingestor {
                         error!(id, error = %e, "transient encoder failed");
                         IngestError::Storage(std::io::Error::other(e))
                     })?;
-            out.push(encoded.map_err(|e| IngestError::Unparseable(e.to_string()))?);
+            out.push(encoded.map_err(|e| match e {
+                FrameFailure::Transient(e) => IngestError::Storage(e),
+                FrameFailure::Codec(e) => IngestError::Unparseable(e.to_string()),
+            })?);
         }
         self.prioritize_copy(id);
         Ok(out)
@@ -449,5 +510,75 @@ mod tests {
         assert!(matches!(state(ids[0]).await, CopyState::Ready { .. }));
         assert!(matches!(state(ids[2]).await, CopyState::Ready { .. }));
         assert!(index.copy_candidates(10).await.unwrap().is_empty());
+    }
+
+    /// Two instances with identical pixels share one content-addressed copy
+    /// blob. A failed write for the second must leave the first's copy intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_write_keeps_a_shared_copy_blob() {
+        use dicom_core::{DataElement, PrimitiveValue, VR};
+        use dicom_dictionary_std::tags;
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        crate::phantom::write_phantom(&src, 1, 16).unwrap();
+        let ing = Ingestor::open(crate::StorageConfig {
+            root: d.path().join("store"),
+            max_instance_bytes: 1 << 30,
+            on_duplicate: crate::DuplicatePolicy::Keep,
+        })
+        .await
+        .unwrap();
+        let first = src.join("IM00001.dcm");
+        let second = src.join("twin.dcm");
+        let mut obj = dicom_object::open_file(&first).unwrap();
+        obj.put(DataElement::new(
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            PrimitiveValue::from("2.25.123456789012345678901234567890"),
+        ));
+        obj.write_to_file(&second).unwrap();
+        ing.import_file(&first).await.unwrap();
+        ing.import_file(&second).await.unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM instances ORDER BY id")
+            .fetch_all(&ing.shared.index.pool)
+            .await
+            .unwrap();
+        let index = ing.index();
+        let current = |id: i64| async move {
+            let (_, source) = index.instance_blob(id).await.unwrap().unwrap();
+            index.copy_for(id, &source).await.unwrap()
+        };
+
+        assert!(ing.make_copy(ids[0]).await.unwrap());
+        let Some(CopyState::Ready { blob, .. }) = current(ids[0]).await else {
+            panic!("no copy");
+        };
+        let file = ing.blobs().path_of(&blob, BlobKind::Htj2k);
+        let intact = || {
+            let bytes = std::fs::read(&file).unwrap();
+            slicestream_codec::decode_full(&bytes).unwrap();
+        };
+        intact();
+
+        // A write that fails for a reason that can pass: no row, an error,
+        // and the shared copy blob survives.
+        *ing.shared.hooks.fail_next_write_copy.lock().unwrap() = Some(sqlx::Error::PoolTimedOut);
+        assert!(ing.make_copy(ids[1]).await.is_err());
+        assert_eq!(current(ids[1]).await, None);
+        intact();
+
+        // A row the database refuses is recorded as failed.
+        *ing.shared.hooks.fail_next_write_copy.lock().unwrap() =
+            Some(sqlx::Error::Encode("too big".into()));
+        assert!(ing.make_copy(ids[1]).await.unwrap());
+        assert_eq!(
+            current(ids[1]).await,
+            Some(CopyState::Failed(COPY_NOT_RECORDED.into()))
+        );
+        intact();
+        assert!(matches!(
+            current(ids[0]).await,
+            Some(CopyState::Ready { .. })
+        ));
     }
 }

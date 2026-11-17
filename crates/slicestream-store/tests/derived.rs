@@ -427,6 +427,10 @@ async fn transient_encode_stores_nothing() {
     assert_eq!(out.len(), 1);
     assert_eq!(copy_rows(&ing).await, 0);
     assert_eq!(copy_blobs(&ing.config().root), 0);
+    assert!(matches!(
+        ing.encode_transient(i64::MAX, &[1]).await,
+        Err(slicestream_store::IngestError::NotFound(_))
+    ));
     assert!(ing.encode_transient(ids[0], &[2]).await.is_err());
     assert!(ing.encode_transient(ids[0], &[0]).await.is_err());
     // Prioritized: the first batch of one makes it, not the newest.
