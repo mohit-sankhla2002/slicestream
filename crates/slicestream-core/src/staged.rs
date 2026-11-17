@@ -52,6 +52,11 @@ impl StagedScheduler {
         }
     }
 
+    /// Whether the slice was made single stage.
+    pub fn is_single_stage(&self, index: usize) -> bool {
+        self.single.get(index).copied().unwrap_or(false)
+    }
+
     /// Update the viewer state and restart the preview-ahead budget.
     pub fn update(&mut self, cursor: usize, velocity: f64) {
         self.cursor = cursor.min(self.finals.len().saturating_sub(1));
@@ -133,7 +138,10 @@ mod tests {
     #[test]
     fn single_stage_slice_sent_once_as_final() {
         let mut s = sched(10, 4);
+        assert!(!s.is_single_stage(5));
         s.set_single_stage(5);
+        assert!(s.is_single_stage(5));
+        assert!(!s.is_single_stage(4) && !s.is_single_stage(99));
         s.update(5, 0.0);
         assert_eq!(s.pop_next(), Some((5, Stage::Final)));
         let rest: Vec<_> = std::iter::from_fn(|| s.pop_next()).collect();

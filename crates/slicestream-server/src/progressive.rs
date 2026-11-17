@@ -18,9 +18,15 @@
 //! its turn comes again (an evicted slice starts over), so after a cursor
 //! change at most one window of old priorities is still on its way.
 //!
-//! Transient codestreams are kept for at most [`TRANSIENT_MAX`] slices per
-//! connection, least recently used dropped first; one needed again is
-//! encoded again, to the same bytes, so resume offsets stay valid.
+//! Transient codestreams are kept for at most [`TRANSIENT_MAX`] slices and
+//! [`TRANSIENT_MAX_BYTES`] bytes per connection, least recently used dropped
+//! first (one larger than the byte bound is not kept at all); one needed
+//! again is encoded again, to the same bytes, so resume offsets stay valid.
+//!
+//! A slice first sent whole is single stage for the rest of the
+//! connection. If, after the client evicts it, it can be had as a
+//! codestream, its final stage carries the whole codestream from offset 0,
+//! as the client holds no preview of it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -44,6 +50,8 @@ use crate::AppState;
 const PART_MAX: u64 = 65_536;
 /// Transient codestreams kept per connection.
 const TRANSIENT_MAX: usize = 64;
+/// Bytes of transient codestreams kept per connection.
+const TRANSIENT_MAX_BYTES: u64 = 64 << 20;
 
 type Sink = SplitSink<WebSocket, Message>;
 
@@ -160,25 +168,39 @@ enum Source {
 
 impl Source {
     fn is_transient(&self) -> bool {
-        matches!(self, Source::Htj2k(c) if c.is_transient())
+        self.transient_bytes().is_some()
+    }
+
+    /// Size of a transient codestream; `None` for other sources.
+    fn transient_bytes(&self) -> Option<u64> {
+        match self {
+            Source::Htj2k(c) if c.is_transient() => Some(c.len),
+            _ => None,
+        }
     }
 }
 
 /// Known sources per slice, with at most `max_transient` transient
-/// codestreams (least recently used dropped first).
+/// codestreams of at most `max_bytes` bytes in all (least recently used
+/// dropped first).
 struct Sources {
     slots: Vec<Option<Source>>,
     /// Slices holding a transient codestream, least recently used first.
     transient: VecDeque<usize>,
+    /// Bytes of the transient codestreams in `slots`.
+    bytes: u64,
     max_transient: usize,
+    max_bytes: u64,
 }
 
 impl Sources {
-    fn new(len: usize, max_transient: usize) -> Sources {
+    fn new(len: usize, max_transient: usize, max_bytes: u64) -> Sources {
         Sources {
             slots: vec![None; len],
             transient: VecDeque::new(),
+            bytes: 0,
             max_transient,
+            max_bytes,
         }
     }
 
@@ -192,25 +214,40 @@ impl Sources {
         Some(source)
     }
 
+    /// Keep `source` for `index`. A transient codestream larger than
+    /// `max_bytes` is not kept.
     fn insert(&mut self, index: usize, source: Source) {
         if index >= self.slots.len() {
             return;
         }
         self.remove(index);
-        if source.is_transient() {
-            self.transient.push_back(index);
-            while self.transient.len() > self.max_transient {
-                if let Some(old) = self.transient.pop_front() {
-                    self.slots[old] = None;
-                }
-            }
+        let Some(bytes) = source.transient_bytes() else {
+            self.slots[index] = Some(source);
+            return;
+        };
+        if bytes > self.max_bytes {
+            return;
         }
         self.slots[index] = Some(source);
+        self.transient.push_back(index);
+        self.bytes += bytes;
+        // The newest fits on its own, so it is never the one dropped.
+        while self.transient.len() > self.max_transient || self.bytes > self.max_bytes {
+            match self.transient.front() {
+                Some(&old) => self.remove(old),
+                None => break,
+            }
+        }
     }
 
     fn remove(&mut self, index: usize) {
-        if let Some(slot) = self.slots.get_mut(index) {
-            *slot = None;
+        if let Some(bytes) = self
+            .slots
+            .get_mut(index)
+            .and_then(Option::take)
+            .and_then(|s| s.transient_bytes())
+        {
+            self.bytes -= bytes;
         }
         self.transient.retain(|&i| i != index);
     }
@@ -218,6 +255,18 @@ impl Sources {
     #[cfg(test)]
     fn transient_len(&self) -> usize {
         self.transient.len()
+    }
+
+    /// Bytes of the transient codestreams kept, counted afresh.
+    #[cfg(test)]
+    fn transient_bytes(&self) -> u64 {
+        let sum = self
+            .transient
+            .iter()
+            .filter_map(|&i| self.slots[i].as_ref()?.transient_bytes())
+            .sum();
+        assert_eq!(sum, self.bytes);
+        sum
     }
 }
 
@@ -285,7 +334,7 @@ impl Session {
             sched: StagedScheduler::new(len, state.scheduler, state.htj2k.preview_ahead),
             flow: FlowWindow::new(),
             started: Instant::now(),
-            sources: Sources::new(len, TRANSIENT_MAX),
+            sources: Sources::new(len, TRANSIENT_MAX, TRANSIENT_MAX_BYTES),
             copies: HashMap::new(),
             resume: HashMap::new(),
             abandoned: HashSet::new(),
@@ -446,11 +495,14 @@ impl Session {
                 })
             }
             (Source::Htj2k(codestream), Stage::Final) => {
-                let next = self
-                    .resume
-                    .remove(&index)
-                    .unwrap_or(0)
-                    .max(codestream.preview_end);
+                // A single-stage slice was sent whole before and evicted
+                // since: the client has no preview of it.
+                let start = if self.sched.is_single_stage(index) {
+                    0
+                } else {
+                    codestream.preview_end
+                };
+                let next = self.resume.remove(&index).unwrap_or(0).max(start);
                 if next >= codestream.len {
                     self.final_sent(index);
                     None
@@ -747,7 +799,7 @@ mod tests {
     #[test]
     fn sources_keep_the_most_recently_used_transients() {
         let transient = || Source::Htj2k(Arc::new(codestream(vec![10], 256)));
-        let mut s = Sources::new(10, 3);
+        let mut s = Sources::new(10, 3, u64::MAX);
         s.insert(0, transient());
         s.insert(1, transient());
         s.insert(2, Source::Whole);
@@ -760,6 +812,33 @@ mod tests {
         assert!(s.slots[2].is_some(), "whole sources are not counted");
         s.remove(4);
         assert_eq!(s.transient_len(), 2);
+    }
+
+    /// Large transient codestreams are bounded by bytes, not only by
+    /// count; one larger than the cap is not kept and evicts nothing.
+    #[test]
+    fn sources_keep_transients_under_the_byte_cap() {
+        let big = |len: u64| {
+            let data = Data::Transient(Bytes::new());
+            Source::Htj2k(Arc::new(Codestream::new(
+                &info(8192, 8192),
+                data,
+                len,
+                vec![len as u32],
+                256,
+            )))
+        };
+        let mut s = Sources::new(20, TRANSIENT_MAX, TRANSIENT_MAX_BYTES);
+        for i in 0..10 {
+            s.insert(i, big(20 << 20));
+            assert!(s.transient_bytes() <= TRANSIENT_MAX_BYTES, "after {i}");
+        }
+        assert_eq!(s.transient_len(), 3);
+        assert!(s.slots[9].is_some() && s.slots[8].is_some() && s.slots[7].is_some());
+        s.insert(10, big(TRANSIENT_MAX_BYTES + 1));
+        assert!(s.slots[10].is_none(), "too large to keep");
+        assert_eq!(s.transient_len(), 3, "nothing evicted for it");
+        assert!(s.transient_bytes() <= TRANSIENT_MAX_BYTES);
     }
 
     // --- sessions over a real store ----------------------------------------
@@ -959,5 +1038,36 @@ mod tests {
             panic!()
         };
         assert_eq!(next, codestream.preview_end);
+    }
+
+    /// A slice that went out whole (single stage) and was evicted can
+    /// later resolve to a codestream: the client holds none of it, so its
+    /// final starts at 0, not at the preview's end, and completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whole_slice_resolving_to_a_codestream_after_eviction_starts_at_zero() {
+        let (_dir, mut s) = session(2, true).await;
+        // No re-encode possible while the original is away: sent whole.
+        let original = s.series.slice(0).unwrap().path.clone();
+        let away = original.with_extension("away");
+        std::fs::rename(&original, &away).unwrap();
+        s.recover(0, Stage::Preview, 0).await;
+        assert!(matches!(s.sources.get(0), Some(Source::Whole)));
+        std::fs::rename(&away, &original).unwrap();
+
+        s.apply(ClientMessage::Evicted { indices: vec![0] });
+        cursor(&mut s, 0);
+        assert_eq!(s.sched.pop_next(), Some((0, Stage::Final)));
+        let Some(Job::Stage {
+            next,
+            end,
+            codestream,
+            ..
+        }) = s.start(0, Stage::Final).await.unwrap()
+        else {
+            panic!("expected the copy");
+        };
+        assert!(codestream.preview_end > 0);
+        assert_eq!(next, 0, "the whole codestream is sent");
+        assert_eq!(end, codestream.len);
     }
 }
