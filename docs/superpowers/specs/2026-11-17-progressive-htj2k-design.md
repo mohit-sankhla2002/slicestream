@@ -284,7 +284,8 @@ level `r`. In CI the oracle is Cornerstone's decoder (see Testing), because
 - Database errors are handled the way M1 now handles scan writes: errors
   caused by the row are recorded, transient database errors leave the row
   for a later try.
-- `[htj2k] mode = "background"` (default), `"on-demand"` (no worker), or
+- `[htj2k] mode = "background"` (default), `"on-demand"` (the worker
+  copies only instances a request asked for; final review Ruling 14), or
   `"off"` (no copies, no progressive delivery; requests for HTJ2K get 406 as
   today).
 

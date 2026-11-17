@@ -296,13 +296,18 @@ codestream (transfer syntax `1.2.840.10008.1.2.4.202`, media type
 - *Creation:* never during ingest (C-STORE, STOW-RS, upload, archive). With
   `[htj2k] mode = "background"` (the default) a worker makes copies after
   ingest, newest instances first, and instances near what a viewer asks for
-  go first. With `"on-demand"` there is no worker: a request that wants
-  HTJ2K frames encodes and verifies them at that moment, and they are not
-  kept. With `"off"` no copies are made, and HTJ2K is not offered.
+  go first. With `"on-demand"` the worker copies only instances that a
+  request asked for: a request that wants HTJ2K frames of an instance
+  without a copy encodes and verifies them at that moment (they are not
+  kept), and the worker then makes and keeps the copy of that instance.
+  Instances no request asked for get no copy. With `"off"` no copies are
+  made, and HTJ2K is not offered.
   `workers`, `preview_size` and `preview_ahead` are in
   [`slicestream.example.toml`](slicestream.example.toml). When a copy is
   missing, the request that needs it encodes the frames it needs and does not
-  wait for the worker.
+  wait for the worker. At most `workers` frames are encoded this way at once,
+  across all requests and progressive streams; further encodes wait for a
+  slot.
 - *Disk cost:* a copy is a second file per instance. For uncompressed CT,
   lossless HTJ2K measured about 3:1 in testing, so a copy adds about a third
   of the original's size. For noisy images it adds up to about the size of

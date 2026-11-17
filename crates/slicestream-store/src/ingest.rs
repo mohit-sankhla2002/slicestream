@@ -379,9 +379,18 @@ pub(crate) struct Shared {
     /// These locks are per process. They are sufficient only because this
     /// process is the sole writer of the storage root (see `_root_lock`).
     locks: Box<[Mutex<()>]>,
-    /// Instances to copy before the rest; see [`Ingestor::prioritize_copy`].
+    /// Instances whose copy is being made now, so no two calls make the
+    /// same one.
     pub(crate) copy_inflight: std::sync::Mutex<HashSet<i64>>,
+    /// Instances to copy before the rest; see [`Ingestor::prioritize_copy`].
     pub(crate) copy_queue: std::sync::Mutex<std::collections::VecDeque<i64>>,
+    /// Signalled when an instance is added to `copy_queue`; see
+    /// [`Ingestor::copy_request_waiting`].
+    pub(crate) copy_requested: tokio::sync::Notify,
+    /// Slots of on-demand encodes, shared by every caller of
+    /// [`Ingestor::encode_transient`]; see
+    /// [`Ingestor::limit_on_demand_encodes`].
+    pub(crate) encode_slots: std::sync::Mutex<Arc<tokio::sync::Semaphore>>,
     /// Exclusive lock on `<root>/LOCK`, held for the life of the ingestor.
     _root_lock: std::fs::File,
     #[cfg(test)]
@@ -406,6 +415,38 @@ pub(crate) struct TestHooks {
     pub(crate) panic_in_encode: std::sync::Mutex<Vec<i64>>,
     /// Make the next `write_copy` fail with this error.
     pub(crate) fail_next_write_copy: std::sync::Mutex<Option<sqlx::Error>>,
+    /// Sleep this long inside each on-demand encode.
+    pub(crate) encode_delay: std::sync::Mutex<Option<std::time::Duration>>,
+    /// On-demand encodes running now, and the most seen at once.
+    pub(crate) encodes_running: std::sync::atomic::AtomicUsize,
+    pub(crate) encodes_peak: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts one on-demand encode in [`TestHooks`] while alive.
+#[cfg(test)]
+pub(crate) struct EncodeGauge<'a>(&'a TestHooks);
+
+#[cfg(test)]
+impl<'a> EncodeGauge<'a> {
+    pub(crate) fn enter(hooks: &'a TestHooks) -> EncodeGauge<'a> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = hooks.encodes_running.fetch_add(1, SeqCst) + 1;
+        hooks.encodes_peak.fetch_max(now, SeqCst);
+        let delay = *hooks.encode_delay.lock().unwrap();
+        if let Some(d) = delay {
+            std::thread::sleep(d);
+        }
+        EncodeGauge(hooks)
+    }
+}
+
+#[cfg(test)]
+impl Drop for EncodeGauge<'_> {
+    fn drop(&mut self) {
+        self.0
+            .encodes_running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +714,10 @@ impl Ingestor {
             locks,
             copy_queue: Default::default(),
             copy_inflight: Default::default(),
+            copy_requested: Default::default(),
+            encode_slots: std::sync::Mutex::new(Arc::new(tokio::sync::Semaphore::new(
+                crate::derived::default_encode_slots(),
+            ))),
             _root_lock: root_lock,
             #[cfg(test)]
             hooks: TestHooks::default(),

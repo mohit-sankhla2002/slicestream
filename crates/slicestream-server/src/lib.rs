@@ -245,13 +245,24 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         shutdown.clone(),
         BACKFILL_RETRY,
     ));
-    let copier = (config.htj2k.mode == Htj2kMode::Background).then(|| {
+    // On-demand encodes (DICOMweb frames and the progressive stream) share
+    // one limit, as many at once as the copy worker runs.
+    ingestor.limit_on_demand_encodes(config.htj2k.worker_count());
+    // `background` copies every eligible instance; `on-demand` only those
+    // a request asked for; `off` none.
+    let scope = match config.htj2k.mode {
+        Htj2kMode::Background => Some(CopyScope::All),
+        Htj2kMode::OnDemand => Some(CopyScope::Requested),
+        Htj2kMode::Off => None,
+    };
+    let copier = scope.map(|scope| {
         tokio::spawn(copy_worker(
             Arc::clone(&ingestor),
             shutdown.clone(),
             COPY_RETRY,
             COPY_IDLE,
             config.htj2k.worker_count(),
+            scope,
         ))
     });
     if config.dicomweb.enabled && !http_addr.ip().is_loopback() {
@@ -459,24 +470,36 @@ const COPY_RETRY: Duration = Duration::from_secs(5);
 /// How long the copy worker waits when no instance needs a copy.
 const COPY_IDLE: Duration = Duration::from_secs(10);
 
+/// Which instances the copy worker copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyScope {
+    /// Every eligible instance, requested ones first.
+    All,
+    /// Only the instances a request asked for.
+    Requested,
+}
+
 /// Make HTJ2K copies in batches until shutdown, `parallel` instances at a
 /// time. A batch that wrote nothing waits `idle` (new instances may have
-/// arrived); a failed batch waits `retry`. Shutdown ends a batch after the
-/// group of instances in flight.
+/// arrived) or until a request queues an instance; a failed batch waits
+/// `retry`. Shutdown ends a batch after the group of instances in flight.
 async fn copy_worker(
     ingestor: Arc<Ingestor>,
     shutdown: CancellationToken,
     retry: Duration,
     idle: Duration,
     parallel: usize,
+    scope: CopyScope,
 ) {
     let mut copied = 0;
     while !shutdown.is_cancelled() {
-        let wait = match ingestor
-            .copy_batch(COPY_BATCH, parallel, || shutdown.is_cancelled())
-            .await
-        {
-            Ok(0) => idle,
+        let stop = || shutdown.is_cancelled();
+        let batch = match scope {
+            CopyScope::All => ingestor.copy_batch(COPY_BATCH, parallel, stop).await,
+            CopyScope::Requested => ingestor.copy_requested(COPY_BATCH, parallel, stop).await,
+        };
+        let (wait, wake_on_request) = match batch {
+            Ok(0) => (idle, true),
             Ok(n) => {
                 copied += n;
                 // scripts/bench-slowlink.sh waits for this message and its
@@ -490,11 +513,12 @@ async fn copy_worker(
                     "HTJ2K copy batch failed: {e}; retrying in {} s",
                     retry.as_secs_f32()
                 );
-                retry
+                (retry, false)
             }
         };
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
+            _ = ingestor.copy_request_waiting(), if wake_on_request => {}
             _ = shutdown.cancelled() => {}
         }
     }
@@ -599,6 +623,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             1,
+            CopyScope::All,
         ));
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -628,6 +653,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(50),
             2,
+            CopyScope::All,
         ));
         let uid = ingestor.index().list_series().await.unwrap()[0]
             .series_instance_uid

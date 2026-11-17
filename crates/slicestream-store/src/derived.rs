@@ -24,6 +24,12 @@ const NO_FRAME_TABLE: &str = "no frame table";
 
 const ENCODING_VERSION: u8 = 1;
 
+/// Default number of on-demand encodes at once: half the cores, at least 1.
+pub(crate) fn default_encode_slots() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (cores / 2).max(1)
+}
+
 /// Where one frame's codestream lives in the copy blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyFrame {
@@ -326,6 +332,35 @@ impl Ingestor {
         parallel: usize,
         stop: impl Fn() -> bool,
     ) -> Result<usize, IngestError> {
+        self.copy_some(limit, parallel, stop, true).await
+    }
+
+    /// [`copy_batch`](Self::copy_batch) over the instances of
+    /// [`prioritize_copy`](Self::prioritize_copy) only (the instances a
+    /// request asked for), never the other instances without a copy.
+    pub async fn copy_requested(
+        &self,
+        limit: i64,
+        parallel: usize,
+        stop: impl Fn() -> bool,
+    ) -> Result<usize, IngestError> {
+        self.copy_some(limit, parallel, stop, false).await
+    }
+
+    /// Wait until an instance is queued by
+    /// [`prioritize_copy`](Self::prioritize_copy). A request queued while
+    /// nobody waited wakes the next call at once.
+    pub async fn copy_request_waiting(&self) {
+        self.shared.copy_requested.notified().await;
+    }
+
+    async fn copy_some(
+        &self,
+        limit: i64,
+        parallel: usize,
+        stop: impl Fn() -> bool,
+        candidates: bool,
+    ) -> Result<usize, IngestError> {
         let wanted = usize::try_from(limit).unwrap_or(0);
         let mut ids: Vec<i64> = {
             let mut queue = self.shared.copy_queue.lock().unwrap();
@@ -339,7 +374,7 @@ impl Ingestor {
                 last_error = Some(e);
             }
         }
-        if ids.len() < wanted {
+        if candidates && ids.len() < wanted {
             for (id, _, _) in self.shared.index.copy_candidates(limit).await? {
                 if ids.len() >= wanted {
                     break;
@@ -379,13 +414,25 @@ impl Ingestor {
     }
 
     /// Have [`copy_batch`](Self::copy_batch) copy instance `id` before the
-    /// others. The queue is in memory, holds 1024 instances and drops
+    /// others (and [`copy_requested`](Self::copy_requested) copy it at
+    /// all). The queue is in memory, holds 1024 instances and drops
     /// further requests when full; an instance is queued once.
     pub fn prioritize_copy(&self, id: i64) {
         let mut queue = self.shared.copy_queue.lock().unwrap();
         if queue.len() < PRIORITY_CAPACITY && !queue.contains(&id) {
             queue.push_back(id);
+            self.shared.copy_requested.notify_one();
         }
+    }
+
+    /// Run at most `permits` (at least 1) encodes of
+    /// [`encode_transient`](Self::encode_transient) at once, across all
+    /// callers; the others wait for a slot. The default is half the cores
+    /// (at least 1). Encodes already running keep the slot they hold, so
+    /// set it before serving requests.
+    pub fn limit_on_demand_encodes(&self, permits: usize) {
+        *self.shared.encode_slots.lock().unwrap() =
+            Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
     }
 
     /// The current `Ready` copy of instance `id` made from `blob` and the
@@ -404,9 +451,13 @@ impl Ingestor {
     }
 
     /// Encode the 1-based frames `numbers` of instance `id` now, verified,
-    /// without storing anything, and queue the instance for its copy.
+    /// without storing anything, and queue the instance for its copy. Each
+    /// frame waits for a slot of
+    /// [`limit_on_demand_encodes`](Self::limit_on_demand_encodes), held
+    /// until its encode ends even when the caller goes away.
     /// [`IngestError::NotFound`] for an unknown instance;
-    /// [`IngestError::Unparseable`] when a frame or a frame table does not exist, the instance is not eligible, or encoding fails.
+    /// [`IngestError::Unparseable`] when a frame or a frame table does not
+    /// exist, the instance is not eligible, or encoding fails or panics.
     pub async fn encode_transient(
         &self,
         id: i64,
@@ -434,13 +485,38 @@ impl Ingestor {
                 _ => return Err(IngestError::Unparseable(format!("no frame {number}"))),
             };
             let (path, table, info) = (path.clone(), table.clone(), info.clone());
-            let encoded =
-                tokio::task::spawn_blocking(move || encode_frame(&path, &table, frame, &info))
-                    .await
-                    .map_err(|e| {
-                        error!(id, error = %e, "transient encoder failed");
-                        IngestError::Storage(std::io::Error::other(e))
-                    })?;
+            let slots = Arc::clone(&self.shared.encode_slots.lock().unwrap());
+            let slot = slots
+                .acquire_owned()
+                .await
+                .map_err(|e| IngestError::Storage(std::io::Error::other(e)))?;
+            #[cfg(test)]
+            let (shared, panics) = (
+                Arc::clone(&self.shared),
+                crate::ingest::TestHooks::panics(&self.shared.hooks.panic_in_encode, id),
+            );
+            let encoded = tokio::task::spawn_blocking(move || {
+                // Released when the encode ends, not when the caller stops
+                // waiting for it.
+                let _slot = slot;
+                #[cfg(test)]
+                let _gauge = crate::ingest::EncodeGauge::enter(&shared.hooks);
+                #[cfg(test)]
+                if panics {
+                    panic!("injected encoder panic");
+                }
+                encode_frame(&path, &table, frame, &info)
+            })
+            .await
+            .map_err(|e| {
+                error!(id, error = %e, "transient encoder failed");
+                if e.is_panic() {
+                    // The instance's problem, as when encoding fails.
+                    IngestError::Unparseable(ENCODER_FAILED.to_owned())
+                } else {
+                    IngestError::Storage(std::io::Error::other(e))
+                }
+            })?;
             out.push(encoded.map_err(|e| match e {
                 FrameFailure::Transient(e) => IngestError::Storage(e),
                 FrameFailure::Codec(e) => IngestError::Unparseable(e.to_string()),
@@ -453,6 +529,9 @@ impl Ingestor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -521,6 +600,87 @@ mod tests {
         assert!(matches!(state(ids[0]).await, CopyState::Ready { .. }));
         assert!(matches!(state(ids[2]).await, CopyState::Ready { .. }));
         assert!(index.copy_candidates(10).await.unwrap().is_empty());
+    }
+
+    /// Instances of the phantom, imported into a fresh store.
+    async fn phantom_store(d: &std::path::Path, n: usize) -> (Arc<Ingestor>, Vec<i64>) {
+        let src = d.join("src");
+        crate::phantom::write_phantom(&src, n, 16).unwrap();
+        let ing = Ingestor::open(crate::StorageConfig {
+            root: d.join("store"),
+            max_instance_bytes: 1 << 30,
+            on_duplicate: crate::DuplicatePolicy::Keep,
+        })
+        .await
+        .unwrap();
+        for i in 1..=n {
+            ing.import_file(&src.join(format!("IM{i:05}.dcm")))
+                .await
+                .unwrap();
+        }
+        let ids = sqlx::query_scalar("SELECT id FROM instances ORDER BY id")
+            .fetch_all(&ing.shared.index.pool)
+            .await
+            .unwrap();
+        (ing, ids)
+    }
+
+    /// Concurrent on-demand encodes never run more at once than the limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn on_demand_encodes_are_bounded() {
+        let d = tempfile::tempdir().unwrap();
+        let (ing, ids) = phantom_store(d.path(), 4).await;
+        ing.limit_on_demand_encodes(2);
+        *ing.shared.hooks.encode_delay.lock().unwrap() = Some(Duration::from_millis(100));
+        let tasks: Vec<_> = (0..8)
+            .map(|i| {
+                let (ing, id) = (Arc::clone(&ing), ids[i % ids.len()]);
+                tokio::spawn(async move { ing.encode_transient(id, &[1]).await })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(t.await.unwrap().unwrap().len(), 1);
+        }
+        let peak = ing.shared.hooks.encodes_peak.load(Ordering::SeqCst);
+        assert_eq!(peak, 2, "at most two encodes at once, and two did overlap");
+    }
+
+    /// A caller that goes away does not free its slot while its encode
+    /// still runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropped_caller_keeps_its_slot_until_the_encode_ends() {
+        let d = tempfile::tempdir().unwrap();
+        let (ing, ids) = phantom_store(d.path(), 2).await;
+        ing.limit_on_demand_encodes(1);
+        *ing.shared.hooks.encode_delay.lock().unwrap() = Some(Duration::from_millis(300));
+        let first = {
+            let (ing, id) = (Arc::clone(&ing), ids[0]);
+            tokio::spawn(async move { ing.encode_transient(id, &[1]).await })
+        };
+        while ing.shared.hooks.encodes_running.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        first.abort();
+        assert_eq!(ing.encode_transient(ids[1], &[1]).await.unwrap().len(), 1);
+        assert_eq!(ing.shared.hooks.encodes_peak.load(Ordering::SeqCst), 1);
+    }
+
+    /// An encoder panic during an on-demand encode means "no HTJ2K for this
+    /// instance", like an ineligible one, not a storage error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_demand_encoder_panic_is_unparseable() {
+        let d = tempfile::tempdir().unwrap();
+        let (ing, ids) = phantom_store(d.path(), 1).await;
+        ing.shared
+            .hooks
+            .panic_in_encode
+            .lock()
+            .unwrap()
+            .push(ids[0]);
+        assert!(matches!(
+            ing.encode_transient(ids[0], &[1]).await,
+            Err(IngestError::Unparseable(_))
+        ));
     }
 
     /// Two instances with identical pixels share one content-addressed copy

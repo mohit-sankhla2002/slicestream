@@ -48,8 +48,10 @@ max_results = 1000    # QIDO limit: default and maximum
 # are never modified). Copies are made by this worker or on demand, never
 # during ingest.
 [htj2k]
-mode = "background"       # background | on-demand | off
-workers = 0               # instances encoded at once; 0 = half the cores (at least 1)
+mode = "background"       # background: copy every eligible instance; on-demand: copy only
+                          # instances a request asked for; off: no copies, no HTJ2K
+workers = 0               # instances encoded at once by the worker, and frames encoded at
+                          # once on demand by requests; 0 = half the cores (at least 1)
 preview_size = 256        # longest side of the first progressive preview, in pixels
 preview_ahead = 32        # slices ahead of the viewer that get a copy first
 prefer_for_wildcard = false  # true: transfer-syntax=*, */* and no Accept get HTJ2K copies

@@ -433,6 +433,30 @@ async fn prioritized_instance_goes_first() {
     assert!(ing.copy_frames(ids[4], &source).await.unwrap().is_some());
 }
 
+/// `copy_requested` copies only queued instances, never the other
+/// candidates; `copy_request_waiting` wakes for a request made before it.
+#[tokio::test]
+async fn copy_requested_copies_only_queued_instances() {
+    let d = tempfile::tempdir().unwrap();
+    let (ing, ids, idx) = open(d.path(), DuplicatePolicy::Keep).await;
+    assert_eq!(ing.copy_requested(10, 2, || false).await.unwrap(), 0);
+    assert_eq!(copy_rows(&ing).await, 0);
+
+    ing.prioritize_copy(ids[1]);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ing.copy_request_waiting(),
+    )
+    .await
+    .expect("a queued request wakes the waiter");
+    assert_eq!(ing.copy_requested(10, 2, || false).await.unwrap(), 1);
+    assert_eq!(copy_rows(&ing).await, 1);
+    let source = source_of(&ing, ids[1]).await;
+    assert!(ing.copy_frames(ids[1], &source).await.unwrap().is_some());
+    assert_eq!(ing.copy_requested(10, 2, || false).await.unwrap(), 0);
+    assert_eq!(idx.copy_candidates(10).await.unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn transient_encode_stores_nothing() {
     let d = tempfile::tempdir().unwrap();

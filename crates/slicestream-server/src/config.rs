@@ -201,9 +201,12 @@ impl Default for DicomwebConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Htj2kMode {
-    /// A background worker copies every eligible instance, newest first.
+    /// A background worker copies every eligible instance, newest first
+    /// (instances a request asked for go first).
     Background,
-    /// Copies are made only when a request asks for one.
+    /// A request that wants HTJ2K frames without a copy encodes them on the
+    /// spot; the worker then stores the copy of that instance. Instances no
+    /// request asked for get no copy.
     OnDemand,
     /// No copies are made.
     Off,
@@ -216,8 +219,9 @@ pub enum Htj2kMode {
 pub struct Htj2kConfig {
     /// When copies are made.
     pub mode: Htj2kMode,
-    /// Instances encoded at once by the background worker; 0 is half the
-    /// cores (at least 1).
+    /// Instances encoded at once by the copy worker, and frames encoded at
+    /// once on demand across all requests (a separate limit of the same
+    /// size); 0 is half the cores (at least 1).
     pub workers: usize,
     /// Longest side, in pixels, of the first preview a progressive stream
     /// sends (at least 1).
@@ -242,7 +246,8 @@ impl Default for Htj2kConfig {
 }
 
 impl Htj2kConfig {
-    /// Instances the background worker encodes at once.
+    /// Instances the copy worker encodes at once, and the limit of
+    /// on-demand encodes.
     pub fn worker_count(&self) -> usize {
         if self.workers > 0 {
             return self.workers;
