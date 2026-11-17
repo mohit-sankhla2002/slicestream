@@ -30,13 +30,23 @@
 //! pipe last went from empty to non-empty (an idle gap): the interval then
 //! spans the gap. Increases always apply.
 //!
+//! Sending: callers gate every message with [`FlowWindow::can_send`], not
+//! with `room()` or `window()`, which are informational. `can_send` admits a
+//! message when `unacked + len` fits the current limit (the probe cap while
+//! probing, the window otherwise), and always admits one message of any size
+//! into an empty pipe, so a message larger than the limit (e.g. a 512 KiB
+//! whole frame) is never blocked forever: it waits for the pipe to drain.
+//!
 //! RTT probing: a standing queue raises every sample, so expiring the minimum
 //! by age alone would let it drift up with the window. Every `PROBE_INTERVAL`
 //! (10 s) the sender is held to `FLOOR` unacked bytes (`FLOOR / 2` when the
-//! window is already at `FLOOR`) until a byte sent under that cap is acked;
-//! that sample sees a short queue and replaces the minimum. The adaptive
-//! window is untouched while probing, and decreases wait for a base sample
-//! taken one round trip after the probe.
+//! window is already at `FLOOR`) until the first message sent after the probe
+//! began is fully acked; that sample sees a short queue and replaces the
+//! minimum. If that message is larger than the cap it goes out once the pipe
+//! is empty and its own ack ends the probe (its sample then includes the
+//! message's transmission time). The adaptive window is untouched while
+//! probing, and decreases wait for a base sample taken one round trip after
+//! the probe.
 //!
 //! Limitation: on a very slow link a probe takes as long as the capped queue
 //! needs to drain (e.g. about 52 s at 10 kbit/s for `FLOOR / 2`), during which
@@ -69,7 +79,8 @@ pub struct FlowWindow {
     probe_cap: u64,
     /// Probing: the unacked cap is `probe_cap` until `probe_target` is acked.
     probing: bool,
-    /// Cumulative bytes sent once the probe's first part left; acked ends it.
+    /// Cumulative bytes sent once the probe's first message left (it may be
+    /// larger than `probe_cap` if sent into an empty pipe); acked ends it.
     probe_target: Option<u64>,
     next_probe: Duration,
     /// Count of window-limited sends so far.
@@ -180,6 +191,16 @@ impl FlowWindow {
         self.acks.push_back((now, total, self.limited_sends));
     }
 
+    /// Whether a message of `len` payload bytes may be sent now. This is the
+    /// send gate: an empty pipe admits one message of any size; otherwise
+    /// `unacked + len` must fit the current limit (the probe cap while
+    /// probing, the window otherwise).
+    pub fn can_send(&self, len: u64) -> bool {
+        let unacked = self.unacked();
+        unacked == 0 || unacked.saturating_add(len) <= self.limit()
+    }
+
+    /// The adaptive window. Informational: gate sends with `can_send`.
     pub fn window(&self) -> u64 {
         self.window
     }
@@ -188,14 +209,19 @@ impl FlowWindow {
         self.sent - self.acked
     }
 
-    /// Bytes that may still be sent: window minus unacked, saturating.
+    /// Current limit minus unacked, saturating. Informational: gate sends
+    /// with `can_send` (it also admits a message into an empty pipe).
     pub fn room(&self) -> u64 {
-        let cap = if self.probing {
+        self.limit().saturating_sub(self.unacked())
+    }
+
+    /// Unacked byte limit: the probe cap while probing, else the window.
+    fn limit(&self) -> u64 {
+        if self.probing {
             self.probe_cap
         } else {
             self.window
-        };
-        cap.saturating_sub(self.unacked())
+        }
     }
 }
 
@@ -210,7 +236,8 @@ mod tests {
     const PART: u64 = 65_536;
 
     /// Simulated link of `bytes_per_s` with `rtt_ms` latency, driven by an
-    /// explicit 1 ms clock. The sender sends 64 KiB parts whenever it has room.
+    /// explicit 1 ms clock. The sender sends `part`-byte messages (64 KiB by
+    /// default) whenever `can_send` admits one.
     struct Sim {
         f: FlowWindow,
         bytes_per_s: u64,
@@ -222,6 +249,10 @@ mod tests {
         part: u64,
         /// Sender is paused until the pipe drains, then resumes in that very tick.
         gap: bool,
+        /// Last tick in which a part was sent (or sending was off).
+        last_send_ms: u64,
+        /// Longest run of ticks with sending wanted but nothing sent.
+        max_stall_ms: u64,
     }
 
     impl Sim {
@@ -236,6 +267,8 @@ mod tests {
                 sent: 0,
                 part: PART,
                 gap: false,
+                last_send_ms: 0,
+                max_stall_ms: 0,
             }
         }
 
@@ -253,13 +286,20 @@ mod tests {
                 if self.gap && self.inflight.is_empty() {
                     self.gap = false;
                 }
-                while sending && !self.gap && self.f.room() >= self.part {
+                let mut did_send = false;
+                while sending && !self.gap && self.f.can_send(self.part) {
                     self.f.on_sent(self.part, ms(self.t));
                     self.sent += self.part;
+                    did_send = true;
                     let start = self.link_free_ms.max(self.t as f64);
                     self.link_free_ms = start + self.part as f64 * 1000.0 / self.bytes_per_s as f64;
                     self.inflight
                         .push_back((self.link_free_ms.ceil() as u64 + self.rtt_ms, self.sent));
+                }
+                if did_send || !sending {
+                    self.last_send_ms = self.t;
+                } else {
+                    self.max_stall_ms = self.max_stall_ms.max(self.t - self.last_send_ms);
                 }
             }
         }
@@ -391,6 +431,58 @@ mod tests {
         sim.run(3_000, true);
         let goodput = (sim.sent - at) as f64 / 3.0;
         assert!(goodput >= 0.8 * 12_500_000.0, "goodput {goodput}");
+    }
+
+    #[test]
+    fn can_send_admits_any_size_into_an_empty_pipe() {
+        let mut f = FlowWindow::new();
+        assert!(f.can_send(CEILING * 2));
+        f.on_sent(1, ms(0));
+        assert!(f.can_send(INITIAL - 1));
+        assert!(!f.can_send(INITIAL));
+    }
+
+    #[test]
+    fn message_larger_than_floor_probe_cap_is_sent_and_ends_the_probe() {
+        // Small parts and a 1 ms RTT pin the window at FLOOR.
+        let mut sim = Sim::new(12_500_000, 1);
+        sim.part = 16_384;
+        while !sim.f.probing {
+            sim.run(1, true);
+            assert!(sim.t < 15_000, "no probe started");
+        }
+        assert_eq!(sim.f.window(), FLOOR);
+        assert_eq!(sim.f.probe_cap, FLOOR / 2);
+        assert_eq!(sim.f.probe_target, None, "probe already has a first send");
+        // From now on every message is 100,000 bytes, above the probe cap.
+        sim.part = 100_000;
+        let at = sim.sent;
+        let start = sim.t;
+        while sim.f.probing {
+            sim.run(1, true);
+            assert!(sim.t - start < 1_000, "probe never ended");
+        }
+        assert!(sim.sent >= at + 100_000, "the large message was not sent");
+        sim.run(5_000, true);
+        assert!(sim.max_stall_ms <= 50, "stalled {} ms", sim.max_stall_ms);
+    }
+
+    #[test]
+    fn whole_frames_keep_flowing_across_probes() {
+        // 512 KiB whole-frame messages exceed the probe cap above FLOOR.
+        let mut sim = Sim::new(12_500_000, 80);
+        sim.part = 524_288;
+        let mut probes = 0;
+        for _ in 0..45_000 {
+            let was_probing = sim.f.probing;
+            sim.run(1, true);
+            if was_probing && !sim.f.probing {
+                probes += 1;
+            }
+        }
+        assert!(probes >= 3, "only {probes} probes completed");
+        assert!(sim.max_stall_ms <= 1_000, "stalled {} ms", sim.max_stall_ms);
+        assert!(sim.sent >= 45 * 12_500_000 / 2, "sent only {}", sim.sent);
     }
 
     #[test]
