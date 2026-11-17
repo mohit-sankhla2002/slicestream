@@ -5,7 +5,7 @@ use slicestream_core::FrameInfo;
 
 use crate::CodecError;
 use crate::levels::decomposition_levels;
-use crate::samples::{eligibility, samples};
+use crate::samples::{MAX_PIXELS, eligibility, samples};
 
 /// A finished copy and where each resolution ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,7 @@ fn enc_err(e: impl std::fmt::Display) -> CodecError {
 /// Encode samples as lossless HTJ2K, RPCL, one tile, TLM marker.
 pub fn encode(samples: &[i32], info: &FrameInfo) -> Result<Encoded, CodecError> {
     let (w, h) = (info.columns as u32, info.rows as u32);
-    if samples.len() != w as usize * h as usize {
+    if samples.len() as u64 != u64::from(w) * u64::from(h) {
         return Err(CodecError::Encode(format!(
             "{} samples for {w}x{h}",
             samples.len()
@@ -81,8 +81,16 @@ pub fn decode_full(codestream: &[u8]) -> Result<Vec<i32>, CodecError> {
     let mut input = MemInfile::new(codestream);
     cs.read_headers(&mut input).map_err(enc_err)?;
     let extent = cs.access_siz().get_image_extent();
+    let pixels = u64::from(extent.x) * u64::from(extent.y);
+    if pixels > MAX_PIXELS {
+        return Err(CodecError::Encode(format!(
+            "{} x {} is more than {MAX_PIXELS} pixels",
+            extent.x, extent.y
+        )));
+    }
     cs.create(&mut input).map_err(enc_err)?;
-    let mut out = Vec::with_capacity(extent.x as usize * extent.y as usize);
+    // At most MAX_PIXELS, which fits a 32-bit usize.
+    let mut out = Vec::with_capacity(pixels as usize);
     for _ in 0..extent.y {
         let line = cs
             .pull(0)

@@ -16,6 +16,10 @@ impl fmt::Display for NotEligible {
 
 const BIG_ENDIAN: &str = "1.2.840.10008.1.2.2";
 
+/// Largest frame, in pixels (64 Mpixel, e.g. 8192 x 8192), that gets a copy.
+/// Larger frames are served as stored.
+pub const MAX_PIXELS: u64 = 67_108_864;
+
 pub fn eligibility(info: &FrameInfo) -> Result<(), NotEligible> {
     let no = |s: String| Err(NotEligible(s));
     if info.is_encapsulated() {
@@ -48,6 +52,13 @@ pub fn eligibility(info: &FrameInfo) -> Result<(), NotEligible> {
     if info.rows == 0 || info.columns == 0 {
         return no("empty frame".into());
     }
+    let pixels = u64::from(info.rows) * u64::from(info.columns);
+    if pixels > MAX_PIXELS {
+        return no(format!(
+            "{} x {} is {pixels} pixels, more than {MAX_PIXELS}",
+            info.columns, info.rows
+        ));
+    }
     Ok(())
 }
 
@@ -60,12 +71,12 @@ pub fn samples(frame: &[u8], info: &FrameInfo) -> Result<Vec<i32>, CodecError> {
         )));
     }
     let bytes = (info.bits_allocated / 8) as usize;
-    let count = info.rows as usize * info.columns as usize;
-    if frame.len() != count * bytes {
+    // In u64: the product does not fit a 32-bit usize for the largest frames.
+    let expected = u64::from(info.rows) * u64::from(info.columns) * bytes as u64;
+    if frame.len() as u64 != expected {
         return Err(CodecError::BadFrame(format!(
-            "{} bytes, expected {}",
-            frame.len(),
-            count * bytes
+            "{} bytes, expected {expected}",
+            frame.len()
         )));
     }
     let big = info.transfer_syntax == BIG_ENDIAN;
@@ -168,5 +179,24 @@ mod tests {
         assert!(eligibility(&info(16, 0, 0, LE, 4, 4)).is_err());
         assert!(eligibility(&info(8, 9, 0, LE, 4, 4)).is_err());
         assert!(eligibility(&info(16, 16, 0, "1.2.840.10008.1.2.4.50", 4, 4)).is_err());
+    }
+
+    #[test]
+    fn eligibility_pixel_ceiling() {
+        assert_eq!(MAX_PIXELS, 67_108_864);
+        assert!(eligibility(&info(16, 16, 0, LE, 8192, 8192)).is_ok());
+        let over = eligibility(&info(16, 16, 0, LE, 8192, 8193)).unwrap_err();
+        assert!(over.0.contains("pixels"), "{over}");
+        assert!(eligibility(&info(16, 16, 0, LE, u16::MAX, u16::MAX)).is_err());
+    }
+
+    #[test]
+    fn samples_size_check_does_not_overflow() {
+        // 65535 x 65535 x 2 bytes does not fit a 32-bit usize; the check
+        // must still reject a short buffer instead of wrapping.
+        assert!(matches!(
+            samples(&[0; 4], &info(16, 16, 0, LE, u16::MAX, u16::MAX)),
+            Err(CodecError::BadFrame(_))
+        ));
     }
 }

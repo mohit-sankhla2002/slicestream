@@ -14,7 +14,7 @@ mod samples;
 pub use conformance::check_conformance;
 pub use encode::{Encoded, decode_full, encode, encode_verified, encode_verified_with};
 pub use levels::{decomposition_levels, preview_level};
-pub use samples::{NotEligible, eligibility, samples};
+pub use samples::{MAX_PIXELS, NotEligible, eligibility, samples};
 
 /// Transfer syntax of the copies: HTJ2K Lossless, RPCL progression.
 pub const HTJ2K_RPCL: &str = "1.2.840.10008.1.2.4.202";
