@@ -34,6 +34,10 @@ name = "openjph_core"
 path = "src/lib.rs"
 
 [[test]]
+name = "encoder_round_trip"
+path = "tests/encoder_round_trip.rs"
+
+[[test]]
 name = "integration_encode_decode"
 path = "tests/integration_encode_decode.rs"
 

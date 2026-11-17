@@ -28,3 +28,28 @@ Also: `tests/resolution_ends.rs` and its `[[test]]` entry (the manifest sets
 `autotests = false`).
 
 Upstream: to be proposed.
+
+## 2. Packet header padding (encoder bug fix)
+
+What: `BitBufferWrite::finalize` (src/codestream/bitbuffer_write.rs) now
+emits the fewest bytes that hold the packet header's bits, like OpenJPH's
+`bb_terminate`: the remaining whole bytes, then one zero-padded byte for any
+leftover bits, then a 0x00 only if the last byte is 0xFF.
+
+Why: the encoder wrote some packet headers one byte too long, and every
+decoder (this crate's and OpenJPH's C++ one) then read the packet body one
+byte off, so that packet's code-blocks, and the packets after it, decoded
+to wrong samples. `write` only
+flushes once 32 bits are pending, so `finalize` could start with up to 31
+bits; it rounded them up to a multiple of 8 before flushing, but a 0xFF
+emitted during that flush makes the next byte carry 7 bits, so the rounding
+left a few bits over, which went into an extra byte. Whether it happens
+depends on where 0xFF falls in the header, so only some images were hit.
+The code-block bytes themselves were already identical to OpenJPH's.
+
+Also: `tests/encoder_round_trip.rs` and its `[[test]]` entry (reproductions
+plus a sweep over sizes, precisions, signedness, levels, block sizes and
+content), and the unit test `finalize_emits_no_extra_byte_after_stuffing`.
+
+Upstream: to be proposed (to the openjph-core port; OpenJPH's C++ is not
+affected).
