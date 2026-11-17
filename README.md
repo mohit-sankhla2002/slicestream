@@ -244,8 +244,9 @@ authentication yet; see [SECURITY.md](SECURITY.md).
 
 For viewing over a slow connection, slicestream keeps a lossless HTJ2K copy
 of each eligible instance (native, monochrome, 8 or 16 bit) next to the
-original, and serves its frames as `image/jphc` with HTTP `Range`, so a
-viewer shows a low-resolution image from the first bytes and sharpens it.
+original, and serves its frames as `image/jphc` (streamed, or by HTTP
+`Range`), so a viewer shows a low-resolution image from the first bytes and
+sharpens it.
 Originals are never changed, and a copy is served only after it decodes to
 exactly the original pixels. Settings, with their defaults, are in the
 `[htj2k]` section of `slicestream.example.toml`:
@@ -264,11 +265,80 @@ The rules for what is served, and `Range`, are in
 opt-in progressive mode (`?progressive=htj2k`), described in
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
-A second OHIF data source entry for this setup (the exact option keys that
-make Cornerstone ask for HTJ2K and use ranges):
+A second OHIF data source entry for this setup asks for the HTJ2K copy and
+has Cornerstone decode each frame while it streams in, so a lower-resolution
+preview shows first and then the exact image. Add it to `dataSources` and
+make it the default (`defaultDataSourceName: 'slicestream-slow'`): OHIF
+reads `acceptHeader` and `stackRetrieveOptions` from the active data source
+when the viewer starts, and in testing, picking the entry with
+`?datasources=` in the URL still sent the default entry's `Accept`.
 
-<!-- TODO(Task 11): replace this line with the verified OHIF "slow links" data source entry. -->
-_OHIF "slow links" data source keys: to be added after they are tested against OHIF._
+```js
+{
+  namespace: '@ohif/extension-default.dataSourcesModule.dicomweb',
+  sourceName: 'slicestream-slow',
+  configuration: {
+    friendlyName: 'slicestream (slow links)',
+    name: 'slicestream-slow',
+    qidoRoot: 'http://localhost:8080/dicom-web',
+    wadoRoot: 'http://localhost:8080/dicom-web',
+    wadoUriRoot: 'http://localhost:8080/dicom-web',
+    imageRendering: 'wadors',
+    thumbnailRendering: 'wadors',
+    enableStudyLazyLoad: true,
+    supportsFuzzyMatching: false,
+    supportsWildcard: true,
+    qidoSupportsIncludeField: true,
+    staticWado: false,
+    bulkDataURI: { enabled: true },
+    omitQuotationForMultipartRequest: true,
+    // Frames: the HTJ2K copy, or the stored frame for an instance without one.
+    acceptHeader: [
+      'multipart/related; type="image/jphc"; transfer-syntax=1.2.840.10008.1.2.4.202, ' +
+        'multipart/related; type="application/octet-stream"; transfer-syntax=*',
+    ],
+    // Stack viewports: decode the partial frame every 16 KiB, at most one
+    // resolution level down (256 x 256 for a 512 x 512 CT).
+    stackRetrieveOptions: {
+      retrieveOptions: { single: { streaming: true, decodeLevel: 1, minChunkSize: 16384 } },
+    },
+  },
+}
+```
+
+`acceptHeader` is the Accept header OHIF sends for frames (through
+Cornerstone's `beforeSend`); `stackRetrieveOptions` is merged into the
+retrieve configuration OHIF gives Cornerstone for stack viewports.
+`minChunkSize` defaults to 128 KiB, which is most of a lossless CT frame,
+so without it no preview would show. This was checked with the
+`ohif/app:v3.13.14` image (Cornerstone 5.6.8) through a simulated 10 Mbit/s,
+80 ms link: the frames came back as `image/jphc`, a preview was drawn
+before the full image, the final pixels in Cornerstone's cache equalled the
+stored ones, there were no console errors, and the phantom's first image
+was drawn about 0.27 s after its frame was requested, against about 0.55 s
+with the entry above (see `scripts/bench-slowlink.sh` for the stream's
+numbers).
+
+Byte ranges instead of streaming also work, with one catch. Cornerstone
+5.6.8 sends range requests with a fixed
+`Accept: multipart/related; type=application/octet-stream; transfer-syntax=*`
+(they bypass `beforeSend`, so `acceptHeader` does not apply), and the server
+answers that with HTJ2K only when `[htj2k] prefer_for_wildcard = true`. With
+that set, these retrieve stages fetch the first 64 KiB of each frame and
+then the rest:
+
+```js
+stackRetrieveOptions: {
+  stages: [
+    { id: 'lossySequential', retrieveType: 'singleFast' },
+    { id: 'finalSequential', retrieveType: 'singleFinal' },
+  ],
+  retrieveOptions: {
+    singleFast: { rangeIndex: 0, chunkSize: 65536, decodeLevel: 1 },
+    singleFinal: { rangeIndex: -1 },
+  },
+},
+```
 
 To try it without patient data, store the phantom and a synthetic RLE
 multi-frame instance, then serve with a `slicestream.toml` that holds the
