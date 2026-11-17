@@ -1,0 +1,21 @@
+[package]
+name = "slicestream-codec"
+description = "Lossless progressive HTJ2K encoding and verification for slicestream."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+openjph-core = "=0.1.0"
+slicestream-core = { version = "0.1.0", path = "../slicestream-core" }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+dicom-core = "0.10.1"
+dicom-dictionary-std = { version = "0.10.1", features = ["sop-class"] }
+dicom-object = "0.10.1"

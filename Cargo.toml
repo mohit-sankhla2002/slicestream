@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/slicestream-archive", "crates/slicestream-core", "crates/slicestream-dicomweb", "crates/slicestream-dimse", "crates/slicestream-server", "crates/slicestream-store"]
+members = ["crates/slicestream-archive", "crates/slicestream-codec", "crates/slicestream-core", "crates/slicestream-dicomweb", "crates/slicestream-dimse", "crates/slicestream-server", "crates/slicestream-store"]
 exclude = ["vendor/openjph-core"]
 
 [workspace.package]

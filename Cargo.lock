@@ -1767,6 +1767,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openjph-core"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2228,6 +2235,18 @@ dependencies = [
  "tempfile",
  "unrar_sys",
  "zip",
+]
+
+[[package]]
+name = "slicestream-codec"
+version = "0.1.0"
+dependencies = [
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "openjph-core",
+ "slicestream-core",
+ "thiserror",
 ]
 
 [[package]]
