@@ -29,7 +29,9 @@ pub enum ClientMessage {
     Cursor { index: usize, velocity: f64 },
     /// The client dropped these slices from its cache; resend if needed.
     Evicted { indices: Vec<usize> },
-    /// Total payload bytes the client has received so far (flow control).
+    /// Total binary message PAYLOAD bytes received so far (flow control).
+    /// Excludes the `SLS1` header, matching what the server passes to
+    /// `FlowWindow::on_sent`.
     Ack { bytes: u64 },
 }
 
@@ -169,9 +171,8 @@ mod tests {
             data: Bytes::from_static(&[1]),
         };
         let msg = encode_frame(&frame);
-        let len = u32::from_le_bytes(msg[4..8].try_into().unwrap()) as usize;
-        let json = std::str::from_utf8(&msg[8..8 + len]).unwrap();
-        assert!(!json.contains("part"), "{json}");
+        let expected: &[u8] = b"SLS1\x1F\x01\x00\x00{\"index\":1,\"info\":{\"rows\":2,\"columns\":2,\"bitsAllocated\":16,\"bitsStored\":12,\"samplesPerPixel\":1,\"pixelRepresentation\":0,\"photometricInterpretation\":\"MONOCHROME2\",\"transferSyntax\":\"1.2.840.10008.1.2.1\",\"rescaleSlope\":1.0,\"rescaleIntercept\":-1024.0,\"windowCenter\":40.0,\"windowWidth\":400.0}}\x01";
+        assert_eq!(&msg[..], expected);
         assert_eq!(decode_frame(&msg).unwrap().0.part, None);
     }
 

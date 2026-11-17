@@ -175,6 +175,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_series_yields_nothing() {
+        let mut s = sched(0, 2);
+        s.update(0, 0.0);
+        assert_eq!(s.pop_next(), None);
+        s.mark_unsent(0);
+        s.requeue_final(0);
+        s.set_single_stage(0);
+        assert_eq!(s.pop_next(), None);
+    }
+
+    #[test]
+    fn cursor_out_of_range_is_clamped() {
+        let mut s = sched(4, 2);
+        s.update(99, 0.0);
+        assert_eq!(s.pop_next(), Some((3, Stage::Preview)));
+        assert_eq!(s.pop_next(), Some((3, Stage::Final)));
+    }
+
+    #[test]
+    fn requeue_final_on_cursor_slice_is_next() {
+        let mut s = sched(5, 2);
+        s.update(2, 0.0);
+        assert_eq!(s.pop_next(), Some((2, Stage::Preview)));
+        assert_eq!(s.pop_next(), Some((2, Stage::Final)));
+        s.requeue_final(2);
+        assert_eq!(s.pop_next(), Some((2, Stage::Final)));
+        assert_ne!(s.pop_next(), Some((2, Stage::Preview)));
+    }
+
+    #[test]
     fn every_stage_handed_out_exactly_once() {
         let n = 40;
         let mut s = sched(n, 5);
