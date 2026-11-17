@@ -41,6 +41,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 toml = "1.2.1"
 tokio-util = { version = "0.7.20", features = ["rt", "io"] }
 rand = "0.9"
+sha2 = "0.10"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 fs4 = "1.1.0"
 slicestream-dimse = { version = "0.1.0", path = "../slicestream-dimse" }

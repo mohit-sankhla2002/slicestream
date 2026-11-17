@@ -593,6 +593,30 @@ async fn ranges_concatenate_to_the_whole_multipart_body() {
     let again = h.get("1", &[("Accept", JPHC)]).await;
     assert!(again.body == whole.body);
     assert_eq!(again.header("content-type"), whole.header("content-type"));
+
+    // The boundary differs per frame and reveals nothing of the original's
+    // hash.
+    let boundary = |r: &Reply| {
+        let ct = r.header("content-type").unwrap();
+        ct.split("boundary=").nth(1).unwrap().to_owned()
+    };
+    let other = h.get("2", &[("Accept", JPHC)]).await;
+    assert_ne!(boundary(&other), boundary(&whole));
+    let rows = h
+        .ingestor
+        .index()
+        .series_slices(IMAGE_SERIES)
+        .await
+        .unwrap();
+    let hex = rows[0].blob.to_hex();
+    for b in [boundary(&whole), boundary(&other)] {
+        for w in hex.as_bytes().windows(8) {
+            assert!(
+                !b.contains(std::str::from_utf8(w).unwrap()),
+                "boundary {b} shares 8 hex digits with the original's hash"
+            );
+        }
+    }
 }
 
 /// A recorded failure is not encoded again: a wildcard gets the stored

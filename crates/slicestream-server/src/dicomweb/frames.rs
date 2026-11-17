@@ -230,8 +230,7 @@ pub(super) async fn respond(
     if plan.use_copy && count == 1 {
         // The whole multipart body, the same bytes on every request for this
         // frame (copy or encoded now), so `Range` can select from it.
-        let boundary = format!("{}{first_number:08x}", &inst.blob.to_hex()[..24]);
-        let multipart = Multipart::with_boundary(boundary);
+        let multipart = Multipart::with_boundary(frame_boundary(&inst.blob, first_number));
         let content_type = multipart.content_type(essence(&plan.part_content_type));
         let head = multipart.part_header(&plan.part_content_type);
         let close = multipart.close();
@@ -266,6 +265,20 @@ pub(super) async fn respond(
             .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     }
     res
+}
+
+/// The multipart boundary of frame `number` of the instance stored as
+/// `blob`: the same on every request, different per frame, and derived by
+/// a hash so it reveals nothing of the stored file's hash.
+fn frame_boundary(blob: &BlobHash, number: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(blob.0);
+    h.update(number.to_be_bytes());
+    h.finalize()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Why the HTJ2K copy of a frame cannot be served.
