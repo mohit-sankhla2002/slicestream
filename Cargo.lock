@@ -2352,6 +2352,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "slicestream-codec",
  "slicestream-core",
  "slicestream-dicomweb",
  "sqlx",

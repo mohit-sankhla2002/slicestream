@@ -19,8 +19,11 @@ use sqlx::sqlite::{
 };
 use tracing::warn;
 
+use slicestream_codec::CODEC_VERSION;
+
 use crate::{
-    BlobHash, BulkValue, FrameTable, InstanceData, InstanceHeader, InstanceScan, SCAN_VERSION,
+    BlobHash, BulkValue, CopyFrames, CopyState, FrameTable, InstanceData, InstanceHeader,
+    InstanceScan, SCAN_VERSION,
 };
 
 /// Everything needed to index one stored instance.
@@ -255,6 +258,8 @@ pub struct ConsoleSeriesRow {
 /// One image instance of a series (rows without `frame_info` are excluded).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SliceRow {
+    /// The instance id.
+    pub id: i64,
     pub blob: BlobHash,
     pub number_of_frames: u32,
     pub instance_number: Option<i64>,
@@ -521,7 +526,8 @@ impl Index {
         Ok(())
     }
 
-    /// Every blob hash referenced by an `instances` or `nifti_volumes` row.
+    /// Every blob hash referenced by an `instances` or `nifti_volumes` row, or
+    /// by a `ready` HTJ2K copy.
     ///
     /// Startup recovery deletes every blob not in this set, so any row whose
     /// hash cannot be parsed fails the whole call rather than being skipped.
@@ -529,7 +535,10 @@ impl Index {
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT blob_sha256 FROM instances
              UNION
-             SELECT blob_sha256 FROM nifti_volumes",
+             SELECT blob_sha256 FROM nifti_volumes
+             UNION
+             SELECT blob_sha256 FROM derived_htj2k
+             WHERE state = 'ready' AND blob_sha256 IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -893,7 +902,7 @@ impl Index {
     pub async fn series_slices(&self, series_uid: &str) -> Result<Vec<SliceRow>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT i.blob_sha256, i.number_of_frames, i.instance_number, i.slice_position,
-                    i.frame_info, d.frames
+                    i.frame_info, d.frames, i.id
              FROM instances i
              JOIN series s ON s.id = i.series_fk
              LEFT JOIN instance_data d ON d.instance_fk = i.id AND d.offsets_valid = 1
@@ -1119,6 +1128,101 @@ impl Index {
             .collect()
     }
 
+    /// Up to `limit` scanned image instances without a copy row for their
+    /// current blob at [`CODEC_VERSION`], newest first, as
+    /// `(id, SOP Instance UID, blob)`.
+    pub async fn copy_candidates(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, BlobHash)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT i.id, i.sop_instance_uid, i.blob_sha256 FROM instances i
+             WHERE i.frame_info IS NOT NULL AND i.scan_version = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM derived_htj2k c
+                 WHERE c.instance_fk = i.id AND c.source_blob = i.blob_sha256
+                   AND c.codec_version = ?2)
+             ORDER BY i.id DESC LIMIT ?3",
+        )
+        .bind(SCAN_VERSION)
+        .bind(CODEC_VERSION)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?, parse_hash(r.try_get(2)?)?)))
+            .collect()
+    }
+
+    /// Record the copy state of instance `id` made from `source`, but only if
+    /// the instance still points at `source`. Returns whether it was written.
+    pub async fn write_copy(
+        &self,
+        id: i64,
+        source: &BlobHash,
+        state: &CopyState,
+    ) -> Result<bool, sqlx::Error> {
+        let (name, problem, blob, frames) = match state {
+            CopyState::Ready { blob, frames } => {
+                ("ready", None, Some(blob.to_hex()), Some(frames.encode()))
+            }
+            CopyState::NotEligible(p) => ("not_eligible", Some(p.as_str()), None, None),
+            CopyState::Failed(p) => ("failed", Some(p.as_str()), None, None),
+        };
+        let done = sqlx::query(
+            "INSERT OR REPLACE INTO derived_htj2k
+               (instance_fk, source_blob, codec_version, state, problem, blob_sha256, frames)
+             SELECT id, blob_sha256, ?3, ?4, ?5, ?6, ?7 FROM instances
+             WHERE id = ?1 AND blob_sha256 = ?2",
+        )
+        .bind(id)
+        .bind(source.to_hex())
+        .bind(CODEC_VERSION)
+        .bind(name)
+        .bind(problem)
+        .bind(blob)
+        .bind(frames)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The copy state of instance `id` for `source`; `None` when missing,
+    /// made from another blob, or made by an older codec.
+    pub async fn copy_for(
+        &self,
+        id: i64,
+        source: &BlobHash,
+    ) -> Result<Option<CopyState>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT state, problem, blob_sha256, frames FROM derived_htj2k
+             WHERE instance_fk = ?1 AND source_blob = ?2 AND codec_version >= ?3",
+        )
+        .bind(id)
+        .bind(source.to_hex())
+        .bind(CODEC_VERSION)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(r) = row else { return Ok(None) };
+        let problem: Option<String> = r.try_get(1)?;
+        let state: &str = r.try_get(0)?;
+        Ok(Some(match state {
+            "ready" => {
+                let blob: Option<&str> = r.try_get(2)?;
+                let frames: Option<&[u8]> = r.try_get(3)?;
+                let blob =
+                    parse_hash(blob.ok_or_else(|| decode_err("ready copy without blob".into()))?)?;
+                let frames = frames
+                    .and_then(CopyFrames::decode)
+                    .ok_or_else(|| decode_err("invalid copy frame table".into()))?;
+                CopyState::Ready { blob, frames }
+            }
+            "not_eligible" => CopyState::NotEligible(problem.unwrap_or_default()),
+            "failed" => CopyState::Failed(problem.unwrap_or_default()),
+            other => return Err(decode_err(format!("invalid copy state {other}"))),
+        }))
+    }
+
     /// SOP Instance UID and blob of instance `id`; `None` when unknown.
     pub async fn instance_blob(&self, id: i64) -> Result<Option<(String, BlobHash)>, sqlx::Error> {
         let row = sqlx::query("SELECT sop_instance_uid, blob_sha256 FROM instances WHERE id = ?1")
@@ -1258,6 +1362,7 @@ fn slice_row(r: &SqliteRow) -> Result<SliceRow, sqlx::Error> {
     let frames: i64 = r.try_get(1)?;
     let info: &str = r.try_get(4)?;
     Ok(SliceRow {
+        id: r.try_get(6)?,
         blob: parse_hash(r.try_get(0)?)?,
         number_of_frames: u32::try_from(frames)
             .map_err(|_| decode_err(format!("invalid number_of_frames {frames}")))?,
