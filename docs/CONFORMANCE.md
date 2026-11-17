@@ -282,9 +282,10 @@ codestream (transfer syntax `1.2.840.10008.1.2.4.202`, media type
 - *Eligible:* stored as Implicit VR Little Endian, Explicit VR Little Endian
   or Explicit VR Big Endian (native pixel data), Samples per Pixel 1,
   Photometric Interpretation `MONOCHROME1` or `MONOCHROME2`, Bits Allocated
-  8 or 16, Bits Stored from 1 to Bits Allocated, and a frame table from the
-  storage scan. Anything else (compressed, color, 32-bit) has no copy and is
-  served as stored.
+  8 or 16, Bits Stored from 1 to Bits Allocated, at most 67,108,864 pixels
+  per frame (for example 8192 x 8192), and a frame table from the storage
+  scan. Anything else (compressed, color, 32-bit, larger frames) has no copy
+  and is served as stored.
 - *Encoding:* reversible 5/3 wavelet, no color transform, one tile, one
   layer, 64 x 64 code blocks, maximum precincts, resolution levels = the
   smallest number of levels that brings the shorter side to 64 pixels or less,
@@ -312,6 +313,13 @@ codestream (transfer syntax `1.2.840.10008.1.2.4.202`, media type
   lossless HTJ2K measured about 3:1 in testing, so a copy adds about a third
   of the original's size. For noisy images it adds up to about the size of
   the original.
+- *Turning copies off:* switching to `mode = "off"` makes no new copies but
+  keeps the copy files already made, because rows of the `derived_htj2k`
+  index table still reference them. To reclaim the space, stop the server,
+  delete those rows (`sqlite3 <root>/index.sqlite "DELETE FROM
+  derived_htj2k"`) and start it again: startup recovery removes the copy
+  files no row references. With `"background"` or `"on-demand"` the copies
+  are made again later.
 - Copies are used for the frames resource only, not for `bulk` Pixel Data.
 
 **Metadata.** The response is `application/dicom+json`: a JSON array with one
@@ -348,7 +356,7 @@ type of the parts.
 | `application/octet-stream; transfer-syntax=<UID>` | As stored if the UID matches, else 406. |
 | `image/jphc`, with no transfer syntax, `*`, `1.2.840.10008.1.2.4.201` or `1.2.840.10008.1.2.4.202` | The HTJ2K copy (`.202`) when the instance is eligible and copies are on; each part is `image/jphc; transfer-syntax=1.2.840.10008.1.2.4.202`. An instance already stored as HTJ2K is sent as stored (no copy is made of it). Else, 406. |
 | `application/octet-stream; transfer-syntax=1.2.840.10008.1.2.4.202` | The HTJ2K copy, as above, else 406. |
-| `*/*`, `image/*` or `application/*`, with `transfer-syntax=1.2.840.10008.1.2.4.202` or `.201` | The HTJ2K copy (a `application/*` range gets `application/octet-stream` parts, the others `image/jphc`). When no copy can be served, that range is not acceptable and the next range in `Accept` is tried, else 406. An instance already stored in that syntax is sent as stored. |
+| `*/*`, `image/*` or `application/*`, with `transfer-syntax=1.2.840.10008.1.2.4.202` or `.201` | The HTJ2K copy (an `application/*` range gets `application/octet-stream` parts, the others `image/jphc`). When no copy can be served, that range is not acceptable and the next range in `Accept` is tried, else 406. An instance already stored in that syntax is sent as stored. |
 | `image/jpeg`, `image/jls`, `image/jp2`, `image/jxl`, `image/dicom-rle` (with or without a transfer syntax), and `image/jphc` with another transfer syntax | As stored if the stored transfer syntax belongs to that media type (and matches the requested one, if given), else 406. |
 | `*/*`, or no `Accept` | As stored: the image media type of the stored transfer syntax, or `application/octet-stream` for native data. With `[htj2k] prefer_for_wildcard = true`, the HTJ2K copy when one can be served, else as stored. |
 

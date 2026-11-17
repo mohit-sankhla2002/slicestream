@@ -226,7 +226,8 @@ pub struct Htj2kConfig {
     /// Longest side, in pixels, of the first preview a progressive stream
     /// sends (at least 1).
     pub preview_size: u32,
-    /// Slices ahead of the viewer that get a copy made first.
+    /// Slices whose preview is sent before any final stage (other than the
+    /// final of the slice in view) on the progressive stream.
     pub preview_ahead: usize,
     /// Answer `transfer-syntax=*`, `*/*` and a missing `Accept` with HTJ2K
     /// copies where one exists.

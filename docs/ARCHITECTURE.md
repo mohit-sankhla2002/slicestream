@@ -151,7 +151,9 @@ benchmarks against Orthanc and dcm4chee.
 - Each HTJ2K copy is a second file next to its original, so eligible
   instances take extra disk: about a third more for uncompressed CT in
   testing (3:1 lossless), up to about the size of the originals for noisy
-  images. Set `[htj2k] mode = "off"` to make no copies.
+  images. Set `[htj2k] mode = "off"` to make no copies. Copies already made
+  stay on disk until their `derived_htj2k` rows are deleted with the server
+  stopped; the next start then removes them (see CONFORMANCE.md).
 - The plain stream (no `?progressive=htj2k`) sends frames as fast as TCP
   accepts them, with no client credit, so priority changes take effect only
   after the socket and any proxy buffers drain (4.7 s for a jump in the

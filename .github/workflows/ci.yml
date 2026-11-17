@@ -24,6 +24,9 @@ jobs:
       - run: cargo clippy -p slicestream-archive --no-default-features --all-targets -- -D warnings
       # Corrupted 7z/RAR inputs (slow in debug, so release and opt-in).
       - run: cargo test --release -p slicestream-archive --test mutate_7z_rar -- --ignored
+      # The vendored HTJ2K encoder is outside the workspace: run its own
+      # regression tests (release keeps the round-trip sweep fast).
+      - run: cargo test --release --manifest-path vendor/openjph-core/Cargo.toml --test encoder_round_trip --test resolution_ends --lib
       - uses: actions/setup-node@v4
         with:
           node-version: 22

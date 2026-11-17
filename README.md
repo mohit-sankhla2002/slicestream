@@ -256,7 +256,7 @@ exactly the original pixels. Settings, with their defaults, are in the
 mode = "background"          # background | on-demand (copy requested instances) | off
 workers = 0                  # 0 = half the cores, at least 1
 preview_size = 256           # long side of the first preview, in pixels
-preview_ahead = 32           # slices ahead of the viewer that get a copy first
+preview_ahead = 32           # slices whose preview goes before any final stage
 prefer_for_wildcard = false  # true: */* and transfer-syntax=* get HTJ2K too
 ```
 
