@@ -72,7 +72,7 @@ described above and nothing in this section applies. Any value other than
 400 too, and the message names `[htj2k] mode = "off"`. The magic stays `SLS1`:
 progressive mode only adds JSON fields and one client message.
 
-**Hello.** The hello message gains `"progressive": "htj2k"`.
+**Hello.** The hello message gains a top-level key `"progressive": "htj2k"`, next to `type` and `series`.
 
 **Parts.** A slice that has an HTJ2K copy (lossless, transfer syntax
 `1.2.840.10008.1.2.4.202`) is sent as several binary messages, each carrying a
@@ -81,23 +81,35 @@ slice of one codestream. The frame header gains a `part` object, and
 
 ```json
 { "index": 12, "info": { "transferSyntax": "1.2.840.10008.1.2.4.202" },
-  "part": { "offset": 0, "total": 91834, "level": 2 } }
+  "part": { "offset": 65536, "total": 91834, "level": 1 } }
 ```
 
 | field | meaning |
 |---|---|
 | `offset` | Byte offset of this payload within the whole codestream. |
 | `total` | Length of the whole codestream in bytes. |
-| `level` | The highest resolution level that is complete once this part is appended. 0 is the smallest resolution; the largest value is the full image. |
+| `level` | The highest resolution level that is complete once this part is appended. 0 is the smallest resolution; the largest value is the full image. It is 0 both when only resolution 0 is complete and when not even that is, so `level` 0 alone does not mean the prefix can be decoded. |
 
 - The frame is complete when `offset + payload length == total`. The client
-  appends payloads of one `index` in order and may decode the prefix it has.
+  may decode the prefix it holds. The server does not send where each
+  resolution ends, only `level` on each part: a client that wants to decode
+  at each resolution tries at part boundaries, and treats a new, higher
+  `level` as the sign that a new resolution has become complete.
+- **Assembling parts.** The client keeps one buffer per `index`. It appends a
+  part only when the part's `offset` equals the number of bytes it holds for
+  that index; otherwise it drops the part. A part with `offset` 0 starts a new
+  buffer and replaces any buffer held. A whole frame (a message with no
+  `part`) replaces any partial buffer for that index. This is needed because
+  after the client sends `evicted`, parts of the evicted slice that were
+  already in flight still arrive, and the server then starts the slice again
+  from offset 0.
 - The server sends the parts of one frame in order. Parts of different slices
   may be interleaved.
 - Every part is at most 65,536 bytes of payload, the first (preview) part
   included. A preview larger than that arrives as several parts.
-- The first bytes of a slice reach the preview resolution (by default 256
-  pixels on the long side, `[htj2k] preview_size`) before the rest of the
+- The first bytes of a slice reach the preview resolution (the smallest one
+  that is at least 256 pixels on the long side by default,
+  `[htj2k] preview_size`, or the full image when it is smaller) before the rest of the
   slice. For the slice at the cursor, the preview and the rest are sent back
   to back. For slices ahead, previews come first, then the remainder, so a
   scroll lands on something sharp.

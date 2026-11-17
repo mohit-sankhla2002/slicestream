@@ -329,6 +329,7 @@ level `r`. In CI the oracle is Cornerstone's decoder (see Testing), because
   > preview included, carries at most 65,536 payload bytes. A preview larger
   > than that is sent as several parts. Each part's `level` is the highest
   > resolution whose end is at or before the part's end.
+
 - `docs/PROTOCOL.md` documents the parameter and the `part` field. The magic
   stays `SLS1`: the change is opt-in and only adds a JSON field.
 
@@ -342,7 +343,8 @@ lives in the protocol, in progressive mode only:
 
 - The client acknowledges what it has received:
   `{"type":"ack","bytes":<total binary payload bytes received so far>}`,
-  sent at least every 64 KiB received and on every completed frame.
+  ~~sent at least every 64 KiB received and on every completed frame.~~
+  (Superseded: see the note below.)
 
   > **Changed during implementation (ack cadence).** The client acks after
   > every binary message it receives (it may coalesce acks for messages it
@@ -351,6 +353,7 @@ lives in the protocol, in progressive mode only:
   > for room: a stall. Acking every message lets the unacknowledged bytes
   > always drain to zero, which guarantees progress. The cost is one small
   > text message per binary message.
+
 - The server keeps the unacknowledged bytes at or below a window. The window
   starts at 256 KiB and adapts to the measured delivery rate: it is set to
   twice the bytes acknowledged over the last round trip (measured from ack
@@ -389,8 +392,8 @@ The server crate forbids `unsafe`, so only `socket2`'s safe API is used.
   designer's call, so no existing client is surprised by HTJ2K).
 - **Range.** A single-frame request with one `Range: bytes=a-b` (or `a-`)
   over HTJ2K answers 206 with `Content-Range: bytes a-b/<frame length>`
-  and only those codestream bytes, in the same body format as the full
-  answer.
+  and only those codestream bytes. ~~in the same body format as the full
+  answer~~ (Superseded for multipart answers: see the note below.)
 
   > **Changed during implementation (Range on multipart).** For a
   > `multipart/related` answer, the range applies to the whole multipart body
@@ -400,8 +403,13 @@ The server crate forbids `unsafe`, so only `socket2`'s safe API is used.
   > says (a range selects part of the representation) and what Cornerstone's
   > range reader, which joins ranges from separate requests, needs. Bare
   > (single-part) answers are ranged over the codestream as written here.
-  > Also: `image/jphc; transfer-syntax=*` and `*/*;
-  > transfer-syntax=1.2.840.10008.1.2.4.202` select the copy too. More than one range, or a range on several frames, ignores `Range`
+
+  > **Changed during implementation (more Accept forms).** `image/jphc;
+  > transfer-syntax=*` and `*/*`, `image/*` or `application/*` with
+  > `transfer-syntax=1.2.840.10008.1.2.4.202` (or `.201`) select the copy too.
+  > When no copy can be served, such a range is not acceptable.
+
+  More than one range, or a range on several frames, ignores `Range`
   and answers 200 with the whole body (allowed by RFC 9110). An
   unsatisfiable range answers 416. `Accept-Ranges: bytes` is sent on HTJ2K
   frame answers.

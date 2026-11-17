@@ -269,6 +269,10 @@ pub fn negotiate_frames(
         };
         let as_stored = |media: &str| plan(format!("{media}; transfer-syntax={stored}"), false);
         let found = match media {
+            // A wildcard range that names an HTJ2K syntax is an explicit
+            // HTJ2K request: the copy (above) or nothing, unless the data
+            // is stored in that syntax.
+            "*/*" if matches!(ts, Some(HTJ2K_RPCL | HTJ2K_LOSSLESS)) && ts != Some(stored) => None,
             "*/*" => Some(as_stored(stored_media.unwrap_or(OCTET))),
             OCTET => match ts {
                 // Native pixels as little-endian; nothing else qualifies.
@@ -311,7 +315,10 @@ fn copy_media(
         JPHC if matches!(ts, None | Some("*" | HTJ2K_RPCL | HTJ2K_LOSSLESS)) => Some(JPHC),
         OCTET if ts == Some(HTJ2K_RPCL) => Some(OCTET),
         OCTET if ts == Some("*") && prefer_wildcard => Some(OCTET),
-        "*/*" if ts == Some(HTJ2K_RPCL) || (wildcard_ts && prefer_wildcard) => {
+        "*/*"
+            if matches!(ts, Some(HTJ2K_RPCL | HTJ2K_LOSSLESS))
+                || (wildcard_ts && prefer_wildcard) =>
+        {
             Some(if r.essence == "application/*" {
                 OCTET
             } else {
@@ -640,6 +647,28 @@ mod tests {
         }
         let p = negotiate_frames(&parse_accept(None), &copyable(false), 1).unwrap();
         assert!(!p.use_copy);
+    }
+
+    #[test]
+    fn wildcard_with_htj2k_syntax_is_explicit() {
+        for r in ["*/*", "image/*", "application/*"] {
+            for ts in [RPCL, HTJ2K] {
+                let h = format!("{r}; transfer-syntax={ts}");
+                // Copy possible: served from the copy.
+                let p = frames(&h, &copyable(false), 1).unwrap();
+                assert!(p.use_copy, "{h}");
+                // No copy: not acceptable, not "as stored".
+                assert!(frames(&h, &src(LE, false, 16), 1).is_err(), "{h}");
+                // A later range still gets its turn.
+                let h2 = format!("{h}, */*;q=0.5");
+                let p = frames(&h2, &src(LE, false, 16), 1).unwrap();
+                assert!(!p.use_copy, "{h2}");
+            }
+        }
+        // Stored in that syntax: as stored.
+        let stored = src(RPCL, true, 16);
+        let h = format!("*/*; transfer-syntax={RPCL}");
+        assert!(!frames(&h, &stored, 1).unwrap().use_copy);
     }
 
     #[test]

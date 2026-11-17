@@ -137,7 +137,9 @@ benchmarks against Orthanc and dcm4chee.
   resources (M4), no XML responses. HTTP `Range` is supported only for
   single-frame HTJ2K answers.
 - Each HTJ2K copy is a second file next to its original, so eligible
-  instances take up to roughly twice the disk. Set `[htj2k] mode = "off"` to make no copies.
+  instances take extra disk: about a third more for uncompressed CT in
+  testing (3:1 lossless), up to about the size of the originals for noisy
+  images. Set `[htj2k] mode = "off"` to make no copies.
 - The plain stream (no `?progressive=htj2k`) sends frames as fast as TCP
   accepts them, with no client credit, so priority changes take effect only
   after the socket buffer drains. The progressive stream has an
