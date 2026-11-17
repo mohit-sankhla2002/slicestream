@@ -1196,7 +1196,7 @@ impl Index {
     ) -> Result<Option<CopyState>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT state, problem, blob_sha256, frames FROM derived_htj2k
-             WHERE instance_fk = ?1 AND source_blob = ?2 AND codec_version >= ?3",
+             WHERE instance_fk = ?1 AND source_blob = ?2 AND codec_version = ?3",
         )
         .bind(id)
         .bind(source.to_hex())

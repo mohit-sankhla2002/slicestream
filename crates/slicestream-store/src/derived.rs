@@ -23,14 +23,19 @@ pub struct CopyFrames(pub Vec<CopyFrame>);
 impl CopyFrames {
     /// `[version u8 = 1][count u32 LE]`, then per frame
     /// `[offset u64][len u64][n u8][ends u32 x n]`, all little-endian.
+    ///
+    /// # Panics
+    /// If there are more than `u32::MAX` frames or a frame has more than 255
+    /// prefix ends; the encoder produces a handful per frame, so either is a
+    /// bug, and a corrupt table must never be written silently.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![ENCODING_VERSION];
-        out.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
+        let count = u32::try_from(self.0.len()).expect("frame count fits u32");
+        out.extend_from_slice(&count.to_le_bytes());
         for f in &self.0 {
-            debug_assert!(f.ends.len() <= usize::from(u8::MAX));
             out.extend_from_slice(&f.offset.to_le_bytes());
             out.extend_from_slice(&f.len.to_le_bytes());
-            out.push(f.ends.len() as u8);
+            out.push(u8::try_from(f.ends.len()).expect("at most 255 prefix ends per frame"));
             for e in &f.ends {
                 out.extend_from_slice(&e.to_le_bytes());
             }

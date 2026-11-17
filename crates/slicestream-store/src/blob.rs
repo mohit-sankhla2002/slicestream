@@ -64,7 +64,8 @@ pub enum BlobKind {
 }
 
 impl BlobKind {
-    /// Every kind, longest extension first (so `nii.gz` is tried before `nii`).
+    /// Every kind. `parse_file_name` splits at the first dot, so extension
+    /// order does not matter.
     const ALL: [BlobKind; 4] = [
         BlobKind::NiftiGz,
         BlobKind::Nifti,

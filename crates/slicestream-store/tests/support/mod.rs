@@ -363,3 +363,25 @@ pub fn instance(dir: &Path, spec: &Spec) -> PathBuf {
     file.write_to_file(&path).unwrap();
     path
 }
+
+pub async fn index_pool(root: &Path) -> sqlx::SqlitePool {
+    sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
+        .await
+        .unwrap()
+}
+
+/// Ingest `n` phantom slices through the pipeline; returns instance ids.
+pub async fn ingest_slices(ing: &slicestream_store::Ingestor, src: &Path, n: usize) -> Vec<i64> {
+    crate::phantom::write_phantom(src, n, 16).unwrap();
+    for i in 1..=n {
+        ing.import_file(&src.join(format!("IM{i:05}.dcm")))
+            .await
+            .unwrap();
+    }
+    let ids = sqlx::query_scalar::<_, i64>("SELECT id FROM instances ORDER BY id")
+        .fetch_all(&index_pool(&ing.config().root).await)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), n);
+    ids
+}

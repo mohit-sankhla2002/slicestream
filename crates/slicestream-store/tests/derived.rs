@@ -1,8 +1,11 @@
 #[allow(dead_code)]
 #[path = "../../slicestream-core/examples/make_phantom.rs"]
 mod phantom;
+mod support;
 
 use std::path::Path;
+
+use support::{index_pool, ingest_slices};
 
 use dicom_core::{DataElement, PrimitiveValue, VR};
 use dicom_dictionary_std::tags;
@@ -17,26 +20,6 @@ fn config(root: &Path, on_duplicate: DuplicatePolicy) -> StorageConfig {
         max_instance_bytes: 2_147_483_648,
         on_duplicate,
     }
-}
-
-async fn index_pool(root: &Path) -> sqlx::SqlitePool {
-    sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
-        .await
-        .unwrap()
-}
-
-/// Ingest `n` phantom slices; returns the instance ids in id order.
-async fn ingest_slices(ing: &Ingestor, src: &Path, n: usize) -> Vec<i64> {
-    phantom::write_phantom(src, n, 16).unwrap();
-    for i in 1..=n {
-        ing.import_file(&src.join(format!("IM{i:05}.dcm")))
-            .await
-            .unwrap();
-    }
-    sqlx::query_scalar::<_, i64>("SELECT id FROM instances ORDER BY id")
-        .fetch_all(&index_pool(&ing.config().root).await)
-        .await
-        .unwrap()
 }
 
 async fn open(d: &Path, policy: DuplicatePolicy) -> (std::sync::Arc<Ingestor>, Vec<i64>, Index) {
