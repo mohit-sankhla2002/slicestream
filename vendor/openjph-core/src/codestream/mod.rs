@@ -264,6 +264,19 @@ impl Codestream {
         self.inner.flush(file)
     }
 
+    /// Where each resolution ends in the codestream written by [`flush`].
+    ///
+    /// One entry per resolution, lowest first: the byte length of the
+    /// codestream prefix (SOC, main header, SOT and SOD included) after which
+    /// that resolution's packets are complete. The last entry is the full
+    /// codestream length, EOC included. `None` before `flush`, or when the
+    /// codestream has more than one tile or tile-part.
+    ///
+    /// [`flush`]: Codestream::flush
+    pub fn resolution_ends(&self) -> Option<Vec<usize>> {
+        self.inner.resolution_ends()
+    }
+
     // ----- Read path -----
 
     /// Reads codestream main headers from `file`.

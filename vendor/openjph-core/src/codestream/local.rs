@@ -50,6 +50,9 @@ pub struct CodestreamLocal {
     pub(crate) profile: i32,
     pub(crate) tilepart_div: u32,
     pub(crate) need_tlm: bool,
+
+    /// Encode only: see [`CodestreamLocal::resolution_ends`].
+    pub(crate) resolution_ends: Option<Vec<usize>>,
 }
 
 impl Default for CodestreamLocal {
@@ -79,6 +82,7 @@ impl Default for CodestreamLocal {
             profile: 0, // UNDEFINED
             tilepart_div: TILEPART_NO_DIVISIONS,
             need_tlm: false,
+            resolution_ends: None,
         }
     }
 }
@@ -427,7 +431,26 @@ impl CodestreamLocal {
         }
         // Write EOC marker
         file.write(&markers::EOC.to_be_bytes())?;
+
+        self.resolution_ends = match self.tiles.as_slice() {
+            [tile] if tile.num_tileparts == 1 && !tile.resolution_ends.is_empty() => {
+                let mut ends = tile.resolution_ends.clone();
+                // The last resolution's prefix is the whole codestream, EOC included.
+                if let Some(last) = ends.last_mut() {
+                    *last += 2;
+                }
+                Some(ends)
+            }
+            _ => None,
+        };
         Ok(())
+    }
+
+    /// Byte length of the codestream prefix after which each resolution's
+    /// packets are complete; `None` before `flush`, or unless there is exactly
+    /// one tile and tile-part.
+    pub fn resolution_ends(&self) -> Option<Vec<usize>> {
+        self.resolution_ends.clone()
     }
 
     // ----- Decode path -----

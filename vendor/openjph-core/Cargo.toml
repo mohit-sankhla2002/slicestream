@@ -49,6 +49,10 @@ path = "tests/integration_pipeline.rs"
 name = "integration_roundtrip"
 path = "tests/integration_roundtrip.rs"
 
+[[test]]
+name = "resolution_ends"
+path = "tests/resolution_ends.rs"
+
 [[bench]]
 name = "codec"
 path = "benches/codec.rs"

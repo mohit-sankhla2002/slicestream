@@ -48,6 +48,10 @@ pub struct Tile {
     pub num_lines: u32,
     /// Skipped resolution levels for reconstruction.
     pub skipped_res_for_recon: u32,
+    /// Encode only: absolute byte offsets (in the output stream) at which
+    /// each resolution's packets end, lowest resolution first. Filled by
+    /// `encode_and_write`.
+    pub resolution_ends: Vec<usize>,
 }
 
 impl Default for Tile {
@@ -67,6 +71,7 @@ impl Default for Tile {
             cur_line: 0,
             num_lines: 0,
             skipped_res_for_recon: 0,
+            resolution_ends: Vec::new(),
         }
     }
 }
@@ -378,6 +383,7 @@ impl Tile {
             cur_line: 0,
             num_lines,
             skipped_res_for_recon,
+            resolution_ends: Vec::new(),
         }
     }
 
@@ -454,9 +460,13 @@ impl Tile {
         }
 
         // 2. Build all packet data into a buffer
-        let packet_data = self.build_all_packets()?;
+        let mut packet_ends = Vec::new();
+        let packet_data = self.build_all_packets(&mut packet_ends)?;
 
         // 3. Write SOT — payload_len is the tile data size AFTER the SOD marker
+        // Packet data starts after SOT (12 bytes) and SOD (2 bytes).
+        let packet_start = file.tell() as usize + 12 + 2;
+        self.resolution_ends = packet_ends.iter().map(|e| packet_start + e).collect();
         self.sot.init(0, self.tile_idx as u16, 0, 1);
         self.sot.write(file, packet_data.len() as u32)?;
 
@@ -471,7 +481,10 @@ impl Tile {
     }
 
     /// Build all packets for this tile in LRCP order.
-    fn build_all_packets(&self) -> Result<Vec<u8>> {
+    ///
+    /// `resolution_ends` receives, for the first layer, the length of `data`
+    /// after each resolution's packets.
+    fn build_all_packets(&self, resolution_ends: &mut Vec<usize>) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         let num_layers = self.num_layers;
         let max_res = self
@@ -482,7 +495,7 @@ impl Tile {
             .unwrap_or(1);
 
         // LRCP: Layer → Resolution → Component → Position(precinct)
-        for _layer in 0..num_layers {
+        for layer in 0..num_layers {
             for r in 0..max_res {
                 for c in 0..self.num_comps {
                     let tc = &self.tile_comps[c as usize];
@@ -495,6 +508,9 @@ impl Tile {
                     // One packet per precinct. For simplicity, 1 precinct per resolution.
                     let packet = Self::write_packet(res)?;
                     data.extend_from_slice(&packet);
+                }
+                if layer == 0 {
+                    resolution_ends.push(data.len());
                 }
             }
         }
