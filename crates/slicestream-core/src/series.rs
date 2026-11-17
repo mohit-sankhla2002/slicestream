@@ -22,6 +22,7 @@ pub struct SliceRef {
     position: Option<f64>,
     instance_number: Option<i64>,
     location: Option<FrameLocation>,
+    instance: Option<i64>,
 }
 
 /// An ordered stack of slices belonging to one SeriesInstanceUID.
@@ -63,6 +64,7 @@ impl SliceRef {
             position,
             instance_number,
             location: None,
+            instance: None,
         }
     }
 
@@ -76,6 +78,17 @@ impl SliceRef {
     /// the file.
     pub fn location(&self) -> Option<&FrameLocation> {
         self.location.as_ref()
+    }
+
+    /// Record the store's instance id so the server can look up copies.
+    pub fn with_instance(mut self, id: i64) -> SliceRef {
+        self.instance = Some(id);
+        self
+    }
+
+    /// The store's instance id, if recorded.
+    pub fn instance(&self) -> Option<i64> {
+        self.instance
     }
 
     fn sort_key(&self) -> (f64, i64, u32) {
@@ -176,6 +189,11 @@ impl Series {
 
     pub fn is_empty(&self) -> bool {
         self.slices.is_empty()
+    }
+
+    /// All slices in anatomical order.
+    pub fn slices(&self) -> &[SliceRef] {
+        &self.slices
     }
 
     pub fn slice(&self, index: usize) -> Result<&SliceRef> {

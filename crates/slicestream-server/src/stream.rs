@@ -122,5 +122,7 @@ fn apply(sched: &mut PrefetchScheduler, msg: ClientMessage) {
         ClientMessage::Evicted { indices } => {
             indices.into_iter().for_each(|i| sched.mark_unsent(i))
         }
+        // Flow control is wired in a later task.
+        ClientMessage::Ack { .. } => {}
     }
 }

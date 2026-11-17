@@ -29,6 +29,8 @@ pub enum ClientMessage {
     Cursor { index: usize, velocity: f64 },
     /// The client dropped these slices from its cache; resend if needed.
     Evicted { indices: Vec<usize> },
+    /// Total payload bytes the client has received so far (flow control).
+    Ack { bytes: u64 },
 }
 
 /// Per-frame header placed in front of each binary payload.
@@ -37,20 +39,45 @@ pub enum ClientMessage {
 pub struct FrameHeader {
     pub index: usize,
     pub info: FrameInfo,
+    /// Present when the message carries one part of a progressive frame.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub part: Option<FramePart>,
+}
+
+/// Position of a payload inside a progressively streamed frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FramePart {
+    /// Byte offset of this payload within the whole codestream.
+    pub offset: u64,
+    /// Total codestream length in bytes.
+    pub total: u64,
+    /// Resolution level the codestream prefix up to this part completes.
+    pub level: u32,
 }
 
 /// Encode a frame into a single binary WebSocket message.
 pub fn encode_frame(frame: &Frame) -> Bytes {
+    encode(frame.index, &frame.info, None, &frame.data)
+}
+
+/// Encode one part of a progressively streamed frame.
+pub fn encode_part(index: usize, info: &FrameInfo, part: FramePart, payload: &[u8]) -> Bytes {
+    encode(index, info, Some(part), payload)
+}
+
+fn encode(index: usize, info: &FrameInfo, part: Option<FramePart>, payload: &[u8]) -> Bytes {
     let header = serde_json::to_vec(&FrameHeader {
-        index: frame.index,
-        info: frame.info.clone(),
+        index,
+        info: info.clone(),
+        part,
     })
     .expect("FrameHeader serialization cannot fail");
-    let mut buf = BytesMut::with_capacity(8 + header.len() + frame.data.len());
+    let mut buf = BytesMut::with_capacity(8 + header.len() + payload.len());
     buf.put_slice(MAGIC);
     buf.put_u32_le(header.len() as u32);
     buf.put_slice(&header);
-    buf.put_slice(&frame.data);
+    buf.put_slice(payload);
     buf.freeze()
 }
 
@@ -118,5 +145,39 @@ mod tests {
                 velocity: -12.5
             }
         );
+    }
+
+    #[test]
+    fn part_round_trip() {
+        let part = FramePart {
+            offset: 100,
+            total: 5000,
+            level: 2,
+        };
+        let msg = encode_part(3, &info(), part, &[9, 8, 7]);
+        let (header, payload) = decode_frame(&msg).unwrap();
+        assert_eq!(header.index, 3);
+        assert_eq!(header.part, Some(part));
+        assert_eq!(payload, &[9, 8, 7]);
+    }
+
+    #[test]
+    fn whole_frame_header_has_no_part_field() {
+        let frame = Frame {
+            index: 1,
+            info: info(),
+            data: Bytes::from_static(&[1]),
+        };
+        let msg = encode_frame(&frame);
+        let len = u32::from_le_bytes(msg[4..8].try_into().unwrap()) as usize;
+        let json = std::str::from_utf8(&msg[8..8 + len]).unwrap();
+        assert!(!json.contains("part"), "{json}");
+        assert_eq!(decode_frame(&msg).unwrap().0.part, None);
+    }
+
+    #[test]
+    fn ack_message_parses() {
+        let m: ClientMessage = serde_json::from_str(r#"{"type":"ack","bytes":42}"#).unwrap();
+        assert_eq!(m, ClientMessage::Ack { bytes: 42 });
     }
 }
