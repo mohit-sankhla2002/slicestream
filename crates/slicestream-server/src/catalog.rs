@@ -115,7 +115,8 @@ impl SeriesCatalog {
                     r.frame_info.clone(),
                     r.slice_position,
                     r.instance_number,
-                );
+                )
+                .with_instance(r.id);
                 slices.push(match table.and_then(|t| t.location(frame)) {
                     Some(loc) => slice.with_location(loc),
                     None => slice,

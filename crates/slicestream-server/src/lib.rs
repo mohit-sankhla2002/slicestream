@@ -35,7 +35,7 @@ pub mod stow;
 pub mod stream;
 
 pub use catalog::SeriesCatalog;
-use config::{Config, DicomwebConfig, HttpConfig};
+use config::{Config, DicomwebConfig, Htj2kConfig, Htj2kMode, HttpConfig};
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -48,6 +48,7 @@ pub struct AppState {
     pub scheduler: SchedulerConfig,
     pub http: HttpConfig,
     pub dicomweb: DicomwebConfig,
+    pub htj2k: Htj2kConfig,
     /// `None` when `metrics_enabled = false`; the console routes are then
     /// not mounted.
     pub metrics: Option<Arc<metrics::Metrics>>,
@@ -239,6 +240,15 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         shutdown.clone(),
         BACKFILL_RETRY,
     ));
+    let copier = (config.htj2k.mode == Htj2kMode::Background).then(|| {
+        tokio::spawn(copy_worker(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            COPY_RETRY,
+            COPY_IDLE,
+            config.htj2k.worker_count(),
+        ))
+    });
     if config.dicomweb.enabled && !http_addr.ip().is_loopback() {
         tracing::warn!(
             "DICOMweb read routes are unauthenticated: anyone who can reach {http_addr} can read patient data (see SECURITY.md)"
@@ -282,6 +292,7 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         scheduler: SchedulerConfig::default(),
         http,
         dicomweb: config.dicomweb,
+        htj2k: config.htj2k,
         metrics,
         gauges,
         archives,
@@ -351,6 +362,13 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         {
             tracing::warn!("metadata backfill still running after the grace period");
         }
+        if let Some(copier) = copier
+            && tokio::time::timeout(HTTP_SHUTDOWN_GRACE, copier)
+                .await
+                .is_err()
+        {
+            tracing::warn!("HTJ2K copy worker still running after the grace period");
+        }
         http_result.and(dimse_result)
     });
 
@@ -411,6 +429,49 @@ async fn backfill_metadata(ingestor: Arc<Ingestor>, shutdown: CancellationToken,
         }
     }
     tracing::info!(scanned, "metadata backfill paused for shutdown");
+}
+
+/// Instances copied per worker batch.
+const COPY_BATCH: i64 = 64;
+/// How long the copy worker waits after a failed batch.
+const COPY_RETRY: Duration = Duration::from_secs(5);
+/// How long the copy worker waits when no instance needs a copy.
+const COPY_IDLE: Duration = Duration::from_secs(10);
+
+/// Make HTJ2K copies in batches until shutdown, `parallel` instances at a
+/// time. A batch that wrote nothing waits `idle` (new instances may have
+/// arrived); a failed batch waits `retry`. Stops after its current batch.
+async fn copy_worker(
+    ingestor: Arc<Ingestor>,
+    shutdown: CancellationToken,
+    retry: Duration,
+    idle: Duration,
+    parallel: usize,
+) {
+    let mut copied = 0;
+    while !shutdown.is_cancelled() {
+        let wait = match ingestor.copy_batch(COPY_BATCH, parallel).await {
+            Ok(0) => idle,
+            Ok(n) => {
+                copied += n;
+                tracing::info!(copied, "HTJ2K copy progress");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    copied,
+                    "HTJ2K copy batch failed: {e}; retrying in {} s",
+                    retry.as_secs_f32()
+                );
+                retry
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = shutdown.cancelled() => {}
+        }
+    }
+    tracing::info!(copied, "HTJ2K copy worker stopped for shutdown");
 }
 
 /// Flatten a server task's join result.
@@ -491,6 +552,40 @@ mod tests {
             "TCP_NODELAY is off on an accepted connection"
         );
         client.await.unwrap().unwrap();
+    }
+
+    /// The worker copies every eligible phantom instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_makes_copies_in_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = unscanned_store(dir.path(), 2).await;
+        // Only scanned instances are candidates.
+        ingestor.backfill_batch(10).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(copy_worker(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            2,
+        ));
+        let uid = ingestor.index().list_series().await.unwrap()[0]
+            .series_instance_uid
+            .clone();
+        let rows = ingestor.index().series_slices(&uid).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        for r in &rows {
+            while ingestor.copy_frames(r.id, &r.blob).await.unwrap().is_none() {
+                assert!(tokio::time::Instant::now() < deadline, "no copy in 10 s");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("shutdown stops the worker")
+            .unwrap();
     }
 
     async fn unscanned_store(dir: &Path, n: usize) -> Arc<Ingestor> {
