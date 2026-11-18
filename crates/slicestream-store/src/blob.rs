@@ -2,7 +2,7 @@
 //!
 //! Layout under the root: `tmp/<random>.part` for in-flight spools and
 //! `objects/aa/bb/<sha256-hex>.<ext>` for committed blobs, where `<ext>` comes
-//! from the [`BlobKind`] (`dcm`, `nii`, `nii.gz`). Names are derived only from
+//! from the [`BlobKind`] (`dcm`, `nii`, `nii.gz`, `j2cs`). Names are derived only from
 //! random numbers, SHA-256 hex and the kind, never from external input.
 
 use std::fs;
@@ -59,11 +59,19 @@ pub enum BlobKind {
     Dicom,
     Nifti,
     NiftiGz,
+    /// A derived HTJ2K copy (`j2cs`).
+    Htj2k,
 }
 
 impl BlobKind {
-    /// Every kind, longest extension first (so `nii.gz` is tried before `nii`).
-    const ALL: [BlobKind; 3] = [BlobKind::NiftiGz, BlobKind::Nifti, BlobKind::Dicom];
+    /// Every kind. `parse_file_name` splits at the first dot, so extension
+    /// order does not matter.
+    const ALL: [BlobKind; 4] = [
+        BlobKind::NiftiGz,
+        BlobKind::Nifti,
+        BlobKind::Dicom,
+        BlobKind::Htj2k,
+    ];
 
     /// File extension without the leading dot.
     pub fn ext(self) -> &'static str {
@@ -71,6 +79,7 @@ impl BlobKind {
             BlobKind::Dicom => "dcm",
             BlobKind::Nifti => "nii",
             BlobKind::NiftiGz => "nii.gz",
+            BlobKind::Htj2k => "j2cs",
         }
     }
 

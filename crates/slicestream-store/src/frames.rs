@@ -139,7 +139,7 @@ impl FrameTable {
     }
 }
 
-struct ByteReader<'a>(&'a [u8]);
+pub(crate) struct ByteReader<'a>(pub(crate) &'a [u8]);
 
 impl ByteReader<'_> {
     fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
@@ -148,15 +148,15 @@ impl ByteReader<'_> {
         Some(*head)
     }
 
-    fn u8(&mut self) -> Option<u8> {
+    pub(crate) fn u8(&mut self) -> Option<u8> {
         self.take::<1>().map(|[b]| b)
     }
 
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         self.take().map(u32::from_le_bytes)
     }
 
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         self.take().map(u64::from_le_bytes)
     }
 }

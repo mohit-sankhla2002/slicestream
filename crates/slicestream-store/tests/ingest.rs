@@ -13,6 +13,7 @@ use slicestream_store::{
     BlobKind, DuplicatePolicy, Expectations, IngestError, IngestSource, Ingestor, NiftiMeta,
     RecoveryReport, SpooledBlob, StorageConfig, is_storage_sop_class,
 };
+use support::{index_pool, ingest_slices};
 
 fn config(root: &Path) -> StorageConfig {
     StorageConfig {
@@ -751,28 +752,6 @@ async fn spool_sync_respects_max_instance_bytes() {
     assert!(files_under(&root.join("tmp")).is_empty());
     let ok = ing.spool_sync(&mut &[0u8; 100][..]).unwrap();
     assert_eq!(ok.len, 100);
-}
-
-async fn index_pool(root: &Path) -> sqlx::SqlitePool {
-    sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
-        .await
-        .unwrap()
-}
-
-/// Ingest `n` phantom slices through the pipeline; returns instance ids.
-async fn ingest_slices(ing: &Ingestor, src: &Path, n: usize) -> Vec<i64> {
-    phantom::write_phantom(src, n, 16).unwrap();
-    for i in 1..=n {
-        ing.import_file(&src.join(format!("IM{i:05}.dcm")))
-            .await
-            .unwrap();
-    }
-    let ids = sqlx::query_scalar::<_, i64>("SELECT id FROM instances ORDER BY id")
-        .fetch_all(&index_pool(&ing.config().root).await)
-        .await
-        .unwrap();
-    assert_eq!(ids.len(), n);
-    ids
 }
 
 async fn unscan_all(root: &Path) {

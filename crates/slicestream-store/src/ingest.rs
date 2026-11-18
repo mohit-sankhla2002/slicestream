@@ -49,7 +49,7 @@ const SCAN_NOT_RECORDED: &str = "the scan could not be recorded";
 /// it again would fail the same way. Anything else (a full disk, a busy or
 /// locked database, an I/O error, a closed pool) can pass, so the row is
 /// left unscanned for a later batch instead of being recorded as a problem.
-fn rejects_row(e: &sqlx::Error) -> bool {
+pub(crate) fn rejects_row(e: &sqlx::Error) -> bool {
     match e {
         sqlx::Error::Encode(_) => true,
         sqlx::Error::Database(db) => {
@@ -153,6 +153,8 @@ pub enum IngestError {
     Unparseable(String),
     #[error("missing required attribute {0}")]
     MissingAttribute(&'static str),
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("{field} mismatch: expected {expected}, dataset has {actual}")]
     UidMismatch {
         field: &'static str,
@@ -177,7 +179,9 @@ impl IngestError {
     /// DIMSE C-STORE status (and STOW-RS FailureReason) for this error.
     pub fn status(&self) -> u16 {
         match self {
-            IngestError::Unparseable(_) | IngestError::MissingAttribute(_) => 0xC000,
+            IngestError::Unparseable(_)
+            | IngestError::MissingAttribute(_)
+            | IngestError::NotFound(_) => 0xC000,
             IngestError::UidMismatch { .. } => 0xA900,
             IngestError::StudyMismatch { .. } => 0xC409,
             IngestError::UnsupportedSopClass(_) => 0x0122,
@@ -333,7 +337,7 @@ struct ScanTask {
 #[derive(Debug)]
 pub struct Ingestor {
     cfg: StorageConfig,
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 /// Create `root` and take an exclusive advisory lock on `root/LOCK`. The lock
@@ -360,9 +364,9 @@ fn lock_root(root: &Path) -> Result<std::fs::File, IngestError> {
 /// State used by the commit → index → cleanup critical section, which runs
 /// in its own task and therefore needs owned (`Arc`) access.
 #[derive(Debug)]
-struct Shared {
-    blobs: FsBlobStore,
-    index: Index,
+pub(crate) struct Shared {
+    pub(crate) blobs: FsBlobStore,
+    pub(crate) index: Index,
     on_duplicate: DuplicatePolicy,
     events: broadcast::Sender<StoredEvent>,
     stats: crate::stats::Stats,
@@ -375,16 +379,28 @@ struct Shared {
     /// These locks are per process. They are sufficient only because this
     /// process is the sole writer of the storage root (see `_root_lock`).
     locks: Box<[Mutex<()>]>,
+    /// Instances whose copy is being made now, so no two calls make the
+    /// same one.
+    pub(crate) copy_inflight: std::sync::Mutex<HashSet<i64>>,
+    /// Instances to copy before the rest; see [`Ingestor::prioritize_copy`].
+    pub(crate) copy_queue: std::sync::Mutex<std::collections::VecDeque<i64>>,
+    /// Signalled when an instance is added to `copy_queue`; see
+    /// [`Ingestor::copy_request_waiting`].
+    pub(crate) copy_requested: tokio::sync::Notify,
+    /// Slots of on-demand encodes, shared by every caller of
+    /// [`Ingestor::encode_transient`]; see
+    /// [`Ingestor::limit_on_demand_encodes`].
+    pub(crate) encode_slots: std::sync::Mutex<Arc<tokio::sync::Semaphore>>,
     /// Exclusive lock on `<root>/LOCK`, held for the life of the ingestor.
     _root_lock: std::fs::File,
     #[cfg(test)]
-    hooks: TestHooks,
+    pub(crate) hooks: TestHooks,
 }
 
 /// Fault-injection and pause points for deterministic unit tests.
 #[cfg(test)]
 #[derive(Debug, Default)]
-struct TestHooks {
+pub(crate) struct TestHooks {
     /// Make the next `upsert_instance` call fail.
     fail_next_upsert: std::sync::atomic::AtomicBool,
     /// One-shot pause inside the blob-delete closure: signal `.0`, then block
@@ -395,6 +411,42 @@ struct TestHooks {
     panic_in_scan: std::sync::Mutex<Vec<i64>>,
     /// Instance ids whose scan task panics outside the blocking scan.
     panic_in_task: std::sync::Mutex<Vec<i64>>,
+    /// Instance ids whose copy encoder panics.
+    pub(crate) panic_in_encode: std::sync::Mutex<Vec<i64>>,
+    /// Make the next `write_copy` fail with this error.
+    pub(crate) fail_next_write_copy: std::sync::Mutex<Option<sqlx::Error>>,
+    /// Sleep this long inside each on-demand encode.
+    pub(crate) encode_delay: std::sync::Mutex<Option<std::time::Duration>>,
+    /// On-demand encodes running now, and the most seen at once.
+    pub(crate) encodes_running: std::sync::atomic::AtomicUsize,
+    pub(crate) encodes_peak: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts one on-demand encode in [`TestHooks`] while alive.
+#[cfg(test)]
+pub(crate) struct EncodeGauge<'a>(&'a TestHooks);
+
+#[cfg(test)]
+impl<'a> EncodeGauge<'a> {
+    pub(crate) fn enter(hooks: &'a TestHooks) -> EncodeGauge<'a> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = hooks.encodes_running.fetch_add(1, SeqCst) + 1;
+        hooks.encodes_peak.fetch_max(now, SeqCst);
+        let delay = *hooks.encode_delay.lock().unwrap();
+        if let Some(d) = delay {
+            std::thread::sleep(d);
+        }
+        EncodeGauge(hooks)
+    }
+}
+
+#[cfg(test)]
+impl Drop for EncodeGauge<'_> {
+    fn drop(&mut self) {
+        self.0
+            .encodes_running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -404,7 +456,7 @@ impl TestHooks {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn panics(list: &std::sync::Mutex<Vec<i64>>, id: i64) -> bool {
+    pub(crate) fn panics(list: &std::sync::Mutex<Vec<i64>>, id: i64) -> bool {
         list.lock().unwrap().contains(&id)
     }
 
@@ -418,7 +470,7 @@ impl TestHooks {
 }
 
 impl Shared {
-    fn lock_for(&self, sop_instance_uid: &str) -> &Mutex<()> {
+    pub(crate) fn lock_for(&self, sop_instance_uid: &str) -> &Mutex<()> {
         let mut h = std::hash::DefaultHasher::new();
         sop_instance_uid.hash(&mut h);
         &self.locks[(h.finish() % self.locks.len() as u64) as usize]
@@ -612,7 +664,7 @@ impl Shared {
     /// references the hash. Failures are logged, not returned: the outcome is
     /// already decided, and any blob left behind is an orphan that
     /// [`Ingestor::recover`] removes.
-    async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash, kind: BlobKind) {
+    pub(crate) async fn discard_unreferenced(self: &Arc<Self>, hash: BlobHash, kind: BlobKind) {
         match self.index.blob_in_use(&hash).await {
             Ok(false) => {
                 let shared = Arc::clone(self);
@@ -660,6 +712,12 @@ impl Ingestor {
             events,
             stats: Default::default(),
             locks,
+            copy_queue: Default::default(),
+            copy_inflight: Default::default(),
+            copy_requested: Default::default(),
+            encode_slots: std::sync::Mutex::new(Arc::new(tokio::sync::Semaphore::new(
+                crate::derived::default_encode_slots(),
+            ))),
             _root_lock: root_lock,
             #[cfg(test)]
             hooks: TestHooks::default(),

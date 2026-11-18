@@ -25,7 +25,7 @@ without custom code, and with backends written in any language.
 | Language / safety | C++ | Rust (memory-safe parser and network code) |
 | Concurrency | Thread pool | Async (tokio); 10k+ concurrent streams |
 | DICOMweb | Plugin | Built in, including frame-level WADO-RS and byte ranges |
-| Progressive HTJ2K | No | Yes: transcode at ingest, stream RPCL progressively |
+| Progressive HTJ2K | No | Yes: lossless RPCL copies of stored instances, streamed progressively |
 | Scroll-aware prefetch | No | Yes: server-side scheduler driven by the viewer cursor |
 | Storage | Filesystem, DB plugins | Filesystem, S3/GCS/Azure (`object_store`), tiered cache |
 | Index | SQLite / PostgreSQL | SQLite (embedded) / PostgreSQL |
@@ -42,7 +42,7 @@ slicestream-store      ingest, filesystem blobs, SQLite index, scan        (exis
 slicestream-index      Index trait: SQLite (sqlx), PostgreSQL              planned
 slicestream-dicomweb   QIDO-RS parsing, Accept negotiation, multipart      (exists)
 slicestream-dimse      C-ECHO/C-STORE SCP                                  (exists; C-FIND/C-MOVE/C-GET planned)
-slicestream-codec      transcode to HTJ2K (OpenJPH), JPEG-LS, JPEG, RLE    planned
+slicestream-codec      lossless HTJ2K copies (vendored openjph-core)       (exists; JPEG-LS, JPEG, RLE transcoding planned)
 slicestream-wasm       browser build of core (scheduler, HTJ2K decode)     planned
 slicestream-ffi        C ABI + cbindgen header                             planned
 bindings/python        PyO3 package                                        planned
@@ -56,9 +56,10 @@ Two levels, so teams can adopt step by step:
 1. **No custom code.** Point `@cornerstonejs/dicom-image-loader` (or OHIF's
    DICOMweb data source) at `/dicom-web`. Standard `wadors:` image IDs work.
    The README has a tested OHIF data source entry.
-   Once the codec crate exists, the server will also serve HTJ2K with
-   `transfer-syntax=*` and HTTP byte ranges. That turns on Cornerstone's built-in
-   progressive loading.
+   For slow links, the server serves lossless HTJ2K copies of eligible
+   frames (`image/jphc`, `transfer-syntax=1.2.840.10008.1.2.4.202`), whole
+   or by HTTP byte range. Cornerstone decodes them progressively as they
+   stream in; see the README for the tested OHIF "slow links" entry.
 2. **Fast path.** Install `@slicestream/cornerstone-loader`. It registers a
    `slicestream:` image loader scheme. It opens one WebSocket per series and
    reports the viewport's current image index (from the `STACK_NEW_IMAGE`
@@ -100,8 +101,31 @@ storage and study "stable" detection are still open.
 done, so modalities and other PACS can push to the server. C-FIND, C-MOVE and
 C-GET through `dicom-ul`, so they can also query it, are still open.
 
-**M4 — Progressive codecs.** Transcode to HTJ2K RPCL at ingest or on demand.
-Stream byte ranges progressively. Add a WASM decoder for the console viewer.
+**M4 — Progressive codecs.** Part 1 is done: lossless progressive HTJ2K
+copies (RPCL, verified sample by sample, made in the background or on
+demand, never at ingest), a progressive WebSocket stream with an
+acknowledgement window (`?progressive=htj2k`, see PROTOCOL.md), and DICOMweb
+frames as HTJ2K with HTTP `Range`. Still open: lossy and other codecs
+(JPEG-LS, JPEG, RLE transcoding), `rendered` and `thumbnail` resources, and
+a WASM decoder for the console viewer.
+
+Slow-link benchmark (`scripts/bench-slowlink.sh` on the 181-slice
+512 x 512 16-bit phantom; 10 Mbit/s, 80 ms round trip, 4 MiB proxy buffer
+per direction; release build, Intel Core i7-11850H laptop, Linux; one run):
+first image 626 ms as stored, 238 ms progressive; every slice lossless
+76.2 s as stored, 4.0 s progressive (5.2 %); after a cursor jump to slice 0
+at 1 s, its first image after 4,665 ms as stored, 197 ms progressive. The
+phantom compresses about 20:1 losslessly, real CT about 3:1, so on real CT
+the lossless total shrinks less. In OHIF on the same link, the "slow links"
+entry drew the phantom's first image about 0.27 s after its frame request
+against about 0.55 s with the M1 entry (a preview first when one is drawn:
+small phantom frames sometimes arrive whole before it is).
+
+The encoder is `openjph-core` 0.1.0, a pure Rust port of OpenJPH. It is
+vendored in `vendor/openjph-core` and wired in with `[patch.crates-io]`. Two
+patches (resolution boundaries, and a packet-header termination fix) are
+described in `vendor/openjph-core/PATCHES.md` and are to be proposed
+upstream. The build needs no C or C++ toolchain.
 
 **M5 — Integrations.** `@slicestream/cornerstone-loader` with a React hook,
 OpenAPI and generated clients, C ABI, Python bindings, webhooks.
@@ -119,12 +143,23 @@ benchmarks against Orthanc and dcm4chee.
   for storage.
 - The DICOMweb read routes have no authentication or authorization until M6.
   Keep the server on loopback or behind an authenticating proxy.
-- No transcoding: instances and frames are sent in the transfer syntax they
-  were stored in. No `rendered` or `thumbnail` resources (M4), no HTTP
-  `Range` requests, no XML responses.
-- Frames go out as fast as TCP accepts them. There is no client credit or
-  acknowledgement, so priority changes take effect only after the socket
-  buffer drains.
+- Instances are sent as stored. Frames are sent as stored too, except that
+  eligible frames (native monochrome, 8 or 16 bit) can be sent as lossless
+  HTJ2K copies. No other transcoding. No `rendered` or `thumbnail`
+  resources (M4), no XML responses. HTTP `Range` is supported only for
+  single-frame HTJ2K answers.
+- Each HTJ2K copy is a second file next to its original, so eligible
+  instances take extra disk: about a third more for uncompressed CT in
+  testing (3:1 lossless), up to about the size of the originals for noisy
+  images. Set `[htj2k] mode = "off"` to make no copies. Copies already made
+  stay on disk until their `derived_htj2k` rows are deleted with the server
+  stopped; the next start then removes them (see CONFORMANCE.md).
+- The plain stream (no `?progressive=htj2k`) sends frames as fast as TCP
+  accepts them, with no client credit, so priority changes take effect only
+  after the socket and any proxy buffers drain (4.7 s for a jump in the
+  slow-link benchmark). The progressive stream has an acknowledgement
+  window instead (see PROTOCOL.md). The acks come from the client, so the
+  window also covers a proxy's buffer.
 - The console viewer renders only native (uncompressed) grayscale.
 - Storage is the local filesystem only, and the series list is rebuilt from
   the index on demand.

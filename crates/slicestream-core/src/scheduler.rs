@@ -59,6 +59,11 @@ impl PrefetchScheduler {
         self.remaining
     }
 
+    /// Whether the slice has been handed out (or marked sent). Out of range is `false`.
+    pub fn is_sent(&self, index: usize) -> bool {
+        self.sent.get(index).copied().unwrap_or(false)
+    }
+
     /// Update the viewer state. Call on every scroll event (cheap).
     pub fn update(&mut self, cursor: usize, velocity: f64) {
         self.cursor = cursor.min(self.len().saturating_sub(1));

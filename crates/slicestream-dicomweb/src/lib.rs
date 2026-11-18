@@ -4,6 +4,7 @@
 pub mod accept;
 pub mod multipart;
 pub mod qido;
+pub mod range;
 pub mod urls;
 
 pub use accept::{
@@ -12,4 +13,5 @@ pub use accept::{
 };
 pub use multipart::{Multipart, splice_bulk_uris};
 pub use qido::{Include, Key, Level, Matcher, QidoQuery, QueryError, default_fields, parse_qido};
+pub use range::{ByteRange, parse_range, resolve};
 pub use urls::{base_url, instance_url, series_url, study_url};

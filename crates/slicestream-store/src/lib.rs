@@ -3,6 +3,7 @@
 
 mod blob;
 mod config;
+mod derived;
 mod frames;
 mod header;
 mod index;
@@ -20,6 +21,7 @@ mod phantom;
 
 pub use blob::{BlobHash, BlobKind, FsBlobStore, SpoolError, SpooledBlob, TempBlob};
 pub use config::StorageConfig;
+pub use derived::{CopyFrame, CopyFrames, CopyState};
 pub use frames::FrameTable;
 pub use header::{HeaderError, InstanceHeader, read_header};
 pub use index::{

@@ -30,12 +30,13 @@ pub mod dicomweb;
 pub mod hosts;
 pub mod linking;
 pub mod metrics;
+mod progressive;
 pub mod routes;
 pub mod stow;
 pub mod stream;
 
 pub use catalog::SeriesCatalog;
-use config::{Config, DicomwebConfig, HttpConfig};
+use config::{Config, DicomwebConfig, Htj2kConfig, Htj2kMode, HttpConfig};
 
 #[cfg(test)]
 #[allow(dead_code)]
@@ -48,6 +49,7 @@ pub struct AppState {
     pub scheduler: SchedulerConfig,
     pub http: HttpConfig,
     pub dicomweb: DicomwebConfig,
+    pub htj2k: Htj2kConfig,
     /// `None` when `metrics_enabled = false`; the console routes are then
     /// not mounted.
     pub metrics: Option<Arc<metrics::Metrics>>,
@@ -167,11 +169,15 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
             .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::HEAD])
             // `Accept` with quoted parameters is not CORS-safelisted, so
-            // DICOMweb clients send a preflight for it.
-            .allow_headers([header::ACCEPT])
+            // DICOMweb clients send a preflight for it; `Range` is only
+            // safelisted in its simplest forms, and not by every browser.
+            .allow_headers([header::ACCEPT, header::RANGE])
+            // `Content-Range` gives the size of a ranged HTJ2K frame.
             .expose_headers([
                 HeaderName::from_static("x-slicestream-frame-info"),
                 header::WARNING,
+                header::CONTENT_RANGE,
+                header::ACCEPT_RANGES,
             ]),
     )
 }
@@ -239,6 +245,26 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         shutdown.clone(),
         BACKFILL_RETRY,
     ));
+    // On-demand encodes (DICOMweb frames and the progressive stream) share
+    // one limit, as many at once as the copy worker runs.
+    ingestor.limit_on_demand_encodes(config.htj2k.worker_count());
+    // `background` copies every eligible instance; `on-demand` only those
+    // a request asked for; `off` none.
+    let scope = match config.htj2k.mode {
+        Htj2kMode::Background => Some(CopyScope::All),
+        Htj2kMode::OnDemand => Some(CopyScope::Requested),
+        Htj2kMode::Off => None,
+    };
+    let copier = scope.map(|scope| {
+        tokio::spawn(copy_worker(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            COPY_RETRY,
+            COPY_IDLE,
+            config.htj2k.worker_count(),
+            scope,
+        ))
+    });
     if config.dicomweb.enabled && !http_addr.ip().is_loopback() {
         tracing::warn!(
             "DICOMweb read routes are unauthenticated: anyone who can reach {http_addr} can read patient data (see SECURITY.md)"
@@ -282,6 +308,7 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
         scheduler: SchedulerConfig::default(),
         http,
         dicomweb: config.dicomweb,
+        htj2k: config.htj2k,
         metrics,
         gauges,
         archives,
@@ -340,16 +367,28 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
             }
             drop(jobs);
         }
-        // Let the sampler and the backfill release the storage lock before
-        // reporting stopped. The backfill stops after its current batch.
+        // Let the sampler, the backfill and the copy worker release the
+        // storage lock before reporting stopped. The workers stop after
+        // their current batch or group; both are joined under one grace.
         if let Some(h) = sampler {
             let _ = h.await;
         }
-        if tokio::time::timeout(HTTP_SHUTDOWN_GRACE, backfill)
+        let workers = async {
+            let (backfill, copier) = tokio::join!(backfill, async {
+                match copier {
+                    Some(c) => c.await.map(Some),
+                    None => Ok(None),
+                }
+            });
+            drop((backfill, copier));
+        };
+        if tokio::time::timeout(HTTP_SHUTDOWN_GRACE, workers)
             .await
             .is_err()
         {
-            tracing::warn!("metadata backfill still running after the grace period");
+            tracing::warn!(
+                "metadata backfill or HTJ2K copy worker still running after the grace period"
+            );
         }
         http_result.and(dimse_result)
     });
@@ -361,16 +400,27 @@ pub async fn start(config: Config, shutdown: CancellationToken) -> anyhow::Resul
     })
 }
 
+/// Unsent bytes the kernel queues per socket before a write waits
+/// (`TCP_NOTSENT_LOWAT`), so a re-planned stream is not stuck behind a deep
+/// socket buffer on a direct connection.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NOTSENT_LOWAT: u32 = 131_072;
+
 /// Set `TCP_NODELAY` on every accepted HTTP connection. Without it, a small
 /// write that follows another one (the stream's first `series` message after
 /// the 101 response) waits for the client's delayed ACK, about 40 ms on
-/// Linux.
+/// Linux. Where `socket2` offers it (Linux, Android), also set
+/// `TCP_NOTSENT_LOWAT`.
 fn no_delay(
     listener: tokio::net::TcpListener,
 ) -> axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)> {
     listener.tap_io(|tcp| {
         if let Err(e) = tcp.set_nodelay(true) {
             tracing::debug!("cannot set TCP_NODELAY: {e}");
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Err(e) = socket2::SockRef::from(&*tcp).set_tcp_notsent_lowat(NOTSENT_LOWAT) {
+            tracing::debug!("cannot set TCP_NOTSENT_LOWAT: {e}");
         }
     })
 }
@@ -411,6 +461,68 @@ async fn backfill_metadata(ingestor: Arc<Ingestor>, shutdown: CancellationToken,
         }
     }
     tracing::info!(scanned, "metadata backfill paused for shutdown");
+}
+
+/// Instances copied per worker batch.
+const COPY_BATCH: i64 = 64;
+/// How long the copy worker waits after a failed batch.
+const COPY_RETRY: Duration = Duration::from_secs(5);
+/// How long the copy worker waits when no instance needs a copy.
+const COPY_IDLE: Duration = Duration::from_secs(10);
+
+/// Which instances the copy worker copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyScope {
+    /// Every eligible instance, requested ones first.
+    All,
+    /// Only the instances a request asked for.
+    Requested,
+}
+
+/// Make HTJ2K copies in batches until shutdown, `parallel` instances at a
+/// time. A batch that wrote nothing waits `idle` (new instances may have
+/// arrived) or until a request queues an instance; a failed batch waits
+/// `retry`. Shutdown ends a batch after the group of instances in flight.
+async fn copy_worker(
+    ingestor: Arc<Ingestor>,
+    shutdown: CancellationToken,
+    retry: Duration,
+    idle: Duration,
+    parallel: usize,
+    scope: CopyScope,
+) {
+    let mut copied = 0;
+    while !shutdown.is_cancelled() {
+        let stop = || shutdown.is_cancelled();
+        let batch = match scope {
+            CopyScope::All => ingestor.copy_batch(COPY_BATCH, parallel, stop).await,
+            CopyScope::Requested => ingestor.copy_requested(COPY_BATCH, parallel, stop).await,
+        };
+        let (wait, wake_on_request) = match batch {
+            Ok(0) => (idle, true),
+            Ok(n) => {
+                copied += n;
+                // scripts/bench-slowlink.sh waits for this message and its
+                // `copied` field; keep them in step with the script.
+                tracing::info!(copied, "HTJ2K copy progress");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    copied,
+                    "HTJ2K copy batch failed: {e}; retrying in {} s",
+                    retry.as_secs_f32()
+                );
+                (retry, false)
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = ingestor.copy_request_waiting(), if wake_on_request => {}
+            _ = shutdown.cancelled() => {}
+        }
+    }
+    tracing::info!(copied, "HTJ2K copy worker stopped for shutdown");
 }
 
 /// Flatten a server task's join result.
@@ -490,7 +602,76 @@ mod tests {
             io.nodelay().unwrap(),
             "TCP_NODELAY is off on an accepted connection"
         );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            socket2::SockRef::from(&io).tcp_notsent_lowat().unwrap(),
+            NOTSENT_LOWAT
+        );
         client.await.unwrap().unwrap();
+    }
+
+    /// Shutdown mid-batch stops the worker promptly and releases the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_stops_mid_batch_and_releases_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = unscanned_store(dir.path(), 8).await;
+        ingestor.backfill_batch(10).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(copy_worker(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            1,
+            CopyScope::All,
+        ));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the worker stops promptly")
+            .unwrap();
+        drop(ingestor);
+        Ingestor::open(slicestream_store::StorageConfig {
+            root: dir.path().join("store"),
+            ..Default::default()
+        })
+        .await
+        .expect("the storage lock is released");
+    }
+
+    /// The worker copies every eligible phantom instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_makes_copies_in_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let ingestor = unscanned_store(dir.path(), 2).await;
+        // Only scanned instances are candidates.
+        ingestor.backfill_batch(10).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(copy_worker(
+            Arc::clone(&ingestor),
+            shutdown.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            2,
+            CopyScope::All,
+        ));
+        let uid = ingestor.index().list_series().await.unwrap()[0]
+            .series_instance_uid
+            .clone();
+        let rows = ingestor.index().series_slices(&uid).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        for r in &rows {
+            while ingestor.copy_frames(r.id, &r.blob).await.unwrap().is_none() {
+                assert!(tokio::time::Instant::now() < deadline, "no copy in 10 s");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("shutdown stops the worker")
+            .unwrap();
     }
 
     async fn unscanned_store(dir: &Path, n: usize) -> Arc<Ingestor> {

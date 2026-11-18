@@ -83,6 +83,8 @@ pub async fn bulk(
         transfer_syntax: stored,
         encapsulated: false,
         bits_allocated: 8,
+        copy_possible: false,
+        prefer_copy_for_wildcard: false,
     };
     let plan = match negotiate_frames(&accept_ranges(&headers), &src, 1) {
         Ok(p) => p,

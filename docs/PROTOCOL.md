@@ -60,6 +60,99 @@ as stored. For example, `1.2.840.10008.1.2.4.201` is HTJ2K.
 
 Unknown messages are ignored, so clients may send extensions.
 
+## Progressive mode (`?progressive=htj2k`)
+
+```
+GET /api/series/{seriesInstanceUid}/stream?progressive=htj2k   (WebSocket upgrade)
+```
+
+Progressive mode is opt-in. Without the parameter the stream is exactly as
+described above and nothing in this section applies. Any value other than
+`htj2k` gets 400. When the server's `[htj2k] mode` is `"off"`, `htj2k` gets
+400 too, and the message names `[htj2k] mode = "off"`. The magic stays `SLS1`:
+progressive mode only adds JSON fields and one client message.
+
+**Hello.** The hello message gains a top-level key `"progressive": "htj2k"`, next to `type` and `series`.
+
+**Parts.** A slice that has an HTJ2K copy (lossless, transfer syntax
+`1.2.840.10008.1.2.4.202`) is sent as several binary messages, each carrying a
+slice of one codestream. The frame header gains a `part` object, and
+`info.transferSyntax` is `1.2.840.10008.1.2.4.202`:
+
+```json
+{ "index": 12, "info": { "transferSyntax": "1.2.840.10008.1.2.4.202" },
+  "part": { "offset": 65536, "total": 91834, "level": 1 } }
+```
+
+| field | meaning |
+|---|---|
+| `offset` | Byte offset of this payload within the whole codestream. |
+| `total` | Length of the whole codestream in bytes. |
+| `level` | The highest resolution level that is complete once this part is appended. 0 is the smallest resolution; the largest value is the full image. It is 0 both when only resolution 0 is complete and when not even that is, so `level` 0 alone does not mean the prefix can be decoded. |
+
+- The frame is complete when `offset + payload length == total`. The client
+  may decode the prefix it holds. The server does not send where each
+  resolution ends, only `level` on each part: a client that wants to decode
+  at each resolution tries at part boundaries, and treats a new, higher
+  `level` as the sign that a new resolution has become complete.
+- **Assembling parts.** The client keeps one buffer per `index`. It appends a
+  part only when the part's `offset` equals the number of bytes it holds for
+  that index; otherwise it drops the part. A part with `offset` 0 starts a new
+  buffer and replaces any buffer held. A whole frame (a message with no
+  `part`) replaces any partial buffer for that index. This is needed because
+  after the client sends `evicted`, parts of the evicted slice that were
+  already in flight still arrive, and the server then starts the slice again
+  from offset 0.
+- The server sends the parts of one frame in order. Parts of different slices
+  may be interleaved.
+- Every part is at most 65,536 bytes of payload, the first (preview) part
+  included. A preview larger than that arrives as several parts.
+- The first bytes of a slice reach the preview resolution (the smallest one
+  that is at least 256 pixels on the long side by default,
+  `[htj2k] preview_size`, or the full image when it is smaller) before the rest of the
+  slice. For the slice at the cursor, the preview and the rest are sent back
+  to back. For slices ahead, previews come first, then the remainder, so a
+  scroll lands on something sharp.
+- A slice without a copy (not eligible, or no copy could be made) is sent
+  whole, in its stored transfer syntax, in one message with no `part`, as in
+  the plain stream. So is a slice whose instance changed after the connection
+  opened. A whole frame may therefore follow parts of the same `index` (for
+  example after a read failure on the server). The client then replaces the
+  parts it holds with the whole frame.
+- If the server cannot read a slice at all after it has sent parts, it stops
+  sending parts for that slice and does not tell the client. It sends the slice
+  again only after the client sends `evicted` for it. Clients should evict
+  partial slices when the stream goes idle, so such a slice is retried.
+
+**Acknowledgements.** The client sends, after every binary message it
+receives:
+
+```json
+{ "type": "ack", "bytes": 262144 }
+```
+
+`bytes` is the cumulative number of payload bytes received so far, counted
+over all binary messages of the connection. It counts payload only, not the
+`SLS1` header and its JSON. A client may coalesce the acks of messages it
+processes in the same event-loop turn, sending one ack with the latest total.
+
+The server keeps the unacknowledged bytes within a window, so that a scroll
+change takes effect after at most one window of data:
+
+- The window starts at 256 KiB (262,144 bytes).
+- It follows about twice the bytes acknowledged over the shortest recent round
+  trip, never below 128 KiB (131,072) and never above 16 MiB (16,777,216).
+  Roughly every 10 seconds the server briefly holds the queue short to
+  measure the round trip again.
+- When nothing is unacknowledged, the server always sends one message, even if
+  it is larger than the window. This guarantees progress.
+- Without acks the stream stops after about one window. A client in
+  progressive mode must therefore ack. The plain stream needs no acks.
+
+**Cursor and eviction** work as above. Control messages are applied between
+parts, so a `cursor` message changes the order from the next part on.
+`evicted` makes the server send the listed slices again from the start.
+
 ## Ordering guarantees
 
 - The server waits up to 100 ms for the first `cursor` message. The first frame
@@ -72,6 +165,6 @@ Unknown messages are ignored, so clients may send extensions.
 
 ## Versioning
 
-The magic `SLS1` carries the major version. Breaking changes will use `SLS2`.
+The magic `SLS1` carries the major version (progressive mode included). Breaking changes will use `SLS2`.
 New JSON fields may be added at any time. Clients must ignore fields they do
 not know.

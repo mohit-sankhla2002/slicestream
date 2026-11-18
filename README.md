@@ -59,7 +59,9 @@ for now.
   records where each frame and each large value sits in the file, and stores
   the instance's DICOM JSON.
 - `slicestream-dicomweb`: QIDO-RS query parsing, `Accept` negotiation,
-  the `multipart/related` writer and URL helpers.
+  the `multipart/related` writer, `Range` parsing and URL helpers.
+- `slicestream-codec`: lossless HTJ2K (RPCL) encoding of native monochrome
+  frames, with a sample-by-sample check of every copy.
 - `slicestream-archive`: opens ZIP, 7z, RAR, tar, tar.gz and plain gzip
   files (nested in any combination) and finds DICOM and NIfTI files inside,
   with limits against zip bombs.
@@ -238,6 +240,112 @@ authentication yet; see [SECURITY.md](SECURITY.md).
 
 ![OHIF showing the synthetic phantom from slicestream](docs/images/ohif.png)
 
+### Slow links: progressive HTJ2K
+
+For viewing over a slow connection, slicestream keeps a lossless HTJ2K copy
+of each eligible instance (native, monochrome, 8 or 16 bit) next to the
+original, and serves its frames as `image/jphc` (streamed, or by HTTP
+`Range`), so a viewer shows a low-resolution image from the first bytes and
+sharpens it.
+Originals are never changed, and a copy is served only after it decodes to
+exactly the original pixels. Settings, with their defaults, are in the
+`[htj2k]` section of `slicestream.example.toml`:
+
+```toml
+[htj2k]
+mode = "background"          # background | on-demand (copy requested instances) | off
+workers = 0                  # 0 = half the cores, at least 1
+preview_size = 256           # long side of the first preview, in pixels
+preview_ahead = 32           # slices whose preview goes before any final stage
+prefer_for_wildcard = false  # true: */* and transfer-syntax=* get HTJ2K too
+```
+
+The rules for what is served, and `Range`, are in
+[docs/CONFORMANCE.md](docs/CONFORMANCE.md). The WebSocket stream has an
+opt-in progressive mode (`?progressive=htj2k`), described in
+[docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+A second OHIF data source entry for this setup asks for the HTJ2K copy and
+has Cornerstone decode each frame while it streams in, so a lower-resolution
+preview shows first and then the exact image. Add it to `dataSources` and
+make it the default (`defaultDataSourceName: 'slicestream-slow'`): OHIF
+reads `acceptHeader` and `stackRetrieveOptions` from the active data source
+when the viewer starts, and in testing, picking the entry with
+`?datasources=` in the URL still sent the default entry's `Accept`.
+
+```js
+{
+  namespace: '@ohif/extension-default.dataSourcesModule.dicomweb',
+  sourceName: 'slicestream-slow',
+  configuration: {
+    friendlyName: 'slicestream (slow links)',
+    name: 'slicestream-slow',
+    qidoRoot: 'http://localhost:8080/dicom-web',
+    wadoRoot: 'http://localhost:8080/dicom-web',
+    wadoUriRoot: 'http://localhost:8080/dicom-web',
+    imageRendering: 'wadors',
+    thumbnailRendering: 'wadors',
+    enableStudyLazyLoad: true,
+    supportsFuzzyMatching: false,
+    supportsWildcard: true,
+    qidoSupportsIncludeField: true,
+    staticWado: false,
+    bulkDataURI: { enabled: true },
+    omitQuotationForMultipartRequest: true,
+    // Frames: the HTJ2K copy, or the stored frame for an instance without one.
+    acceptHeader: [
+      'multipart/related; type="image/jphc"; transfer-syntax=1.2.840.10008.1.2.4.202, ' +
+        'multipart/related; type="application/octet-stream"; transfer-syntax=*',
+    ],
+    // Stack viewports: decode the partial frame every 16 KiB, at most one
+    // resolution level down (256 x 256 for a 512 x 512 CT).
+    stackRetrieveOptions: {
+      retrieveOptions: { single: { streaming: true, decodeLevel: 1, minChunkSize: 16384 } },
+    },
+  },
+}
+```
+
+`acceptHeader` is the Accept header OHIF sends for frames (through
+Cornerstone's `beforeSend`); `stackRetrieveOptions` is merged into the
+retrieve configuration OHIF gives Cornerstone for stack viewports.
+`minChunkSize` defaults to 128 KiB, which is most of a lossless CT frame,
+so without it no preview would show. This was checked with the
+`ohif/app:v3.13.14` image (Cornerstone 5.6.8) through a simulated 10 Mbit/s,
+80 ms link: the frames came back as `image/jphc`, the final pixels in
+Cornerstone's cache equalled the stored ones, and there were no console
+errors. On a real CT series a preview was drawn before the full image every
+time; the phantom's frames are so small (about 25 KB) that they sometimes
+arrive whole before a preview is drawn. The phantom's first image was drawn
+about 0.27 s after its frame was requested, against about 0.55 s with the
+M1 entry (the one in "Use with OHIF" above). The stream's numbers are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (M4).
+
+The other keys are those of the M1 entry. Its
+`omitQuotationForMultipartRequest: false` and `singlepart` variants were
+not tested with this entry.
+
+Byte ranges instead of streaming also work, with one catch. Cornerstone
+5.6.8 sends range requests with a fixed
+`Accept: multipart/related; type=application/octet-stream; transfer-syntax=*`
+(they bypass `beforeSend`, so `acceptHeader` does not apply), and the server
+answers that with HTJ2K only when `[htj2k] prefer_for_wildcard = true`. With
+that set, these retrieve stages fetch the first 64 KiB of each frame and
+then the rest:
+
+```js
+stackRetrieveOptions: {
+  stages: [
+    { id: 'lossySequential', retrieveType: 'singleFast' },
+    { id: 'finalSequential', retrieveType: 'singleFinal' },
+  ],
+  retrieveOptions: {
+    singleFast: { rangeIndex: 0, chunkSize: 65536, decodeLevel: 1 },
+    singleFinal: { rangeIndex: -1 },
+  },
+},
+```
+
 To try it without patient data, store the phantom and a synthetic RLE
 multi-frame instance, then serve with a `slicestream.toml` that holds the
 `cors_allowed_origins` line above:
@@ -284,6 +392,7 @@ crates/slicestream-core     transport-agnostic library (index, frames, scheduler
 crates/slicestream-store    ingest pipeline, blob store, SQLite index and instance scan
 crates/slicestream-dicomweb QIDO-RS parsing, Accept negotiation, multipart writer
 crates/slicestream-archive  archive walking (ZIP/7z/RAR/tar/gzip), NIfTI header parsing
+crates/slicestream-codec    lossless HTJ2K encoding and verification (vendored openjph-core)
 crates/slicestream-dimse    DIMSE C-STORE / C-ECHO storage SCP
 crates/slicestream-server   reference HTTP + WebSocket server (axum/tokio)
 slicestream.example.toml    configuration with every default

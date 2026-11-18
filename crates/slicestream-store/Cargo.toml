@@ -25,6 +25,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.10"
 slicestream-core = { version = "0.1.0", path = "../slicestream-core" }
+slicestream-codec = { version = "0.1.0", path = "../slicestream-codec" }
 slicestream-dicomweb = { version = "0.1.0", path = "../slicestream-dicomweb" }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 thiserror = "2.0.21"

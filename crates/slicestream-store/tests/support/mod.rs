@@ -363,3 +363,111 @@ pub fn instance(dir: &Path, spec: &Spec) -> PathBuf {
     file.write_to_file(&path).unwrap();
     path
 }
+
+pub async fn index_pool(root: &Path) -> sqlx::SqlitePool {
+    sqlx::SqlitePool::connect(&format!("sqlite://{}", root.join("index.sqlite").display()))
+        .await
+        .unwrap()
+}
+
+/// Ingest `n` phantom slices through the pipeline; returns instance ids.
+pub async fn ingest_slices(ing: &slicestream_store::Ingestor, src: &Path, n: usize) -> Vec<i64> {
+    crate::phantom::write_phantom(src, n, 16).unwrap();
+    for i in 1..=n {
+        ing.import_file(&src.join(format!("IM{i:05}.dcm")))
+            .await
+            .unwrap();
+    }
+    let ids = sqlx::query_scalar::<_, i64>("SELECT id FROM instances ORDER BY id")
+        .fetch_all(&index_pool(&ing.config().root).await)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), n);
+    ids
+}
+
+/// A fresh (study, series, SOP) UID triple, unique within the test process.
+fn fresh_uids() -> (String, String, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let uid = |part: u32| format!("2.25.{nanos}{n:04}{part}");
+    (uid(1), uid(2), uid(3))
+}
+
+/// Write `obj` as a CT Image Storage file (Explicit VR LE) with fresh UIDs.
+fn write_ct(dir: &Path, mut obj: InMemDicomObject) -> PathBuf {
+    let (study, series, sop) = fresh_uids();
+    let ui = |tag, v: &str| DataElement::new(tag, VR::UI, PrimitiveValue::from(v));
+    obj.put(ui(tags::SOP_CLASS_UID, uids::CT_IMAGE_STORAGE));
+    obj.put(ui(tags::STUDY_INSTANCE_UID, &study));
+    obj.put(ui(tags::SERIES_INSTANCE_UID, &series));
+    obj.put(ui(tags::SOP_INSTANCE_UID, &sop));
+    let file = obj
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN)
+                .media_storage_sop_class_uid(uids::CT_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(&sop),
+        )
+        .unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{sop}.dcm"));
+    file.write_to_file(&path).unwrap();
+    path
+}
+
+/// Pixel value of `frame` at sample `i` of [`native_multiframe`].
+pub fn multiframe_sample(frame: u32, i: usize) -> u16 {
+    ((i * 31 + frame as usize * 977 + i / 7) % 4096) as u16
+}
+
+/// A native 64 x 64, 16-bit unsigned, Bits Stored 12 instance of `frames`
+/// frames with distinct pixels per frame, with fresh UIDs.
+pub fn native_multiframe(dir: &Path, frames: u32) -> PathBuf {
+    let mut obj = base(frames, 64, 64, 16);
+    obj.put(DataElement::new(
+        tags::BITS_STORED,
+        VR::US,
+        PrimitiveValue::from(12u16),
+    ));
+    obj.put(DataElement::new(
+        tags::HIGH_BIT,
+        VR::US,
+        PrimitiveValue::from(11u16),
+    ));
+    let pixels: Vec<u8> = (0..frames)
+        .flat_map(|f| (0..64 * 64).map(move |i| multiframe_sample(f, i)))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        PrimitiveValue::from(pixels),
+    ));
+    write_ct(dir, obj)
+}
+
+/// A 16 x 16, 8-bit, `RGB` instance (Samples per Pixel 3), with fresh UIDs.
+pub fn rgb_instance(dir: &Path) -> PathBuf {
+    let us = |tag, v: u16| DataElement::new(tag, VR::US, PrimitiveValue::from(v));
+    let mut obj = base(1, 16, 16, 8);
+    obj.put(us(tags::SAMPLES_PER_PIXEL, 3));
+    obj.put(us(tags::PLANAR_CONFIGURATION, 0));
+    obj.put(us(tags::HIGH_BIT, 7));
+    obj.put(DataElement::new(
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        PrimitiveValue::from("RGB"),
+    ));
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OB,
+        PrimitiveValue::from(pixel_bytes(16 * 16 * 3)),
+    ));
+    write_ct(dir, obj)
+}

@@ -267,11 +267,60 @@ one part per instance, each part the stored file byte for byte. A part's
 itself, and is only possible when the request names one instance; for more it
 gets 406. Bodies are streamed in 1 MiB reads and are never compressed.
 
-**Transfer syntax.** The server does not transcode: it sends every instance
-in the transfer syntax it was stored with. This is the same as Orthanc. A
-request for a specific `transfer-syntax` is answered only when every instance
-in the response is stored in it; otherwise 406. `transfer-syntax=*` and no
-`transfer-syntax` accept whatever is stored.
+**Transfer syntax.** Instances (the `application/dicom` resource) are sent
+in the transfer syntax they were stored with. This is the same as Orthanc.
+A request for a specific `transfer-syntax` is answered only when every
+instance in the response is stored in it; otherwise 406.
+`transfer-syntax=*` and no `transfer-syntax` accept whatever is stored.
+Frames (below) can also be sent from an HTJ2K copy.
+
+**HTJ2K copies.** For an instance that qualifies, the server keeps a second
+file next to the stored one, holding every frame as an HTJ2K Lossless RPCL
+codestream (transfer syntax `1.2.840.10008.1.2.4.202`, media type
+`image/jphc`). The stored instance is never changed.
+
+- *Eligible:* stored as Implicit VR Little Endian, Explicit VR Little Endian
+  or Explicit VR Big Endian (native pixel data), Samples per Pixel 1,
+  Photometric Interpretation `MONOCHROME1` or `MONOCHROME2`, Bits Allocated
+  8 or 16, Bits Stored from 1 to Bits Allocated, at most 67,108,864 pixels
+  per frame (for example 8192 x 8192), and a frame table from the storage
+  scan. Anything else (compressed, color, 32-bit, larger frames) has no copy
+  and is served as stored.
+- *Encoding:* reversible 5/3 wavelet, no color transform, one tile, one
+  layer, 64 x 64 code blocks, maximum precincts, resolution levels = the
+  smallest number of levels that brings the shorter side to 64 pixels or less,
+  RPCL progression, a TLM marker and one tile-part. The byte offset where each
+  resolution is complete is recorded.
+- *Lossless check:* a copy is kept and served only after it has been decoded
+  and compared sample by sample with the stored pixels. A frame that fails
+  the check is not served as HTJ2K.
+- *Creation:* never during ingest (C-STORE, STOW-RS, upload, archive). With
+  `[htj2k] mode = "background"` (the default) a worker makes copies after
+  ingest, newest instances first, and instances near what a viewer asks for
+  go first. With `"on-demand"` the worker copies only instances that a
+  request asked for: a request that wants HTJ2K frames of an instance
+  without a copy encodes and verifies them at that moment (they are not
+  kept), and the worker then makes and keeps the copy of that instance.
+  Instances no request asked for get no copy. With `"off"` no copies are
+  made, and HTJ2K is not offered.
+  `workers`, `preview_size` and `preview_ahead` are in
+  [`slicestream.example.toml`](slicestream.example.toml). When a copy is
+  missing, the request that needs it encodes the frames it needs and does not
+  wait for the worker. At most `workers` frames are encoded this way at once,
+  across all requests and progressive streams; further encodes wait for a
+  slot.
+- *Disk cost:* a copy is a second file per instance. For uncompressed CT,
+  lossless HTJ2K measured about 3:1 in testing, so a copy adds about a third
+  of the original's size. For noisy images it adds up to about the size of
+  the original.
+- *Turning copies off:* switching to `mode = "off"` makes no new copies but
+  keeps the copy files already made, because rows of the `derived_htj2k`
+  index table still reference them. To reclaim the space, stop the server,
+  delete those rows (`sqlite3 <root>/index.sqlite "DELETE FROM
+  derived_htj2k"`) and start it again: startup recovery removes the copy
+  files no row references. With `"background"` or `"on-demand"` the copies
+  are made again later.
+- Copies are used for the frames resource only, not for `bulk` Pixel Data.
 
 **Metadata.** The response is `application/dicom+json`: a JSON array with one
 object per instance, in storage order. It is streamed an instance at a
@@ -303,15 +352,51 @@ type of the parts.
 | `Accept` asks for | Served |
 |---|---|
 | `application/octet-stream` (no transfer syntax) | Uncompressed little-endian pixels. Native little-endian data as stored. Big-endian data byte-swapped (Bits Allocated 16 or 32). Encapsulated data gives 406. Parts are `application/octet-stream; transfer-syntax=1.2.840.10008.1.2.1`. |
-| `application/octet-stream; transfer-syntax=*` | As stored. Each part's `Content-Type` carries `transfer-syntax=<stored UID>`. |
+| `application/octet-stream; transfer-syntax=*` | As stored (the HTJ2K copy with `prefer_for_wildcard = true`). Each part's `Content-Type` carries `transfer-syntax=<UID>`. |
 | `application/octet-stream; transfer-syntax=<UID>` | As stored if the UID matches, else 406. |
-| `image/jpeg`, `image/jls`, `image/jp2`, `image/jphc`, `image/jxl`, `image/dicom-rle` (with or without a transfer syntax) | As stored if the stored transfer syntax belongs to that media type (and matches the requested one, if given), else 406. |
-| `*/*`, or no `Accept` | As stored: the image media type of the stored transfer syntax, or `application/octet-stream` for native data. |
+| `image/jphc`, with no transfer syntax, `*`, `1.2.840.10008.1.2.4.201` or `1.2.840.10008.1.2.4.202` | The HTJ2K copy (`.202`) when the instance is eligible and copies are on; each part is `image/jphc; transfer-syntax=1.2.840.10008.1.2.4.202`. An instance already stored as HTJ2K is sent as stored (no copy is made of it). Else, 406. |
+| `application/octet-stream; transfer-syntax=1.2.840.10008.1.2.4.202` | The HTJ2K copy, as above, else 406. |
+| `*/*`, `image/*` or `application/*`, with `transfer-syntax=1.2.840.10008.1.2.4.202` or `.201` | The HTJ2K copy (an `application/*` range gets `application/octet-stream` parts, the others `image/jphc`). When no copy can be served, that range is not acceptable and the next range in `Accept` is tried, else 406. An instance already stored in that syntax is sent as stored. |
+| `image/jpeg`, `image/jls`, `image/jp2`, `image/jxl`, `image/dicom-rle` (with or without a transfer syntax), and `image/jphc` with another transfer syntax | As stored if the stored transfer syntax belongs to that media type (and matches the requested one, if given), else 406. |
+| `*/*`, or no `Accept` | As stored: the image media type of the stored transfer syntax, or `application/octet-stream` for native data. With `[htj2k] prefer_for_wildcard = true`, the HTJ2K copy when one can be served, else as stored. |
 
 `Accept` may list several choices, with q-values. The `type` parameter works
 with and without quotes. A bare media type (not wrapped in
 `multipart/related`) gets the frame itself as the body, and only when the
 request names one frame; for more it gets 406.
+
+**HTJ2K answers.** `[htj2k] prefer_for_wildcard` (default `false`) decides
+what `transfer-syntax=*`, `*/*` and a missing `Accept` get: by default the
+stored frames, exactly as before copies existed. When it is `true` and a copy
+can be served they get the copy; when it cannot (not eligible, copies off, or
+the encode failed) they still get the stored frames.
+
+A media range that asks for HTJ2K explicitly (the `image/jphc`,
+`application/octet-stream; transfer-syntax=...202` and wildcard-with-HTJ2K rows
+above) and cannot be served from a copy is not acceptable. It gets 406 unless
+a later range in `Accept` can be served. A `.201` request for data stored as
+`.202`, or the reverse, with no copy to give, gets 406: only the stored syntax
+itself matches. The text names the reason when the instance is
+not eligible (for example `3 samples per pixel`); a failed encode or copy
+says only that the frames could not be encoded.
+
+**Range.** Frames sent as HTJ2K honour one HTTP `Range` of the form
+`bytes=a-b`, `bytes=a-` or `bytes=-n`, with these rules:
+
+- Only a request for a single frame is ranged. For several frames, or
+  `Range` with several ranges, a malformed `Range`, or any `If-Range`
+  header, `Range` is ignored and the answer is 200 with the whole body.
+- For a bare (single-part) answer the range applies to the codestream. For a
+  `multipart/related` answer it applies to the whole multipart body, boundary
+  lines and part headers included. The boundary depends only on the stored
+  instance and the frame number, so the body is the same on every request for
+  that frame and ranges from separate requests fit together.
+- A satisfiable range gives 206 with `Content-Range: bytes first-last/total`.
+  A range outside the body gives 416 with `Content-Range: bytes */total`.
+- Answers from a copy carry `Accept-Ranges: bytes`. Stored frames are not
+  ranged.
+- CORS (for the origins in `[http] cors_allowed_origins`) allows the `Range`
+  request header and exposes `Content-Range` and `Accept-Ranges`.
 
 Frames are read at the file offsets recorded when the instance was stored.
 Instances stored before scanning existed have none until the background
@@ -339,7 +424,9 @@ of the element at that path is sent.
 | 200 | Instances, metadata, frames or bulk data found |
 | 400 | A malformed frame list: not digits, an empty item, or more than 4,096 numbers |
 | 404 | Unknown study, series or instance, or a series that is not in that study. Also: a frame number of 0 or above Number of Frames; frames of an object that is not an image; frames or Pixel Data of an image without Pixel Data (`no pixel data`); a bulk data path the instance does not have. |
-| 406 | No acceptable media type or transfer syntax (also a bare media type for several instances or frames) |
+| 206 | A satisfiable `Range` on a single HTJ2K frame |
+| 406 | No acceptable media type or transfer syntax (also a bare media type for several instances or frames, and an explicit HTJ2K request that cannot be served from a copy) |
+| 416 | A `Range` outside the HTJ2K frame answer; `Content-Range: bytes */<length>` |
 | 500 | An instance has no metadata (for example its object is over 64 MiB). Frames that cannot be located: encapsulated pixel data with no usable offset table (`frame boundaries unknown`), with more than 1,048,576 fragments (`too many fragments (N)`, N the number of fragments), or pixel data shorter than its frames (`pixel data truncated`, `pixel data too short`). A stored file that cannot be read. The plain-text body says why. |
 | 503 | Frames or bulk data of an instance that was overwritten twice while the request read it. Try again. |
 
@@ -364,6 +451,11 @@ body early; the client sees a broken stream.
 | `[http] public_url` | unset (`http://<Host>`) |
 | `[dicomweb] enabled` | `true` |
 | `[dicomweb] max_results` | 1000 (QIDO-RS `limit` default and maximum; at least 1) |
+| `[htj2k] mode` | `background` (or `on-demand`, `off`) |
+| `[htj2k] workers` | 0 (half the cores, at least 1) |
+| `[htj2k] preview_size` | 256 (pixels, long side; at least 1) |
+| `[htj2k] preview_ahead` | 32 |
+| `[htj2k] prefer_for_wildcard` | `false` |
 | `[dimse] max_associations` | 64 |
 | `[dimse] max_pdu_length` | 116794 |
 | `[dimse] read_timeout_secs` / `write_timeout_secs` | 60 / 60 |

@@ -1,5 +1,5 @@
 //! Server configuration: one TOML file with `[storage]`, `[http]`,
-//! `[dimse]`, `[archives]` and `[dicomweb]`.
+//! `[dimse]`, `[archives]`, `[dicomweb]` and `[htj2k]`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ pub struct Config {
     pub dimse: ScpConfig,
     pub archives: ArchivesConfig,
     pub dicomweb: DicomwebConfig,
+    pub htj2k: Htj2kConfig,
 }
 
 impl Config {
@@ -52,6 +53,9 @@ impl Config {
         }
         if self.dicomweb.max_results == 0 {
             bail!("[dicomweb] max_results must be at least 1");
+        }
+        if self.htj2k.preview_size == 0 {
+            bail!("[htj2k] preview_size must be at least 1");
         }
         Ok(())
     }
@@ -190,5 +194,109 @@ impl Default for DicomwebConfig {
             enabled: true,
             max_results: 1000,
         }
+    }
+}
+
+/// When HTJ2K copies of stored instances are made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Htj2kMode {
+    /// A background worker copies every eligible instance, newest first
+    /// (instances a request asked for go first).
+    Background,
+    /// A request that wants HTJ2K frames without a copy encodes them on the
+    /// spot; the worker then stores the copy of that instance. Instances no
+    /// request asked for get no copy.
+    OnDemand,
+    /// No copies are made.
+    Off,
+}
+
+/// Progressive HTJ2K copies. Every field has a default, so `[htj2k]` may be
+/// empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Htj2kConfig {
+    /// When copies are made.
+    pub mode: Htj2kMode,
+    /// Instances encoded at once by the copy worker, and frames encoded at
+    /// once on demand across all requests (a separate limit of the same
+    /// size); 0 is half the cores (at least 1).
+    pub workers: usize,
+    /// Longest side, in pixels, of the first preview a progressive stream
+    /// sends (at least 1).
+    pub preview_size: u32,
+    /// Slices whose preview is sent before any final stage (other than the
+    /// final of the slice in view) on the progressive stream.
+    pub preview_ahead: usize,
+    /// Answer `transfer-syntax=*`, `*/*` and a missing `Accept` with HTJ2K
+    /// copies where one exists.
+    pub prefer_for_wildcard: bool,
+}
+
+impl Default for Htj2kConfig {
+    fn default() -> Self {
+        Self {
+            mode: Htj2kMode::Background,
+            workers: 0,
+            preview_size: 256,
+            preview_ahead: 32,
+            prefer_for_wildcard: false,
+        }
+    }
+}
+
+impl Htj2kConfig {
+    /// Instances the copy worker encodes at once, and the limit of
+    /// on-demand encodes.
+    pub fn worker_count(&self) -> usize {
+        if self.workers > 0 {
+            return self.workers;
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        (cores / 2).max(1)
+    }
+}
+
+#[cfg(test)]
+mod htj2k_tests {
+    use super::*;
+
+    #[test]
+    fn htj2k_defaults() {
+        let c: Config = toml::from_str("[htj2k]\n").unwrap();
+        assert_eq!(c.htj2k.mode, Htj2kMode::Background);
+        assert_eq!(c.htj2k.workers, 0);
+        assert_eq!(c.htj2k.preview_size, 256);
+        assert_eq!(c.htj2k.preview_ahead, 32);
+        assert!(!c.htj2k.prefer_for_wildcard);
+        assert_eq!(c.htj2k, Config::default().htj2k);
+    }
+
+    #[test]
+    fn htj2k_mode_values() {
+        let c: Config = toml::from_str("[htj2k]\nmode = \"on-demand\"").unwrap();
+        assert_eq!(c.htj2k.mode, Htj2kMode::OnDemand);
+        let c: Config = toml::from_str("[htj2k]\nmode = \"off\"").unwrap();
+        assert_eq!(c.htj2k.mode, Htj2kMode::Off);
+        let e = toml::from_str::<Config>("[htj2k]\nmode = \"sometimes\"").unwrap_err();
+        assert!(e.to_string().contains("mode"), "{e}");
+    }
+
+    #[test]
+    fn worker_count_zero_means_half_cores() {
+        assert!(Htj2kConfig::default().worker_count() >= 1);
+        let c = Htj2kConfig {
+            workers: 3,
+            ..Default::default()
+        };
+        assert_eq!(c.worker_count(), 3);
+    }
+
+    #[test]
+    fn validate_rejects_zero_preview_size() {
+        let mut c = Config::default();
+        c.htj2k.preview_size = 0;
+        assert!(c.validate().is_err());
     }
 }

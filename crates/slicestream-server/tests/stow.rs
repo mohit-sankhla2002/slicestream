@@ -65,6 +65,7 @@ async fn harness_with(
         ingestor: Arc::clone(&ingestor),
         http: cfg,
         dicomweb: Default::default(),
+        htj2k: Default::default(),
         metrics: None,
         gauges: Default::default(),
         archives: None,
@@ -429,6 +430,7 @@ async fn post_instance_too_large_413() {
             ..HttpConfig::default()
         },
         dicomweb: Default::default(),
+        htj2k: Default::default(),
         metrics: None,
         gauges: Default::default(),
         archives: None,

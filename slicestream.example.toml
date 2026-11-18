@@ -43,3 +43,15 @@ body_idle_timeout_secs = 60         # a body silent this long is refused (408)
 [dicomweb]
 enabled = true        # false: the /dicom-web GET routes are not mounted (STOW-RS stays)
 max_results = 1000    # QIDO limit: default and maximum
+
+# Progressive HTJ2K copies of stored instances (lossless, verified; originals
+# are never modified). Copies are made by this worker or on demand, never
+# during ingest.
+[htj2k]
+mode = "background"       # background: copy every eligible instance; on-demand: copy only
+                          # instances a request asked for; off: no copies, no HTJ2K
+workers = 0               # instances encoded at once by the worker, and frames encoded at
+                          # once on demand by requests; 0 = half the cores (at least 1)
+preview_size = 256        # longest side of the first progressive preview, in pixels
+preview_ahead = 32        # slices whose preview goes before any final stage (progressive stream)
+prefer_for_wildcard = false  # true: transfer-syntax=*, */* and no Accept get HTJ2K copies
