@@ -320,7 +320,9 @@ impl Ingestor {
     /// first the instances of [`prioritize_copy`](Self::prioritize_copy),
     /// then the newest instances without a current copy row. Returns how
     /// many rows were written. A row that fails on the database's side
-    /// is logged and left for a later batch; `Err` when the candidates
+    /// is logged and left for a later batch (a prioritized instance goes
+    /// back on the queue, so [`copy_requested`](Self::copy_requested)
+    /// retries it too); `Err` when the candidates
     /// cannot be listed, or when every instance of the batch failed that
     /// way, so the caller can wait before trying again. `stop` is asked
     /// before each group of `parallel` instances; once it returns `true`
@@ -367,10 +369,15 @@ impl Ingestor {
             let n = wanted.min(queue.len());
             queue.drain(..n).collect()
         };
+        // Prioritized instances that failed for a reason that can pass, or
+        // were not reached before `stop`; they go back on the queue.
+        let queued = ids.len();
+        let mut requeue = Vec::new();
         let mut last_error = None;
         for id in &ids {
             if let Err(e) = self.ensure_scanned(*id).await {
                 warn!(id, error = %e, "cannot scan a prioritized instance");
+                requeue.push(*id);
                 last_error = Some(e);
             }
         }
@@ -385,10 +392,12 @@ impl Ingestor {
             }
         }
         let mut recorded = 0;
+        let mut reached = 0;
         for chunk in ids.chunks(parallel.max(1)) {
             if stop() {
                 break;
             }
+            reached += chunk.len();
             let tasks: Vec<_> = chunk
                 .iter()
                 .map(|id| (*id, tokio::spawn(Arc::clone(&self.shared).make_copy(*id))))
@@ -398,15 +407,19 @@ impl Ingestor {
                     Ok(Ok(written)) => recorded += usize::from(written),
                     Ok(Err(e)) => {
                         error!(id, error = %e, "cannot record the copy; the row is retried later");
+                        requeue.push(id);
                         last_error = Some(e);
                     }
                     Err(e) => {
                         error!(id, error = %e, "copy task failed");
+                        requeue.push(id);
                         last_error = Some(IngestError::Storage(std::io::Error::other(e)));
                     }
                 }
             }
         }
+        requeue.extend(ids.get(reached..).unwrap_or_default());
+        self.requeue_copies(ids[..queued].iter().filter(|id| requeue.contains(id)));
         match last_error {
             Some(e) if recorded == 0 => Err(e),
             _ => Ok(recorded),
@@ -422,6 +435,19 @@ impl Ingestor {
         if queue.len() < PRIORITY_CAPACITY && !queue.contains(&id) {
             queue.push_back(id);
             self.shared.copy_requested.notify_one();
+        }
+    }
+
+    /// Put prioritized instances back at the end of the queue, without
+    /// waking a waiting [`copy_request_waiting`](Self::copy_request_waiting):
+    /// they failed for a reason that can pass, so the caller's retry delay
+    /// applies. Same capacity rule as [`prioritize_copy`](Self::prioritize_copy).
+    fn requeue_copies<'a>(&self, ids: impl Iterator<Item = &'a i64>) {
+        let mut queue = self.shared.copy_queue.lock().unwrap();
+        for id in ids {
+            if queue.len() < PRIORITY_CAPACITY && !queue.contains(id) {
+                queue.push_back(*id);
+            }
         }
     }
 
@@ -751,5 +777,68 @@ mod tests {
             current(ids[0]).await,
             Some(CopyState::Ready { .. })
         ));
+    }
+
+    /// A requested copy whose row cannot be written for a reason that can
+    /// pass stays queued, so the on-demand worker's retry makes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requested_copy_is_retried_after_a_transient_failure() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        crate::phantom::write_phantom(&src, 1, 16).unwrap();
+        let ing = Ingestor::open(crate::StorageConfig {
+            root: d.path().join("store"),
+            max_instance_bytes: 1 << 30,
+            on_duplicate: crate::DuplicatePolicy::Keep,
+        })
+        .await
+        .unwrap();
+        ing.import_file(&src.join("IM00001.dcm")).await.unwrap();
+        let id: i64 = sqlx::query_scalar("SELECT id FROM instances")
+            .fetch_one(&ing.shared.index.pool)
+            .await
+            .unwrap();
+
+        ing.prioritize_copy(id);
+        *ing.shared.hooks.fail_next_write_copy.lock().unwrap() = Some(sqlx::Error::PoolTimedOut);
+        assert!(ing.copy_requested(10, 2, || false).await.is_err());
+        assert_eq!(*ing.shared.copy_queue.lock().unwrap(), [id]);
+
+        assert_eq!(ing.copy_requested(10, 2, || false).await.unwrap(), 1);
+        assert!(ing.shared.copy_queue.lock().unwrap().is_empty());
+        let (_, source) = ing.index().instance_blob(id).await.unwrap().unwrap();
+        assert!(matches!(
+            ing.index().copy_for(id, &source).await.unwrap(),
+            Some(CopyState::Ready { .. })
+        ));
+    }
+
+    /// Prioritized instances not reached before `stop` stay queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_batch_keeps_unreached_requests_queued() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        crate::phantom::write_phantom(&src, 2, 16).unwrap();
+        let ing = Ingestor::open(crate::StorageConfig {
+            root: d.path().join("store"),
+            max_instance_bytes: 1 << 30,
+            on_duplicate: crate::DuplicatePolicy::Keep,
+        })
+        .await
+        .unwrap();
+        for f in ["IM00001.dcm", "IM00002.dcm"] {
+            ing.import_file(&src.join(f)).await.unwrap();
+        }
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM instances ORDER BY id")
+            .fetch_all(&ing.shared.index.pool)
+            .await
+            .unwrap();
+        for id in &ids {
+            ing.prioritize_copy(*id);
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        assert_eq!(ing.copy_requested(10, 1, stop).await.unwrap(), 1);
+        assert_eq!(*ing.shared.copy_queue.lock().unwrap(), [ids[1]]);
     }
 }
