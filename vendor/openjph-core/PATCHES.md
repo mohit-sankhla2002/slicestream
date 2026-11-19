@@ -51,5 +51,7 @@ Also: `tests/encoder_round_trip.rs` and its `[[test]]` entry (reproductions
 plus a sweep over sizes, precisions, signedness, levels, block sizes and
 content), and the unit test `finalize_emits_no_extra_byte_after_stuffing`.
 
-Upstream: to be proposed (to the openjph-core port; OpenJPH's C++ is not
-affected).
+Upstream: proposed as https://github.com/knopkem/openjph-rs/pull/3 (fixes
+https://github.com/knopkem/openjph-rs/issues/2, the same bug reported
+independently). OpenJPH's C++ is not affected. Drop this patch once a
+release carries the fix.

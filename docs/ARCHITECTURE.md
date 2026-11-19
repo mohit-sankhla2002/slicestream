@@ -124,8 +124,9 @@ small phantom frames sometimes arrive whole before it is).
 The encoder is `openjph-core` 0.1.0, a pure Rust port of OpenJPH. It is
 vendored in `vendor/openjph-core` and wired in with `[patch.crates-io]`. Two
 patches (resolution boundaries, and a packet-header termination fix) are
-described in `vendor/openjph-core/PATCHES.md` and are to be proposed
-upstream. The build needs no C or C++ toolchain.
+described in `vendor/openjph-core/PATCHES.md`. The packet-header fix is
+proposed upstream as knopkem/openjph-rs#3; the resolution boundaries patch
+is not proposed yet. The build needs no C or C++ toolchain.
 
 **M5 — Integrations.** `@slicestream/cornerstone-loader` with a React hook,
 OpenAPI and generated clients, C ABI, Python bindings, webhooks.
